@@ -1,0 +1,23 @@
+reprocess_date:
+  name: Reprocess date
+  description: Rebuild one local calendar day from read-only source history.
+  fields:
+    date:
+      required: true
+      selector:
+        date:
+reprocess_range:
+  name: Reprocess date range
+  description: Rebuild an inclusive range, limited to 31 days per call.
+  fields:
+    start_date:
+      required: true
+      selector:
+        date:
+    end_date:
+      required: true
+      selector:
+        date:
+export_database:
+  name: Export database
+  description: Create a consistent SQLite backup in the Home Assistant www directory.

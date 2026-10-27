@@ -1,0 +1,93 @@
+{
+  "title": "Home Energy Intelligence",
+  "config": {
+    "abort": {"single_instance_allowed": "Only one Home Energy Intelligence instance is supported."},
+    "error": {"duplicate_meter": "Each physical cumulative energy meter must be selected only once."},
+    "step": {
+      "user": {
+        "title": "General settings",
+        "description": "Configure local aggregation. All measurements remain in Home Assistant; this integration stores only compact daily results.",
+        "data": {
+          "locale": "Language",
+          "floor_area_m2": "Heated floor area",
+          "cycle_hours": "Processing cycle (hours)",
+          "temperature_freshness_minutes": "Maximum temperature carry time",
+          "seasonal_fallback": "Enable explicitly estimated seasonal AC fallback"
+        }
+      },
+      "entities": {
+        "title": "Entity mapping",
+        "description": "Select each physical meter only once. Never select a circuit 2K sensor as the heating supply or return temperature.",
+        "data": {
+          "ecodan_energy": "Heat pump cumulative electricity",
+          "ecodan_power": "Heat pump instantaneous power",
+          "ecodan_mode": "Heat pump operation mode",
+          "ecodan_dhw": "DHW tank water heater",
+          "ac_1_energy": "AC 1 cumulative electricity",
+          "ac_1_power": "AC 1 instantaneous power",
+          "ac_1_climate": "AC 1 climate entity",
+          "ac_1_temperature": "AC 1 room temperature",
+          "ac_2_energy": "AC 2 cumulative electricity",
+          "ac_2_power": "AC 2 instantaneous power",
+          "ac_2_climate": "AC 2 climate entity",
+          "ac_2_temperature": "AC 2 room temperature",
+          "ac_3_energy": "AC 3 cumulative electricity",
+          "ac_3_power": "AC 3 instantaneous power",
+          "ac_3_climate": "AC 3 climate entity",
+          "pv_energy": "PV cumulative production",
+          "grid_import": "Grid cumulative import",
+          "grid_export": "Grid cumulative export",
+          "outdoor_temperature": "Outdoor temperature",
+          "flow_temperature": "Primary heating supply temperature",
+          "representative_room_temperature": "Representative room temperature",
+          "weather": "Weather entity"
+        }
+      }
+    }
+  },
+  "options": {
+    "error": {"duplicate_meter": "Each physical cumulative energy meter must be selected only once."},
+    "step": {
+      "init": {
+        "title": "Home Energy Intelligence settings",
+        "description": "Update mappings without reinstalling. InfluxDB is optional and queried read-only for backfill.",
+        "data": {
+          "locale": "Language",
+          "floor_area_m2": "Heated floor area",
+          "cycle_hours": "Processing cycle (hours)",
+          "temperature_freshness_minutes": "Maximum temperature carry time (0 disables time-only expiry)",
+          "seasonal_fallback": "Enable explicitly estimated seasonal AC fallback",
+          "ecodan_energy": "Heat pump cumulative electricity",
+          "ecodan_power": "Heat pump instantaneous power",
+          "ecodan_mode": "Heat pump operation mode",
+          "ecodan_dhw": "DHW tank water heater",
+          "ac_1_energy": "AC 1 cumulative electricity",
+          "ac_1_power": "AC 1 instantaneous power",
+          "ac_1_climate": "AC 1 climate entity",
+          "ac_1_temperature": "AC 1 room temperature",
+          "ac_2_energy": "AC 2 cumulative electricity",
+          "ac_2_power": "AC 2 instantaneous power",
+          "ac_2_climate": "AC 2 climate entity",
+          "ac_2_temperature": "AC 2 room temperature",
+          "ac_3_energy": "AC 3 cumulative electricity",
+          "ac_3_power": "AC 3 instantaneous power",
+          "ac_3_climate": "AC 3 climate entity",
+          "pv_energy": "PV cumulative production",
+          "grid_import": "Grid cumulative import",
+          "grid_export": "Grid cumulative export",
+          "outdoor_temperature": "Outdoor temperature",
+          "flow_temperature": "Primary heating supply temperature",
+          "representative_room_temperature": "Representative room temperature",
+          "weather": "Weather entity",
+          "influx_enabled": "Enable InfluxDB backfill",
+          "influx_host": "InfluxDB host",
+          "influx_port": "InfluxDB port",
+          "influx_database": "InfluxDB database",
+          "influx_username": "InfluxDB username",
+          "influx_password": "InfluxDB password",
+          "influx_mapping_json": "InfluxDB source mapping (JSON)"
+        }
+      }
+    }
+  }
+}

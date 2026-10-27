@@ -1,0 +1,13 @@
+{
+  "domain": "home_energy_intelligence",
+  "name": "Home Energy Intelligence",
+  "after_dependencies": ["recorder"],
+  "codeowners": ["@igormesarec"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http", "recorder"],
+  "documentation": "https://github.com/igormesarec/home_energy_intelligence",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/igormesarec/home_energy_intelligence/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

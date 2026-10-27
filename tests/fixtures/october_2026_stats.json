@@ -1,0 +1,16 @@
+{
+  "source": "mocked recorder.get_statistics-compatible daily changes",
+  "timezone": "Europe/Ljubljana",
+  "ecodan_daily_kwh": {
+    "2026-10-23": 15.87707,
+    "2026-10-24": 15.26269,
+    "2026-10-25": 20.19328,
+    "2026-10-26": 28.78444
+  },
+  "2026-10-25": {
+    "pv_kwh": 23.732,
+    "import_kwh": 32.620,
+    "export_kwh": 13.721,
+    "expected_household_kwh": 42.631
+  }
+}
