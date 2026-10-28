@@ -7,6 +7,8 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 ## V0.1 features
 
 - Guided General, Heat pumps, Air conditioners, Solar/grid, Temperatures, Weather, Data sources, and Data quality UI sections. Every source entity and operating-state mapping is configurable.
+- Options Flow edits, disables or removes individual devices while preserving stable IDs, unrelated mappings and historical records.
+- Source values are normalized before calculation: Wh/kWh/MWh to kWh, W/kW to W, and °F to °C. Original source units remain in provenance.
 - Recorder-first raw history and long-term-statistics reads, always off the event loop.
 - Persisted six-hour, transition-aware allocations for any configured heat pumps and zero or more AC units; checkpoints are the primary daily classification evidence.
 - Unknown heat-pump operation is `heating_assumed`; confirmed idle and raw reconciliation residual remain separate.
@@ -15,6 +17,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Idempotent 05:00 daily close and correction-safe catch-up in a dedicated compact SQLite database.
 - Optional read-only InfluxDB 1.x backfill for explicitly mapped sources.
 - Responsive Overview, History, and Settings panel with six-tab navigation. Deferred tabs never display invented measurements.
+- Dashboard equipment is loaded dynamically. Authenticated users can view Overview and History; source mappings, database details and exports remain administrator-only.
 - Daily summary and quality sensors only; no duplicate high-frequency entities.
 
 ## Installation
@@ -25,7 +28,8 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 2. Install **Home Energy Intelligence** and restart Home Assistant.
 3. Go to **Settings → Devices & services → Add integration** and select **Home Energy Intelligence**.
 4. Add each heat pump and optional AC with a display name, electrical counter, power and operating-state entity. Map the installation's state strings to the documented categories.
-5. Add optional PV/grid, temperature and weather sources. Each temperature has its own physical limits, invalid sentinels, spike limit, freshness and missing-data thresholds.
+   Energy counters must use the `energy` device class, Wh/kWh/MWh and `total` or `total_increasing`; power sources must use the `power` device class and W/kW.
+5. Add optional PV/grid, temperature and weather sources. Temperature sources accept °C or °F and each has its own physical limits, invalid sentinels, spike limit, point-sample freshness and missing-data thresholds.
 6. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 7. Confirm the Home Assistant time zone and wait for the first completed six-hour checkpoint. The previous calendar day is finalized at 05:00 local time.
 

@@ -22,6 +22,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.latest = null;
     this.history = [];
     this.settings = null;
+    this.equipment = [];
+    this.temperatureSources = [];
   }
 
   set hass(value) {
@@ -35,12 +37,19 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.loading = true;
     this.render();
     try {
-      const [overview, history, settings] = await Promise.all([
+      const [overview, history] = await Promise.all([
         this._hass.callWS({ type: "home_energy_intelligence/overview" }),
         this._hass.callWS({ type: "home_energy_intelligence/history", limit: 90 }),
-        this._hass.callWS({ type: "home_energy_intelligence/settings" }),
       ]);
+      let settings = null;
+      try {
+        settings = await this._hass.callWS({ type: "home_energy_intelligence/settings" });
+      } catch (error) {
+        if (!String(error?.code || error?.message || error).includes("unauthorized")) throw error;
+      }
       this.latest = overview.latest;
+      this.equipment = (overview.equipment || []).filter((item) => item.enabled);
+      this.temperatureSources = (overview.temperature_sources || []).filter((item) => item.enabled);
       this.history = history.records || [];
       this.settings = settings;
     } catch (error) {
@@ -54,6 +63,39 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return sum(record?.allocations?.[device]?.categories, keys);
   }
 
+  devices(kind) {
+    return this.equipment.filter((item) => !kind || item.kind === kind);
+  }
+
+  categories(record, kinds, keys) {
+    return this.equipment
+      .filter((item) => kinds.includes(item.kind))
+      .reduce((total, item) => total + this.category(record, item.equipment_id, keys), 0);
+  }
+
+  assumedHeating(record) {
+    return this.devices("heat_pump").reduce((total, item) => {
+      const allocation = record?.allocations?.[item.equipment_id];
+      return total + (allocation?.reported_assumed_heating_kwh
+        ?? this.category(record, item.equipment_id, ["heating_assumed"]));
+    }, 0);
+  }
+
+  heating(record) {
+    return this.categories(record, ["heat_pump"], ["confirmed_heating"])
+      + this.assumedHeating(record)
+      + this.categories(record, ["air_conditioner"], ["heating", "heating_selected", "heating_estimated"]);
+  }
+
+  cooling(record) {
+    return this.categories(record, ["heat_pump", "air_conditioner"], ["cooling", "cooling_selected", "cooling_estimated"]);
+  }
+
+  temperatureForRole(record, role) {
+    const source = this.temperatureSources.find((item) => item.role === role);
+    return source ? record?.temperatures?.[source.source_id] : null;
+  }
+
   kpis() {
     const r = this.latest;
     if (!r) return [
@@ -64,16 +106,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       ["mdi:white-balance-sunny", "PV Generation", null, "amber"],
       ["mdi:leaf", "Self-Sufficiency", null, "green", "%"],
     ];
-    const heating = this.category(r, "ecodan", ["confirmed_heating", "heating_assumed"])
-      + ["ac_1", "ac_2", "ac_3"].reduce((v, device) => v + this.category(r, device, ["heating", "heating_selected", "heating_estimated"]), 0);
-    const cooling = this.category(r, "ecodan", ["cooling"])
-      + ["ac_1", "ac_2", "ac_3"].reduce((v, device) => v + this.category(r, device, ["cooling", "cooling_selected", "cooling_estimated"]), 0);
+    const heating = this.heating(r);
+    const cooling = this.cooling(r);
     const consumedPv = r.pv_kwh != null && r.export_kwh != null ? Math.max(0, r.pv_kwh - r.export_kwh) : null;
     const self = consumedPv != null && r.household_kwh > 0 ? 100 * consumedPv / r.household_kwh : null;
     return [
       ["mdi:flash", "Whole-House Electricity", r.household_kwh, "blue"],
       ["mdi:radiator", "Heating Electricity", heating, "red"],
-      ["mdi:water", "DHW Electricity", this.category(r, "ecodan", ["dhw"]), "orange"],
+      ["mdi:water", "DHW Electricity", this.categories(r, ["heat_pump"], ["dhw"]), "orange"],
       ["mdi:snowflake", "Cooling Electricity", cooling, "blue"],
       ["mdi:white-balance-sunny", "PV Generation", r.pv_kwh, "amber"],
       ["mdi:leaf", "Self-Sufficiency", self, "green", "%"],
@@ -97,9 +137,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if (!records.length) return `<div class="empty">No validated daily records yet.</div>`;
     const max = Math.max(1, ...records.map((r) => r.household_kwh || 0));
     return `<div class="bars" role="img" aria-label="Daily electricity split">${records.map((r) => {
-      const heat = this.category(r, "ecodan", ["confirmed_heating", "heating_assumed"]);
-      const dhw = this.category(r, "ecodan", ["dhw"]);
-      const cool = ["ecodan", "ac_1", "ac_2", "ac_3"].reduce((v, d) => v + this.category(r, d, ["cooling", "cooling_selected", "cooling_estimated"]), 0);
+      const heat = this.heating(r);
+      const dhw = this.categories(r, ["heat_pump"], ["dhw"]);
+      const cool = this.cooling(r);
       const scale = 150 / max;
       return `<div class="bar-col" title="${esc(r.local_date)}">
         <div class="bar" style="height:${Math.max(2, (r.household_kwh || 0) * scale)}px">
@@ -112,9 +152,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
 
   scatterChart() {
     const points = this.history.flatMap((r) => {
-      const temp = r.temperatures?.outdoor?.mean;
-      const heat = this.category(r, "ecodan", ["confirmed_heating", "heating_assumed"])
-        + ["ac_1", "ac_2", "ac_3"].reduce((v, d) => v + this.category(r, d, ["heating", "heating_selected", "heating_estimated"]), 0);
+      const temp = this.temperatureForRole(r, "outdoor")?.mean;
+      const heat = this.heating(r);
       return temp == null ? [] : [[temp, heat, r.local_date]];
     });
     if (!points.length) return `<div class="empty">Needs validated outdoor temperature and heating records.</div>`;
@@ -135,14 +174,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if (!records.length) return `<div class="empty">No daily records yet. The first close runs at 05:00 local time.</div>`;
     return `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Whole house</th><th>Heating</th><th>Assumed heat</th><th>DHW</th><th>PV</th><th>Quality</th></tr></thead><tbody>
       ${records.map((r) => `<tr><td>${esc(r.local_date)}</td><td>${n(r.household_kwh)} kWh</td>
-        <td>${n(this.category(r, "ecodan", ["confirmed_heating"]))} kWh</td>
-        <td>${n(this.category(r, "ecodan", ["heating_assumed"]))} kWh</td>
-        <td>${n(this.category(r, "ecodan", ["dhw"]))} kWh</td><td>${n(r.pv_kwh)} kWh</td><td>${this.quality(r)}</td></tr>`).join("")}
+        <td>${n(this.categories(r, ["heat_pump"], ["confirmed_heating"]) + this.categories(r, ["air_conditioner"], ["heating"]))} kWh</td>
+        <td>${n(this.assumedHeating(r))} kWh</td>
+        <td>${n(this.categories(r, ["heat_pump"], ["dhw"]))} kWh</td><td>${n(r.pv_kwh)} kWh</td><td>${this.quality(r)}</td></tr>`).join("")}
     </tbody></table></div>`;
   }
 
   overview() {
-    const room = this.latest?.temperatures?.representative_indoor;
+    const room = this.temperatureForRole(this.latest, "indoor");
     return `<section class="kpis">${this.kpis().map(([icon, label, value, color, unit = "kWh"]) => `
       <article class="card kpi"><div class="kpi-icon ${color}"><ha-icon icon="${icon}"></ha-icon></div>
       <div><span>${label}</span><strong>${n(value)} ${value == null ? "" : unit}</strong>
@@ -170,12 +209,13 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   settingsView() {
-    if (!this.settings?.configured) return `<section class="card page-card"><h2>Setup required</h2><p>Add the integration from Settings → Devices & services.</p></section>`;
+    if (!this.settings) return `<section class="card page-card"><h2>Administrator access required</h2><p>Overview and History remain available. Integration mappings and database details are restricted to administrators.</p></section>`;
+    if (!this.settings.configured) return `<section class="card page-card"><h2>Setup required</h2><p>Add the integration from Settings → Devices & services.</p></section>`;
     return `<section class="settings-grid">
       <article class="card page-card"><h2>Processing</h2><dl><dt>Time zone</dt><dd>${esc(this.settings.timezone)}</dd><dt>Cycle</dt><dd>${esc(this.settings.cycle_hours)} hours</dd><dt>Floor area</dt><dd>${n(this.settings.floor_area_m2, 0)} m²</dd><dt>Database</dt><dd>${n(this.settings.database_size_bytes / 1024, 0)} KiB</dd><dt>InfluxDB backfill</dt><dd>${this.settings.influx_enabled ? "Enabled (read-only)" : "Disabled"}</dd></dl>
       <a class="primary" href="/config/integrations/integration/home_energy_intelligence">Open integration options</a></article>
       <article class="card page-card"><h2>Entity mapping</h2><div class="mapping">${this.settings.mapping.map((row) => `<div><span>${esc(row.label)}</span><code>${row.entity_id ? esc(row.entity_id) : "Not selected"}</code></div>`).join("")}</div></article>
-      <article class="card page-card notice"><h2>Data guarantees</h2><p>Recorder is read-only. Unknown Ecodan operation is stored as assumed heating, idle remains separate, gaps remain gaps, and circuit 2K is never used.</p></article>
+       <article class="card page-card notice"><h2>Data guarantees</h2><p>Recorder is read-only. Unknown heat-pump operation is reported as assumed heating, idle remains separate, gaps remain gaps, and unrelated circuit sensors are never substituted.</p></article>
     </section>`;
   }
 
@@ -193,7 +233,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   render() {
     this.shadowRoot.innerHTML = `<style>${HomeEnergyIntelligencePanel.styles}</style>
       <main><header><div class="brand"><ha-icon icon="mdi:home-lightning-bolt-outline"></ha-icon><div><h1>Home Energy Intelligence</h1><p>Whole-house energy analytics and forecasting</p></div></div>
-      <div class="connection"><i></i><div><b>${this.settings?.configured ? "Connected" : "Setup required"}</b><span>${this.latest ? `Last daily close ${esc(this.latest.local_date)}` : "No validated day yet"}</span></div></div></header>
+      <div class="connection"><i></i><div><b>${this.latest || this.settings?.configured ? "Connected" : "Setup required"}</b><span>${this.latest ? `Last daily close ${esc(this.latest.local_date)}` : "No validated day yet"}</span></div></div></header>
       ${this.tabs()}<div class="content">${this.content()}</div></main>`;
     this.shadowRoot.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => { this.active = button.dataset.tab; this.render(); }));
     this.shadowRoot.querySelector(".refresh")?.addEventListener("click", () => this.load());

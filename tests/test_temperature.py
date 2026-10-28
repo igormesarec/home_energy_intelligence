@@ -51,11 +51,20 @@ def test_unavailable_marker_stops_imputation_and_reports_gap():
 
 def test_freshness_limit_creates_missing_coverage_without_new_evidence():
     result = time_weighted_temperature(
-        [NumericSample(dt(), 20)], dt(), dt(2), minimum_valid=-10, maximum_valid=60,
+        [NumericSample(dt(), 20, "point_sample")], dt(), dt(2), minimum_valid=-10, maximum_valid=60,
         max_carry=timedelta(minutes=30),
     )
     assert result.coverage_seconds == 1800
     assert result.coverage_percent == 25
+
+
+def test_unchanged_recorder_state_is_not_stale_solely_from_last_change_time():
+    result = time_weighted_temperature(
+        [NumericSample(dt() - timedelta(days=2), 19.5)], dt(), dt(2),
+        minimum_valid=-10, maximum_valid=60, max_carry=timedelta(minutes=30),
+    )
+    assert result.coverage_percent == 100
+    assert result.mean == 19.5
 
 
 def test_long_term_statistic_bounds_do_not_distort_weighted_mean():

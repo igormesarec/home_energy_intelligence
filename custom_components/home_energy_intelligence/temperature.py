@@ -76,7 +76,11 @@ def time_weighted_temperature(
     for index, sample in enumerate(active):
         segment_start = max(start, sample.timestamp)
         segment_end = end if index + 1 == len(active) else min(end, active[index + 1].timestamp)
-        if max_carry is not None:
+        # Recorder state history contains state changes, not polling samples. A
+        # value that remains unchanged is still the active HA state and must not
+        # become stale merely because its value did not change. Carry limits are
+        # only applied to explicitly point-in-time/backfill observations.
+        if max_carry is not None and sample.reason == "point_sample":
             segment_end = min(segment_end, sample.timestamp + max_carry)
         if segment_end <= segment_start:
             continue

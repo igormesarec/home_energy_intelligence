@@ -16,6 +16,10 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 8. Persisted six-hour checkpoints are the primary daily classification evidence. Daily Recorder counter changes reconcile totals but do not overwrite valid checkpoint categories.
 9. Every source is a UI mapping. Equipment IDs and mapping revisions preserve provenance across entity replacement.
 10. Temperature rejection is sensor-specific and auditable; −55 °C and 155 °C are default invalid sentinels, while legitimate sub-zero outdoor readings remain valid.
+11. Source units are validated and normalized before aggregation: energy to kWh, power to W and temperature to °C. The original unit is retained in provenance; incompatible sources produce unavailable data, not zero.
+12. An unchanged Recorder temperature remains the active measured state until another state or an explicit unavailable marker. A value is not stale merely because its value did not change.
+13. Checkpoint completeness is evaluated for every enabled equipment ID. Recovery writes only missing equipment/interval pairs and preserves valid prior checkpoints.
+14. Positive unclassified heat-pump residual may be included in the configured assumed-heating reporting view, but remains stored as residual uncertainty and is never promoted to confirmed heating or DHW.
 
 ## Runtime schedule
 
@@ -39,5 +43,12 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - One or more heat pumps and zero or more air conditioners, each named, enabled/disabled and independently mapped.
 - Optional PV, import/export, indoor/outdoor, supply/return, DHW and weather sources.
 - Installation-specific operating-state maps; Mitsubishi/MELCloud strings are suggestions, not engine assumptions.
-- Options Flow can rebuild mappings without deleting daily records. Mapping revisions store effective dates.
+- Options Flow edits, adds, disables and removes individual entries without changing stable IDs or clearing unrelated mappings. Mapping revisions store effective dates.
 - Circuit 2K is not accepted for supply/return; no return sensor is inferred.
+
+## Dashboard and authorization
+
+- Equipment IDs, types and display names are loaded dynamically through the WebSocket API; the frontend contains no installation-specific allocation keys.
+- Overview and validated History are available to authenticated Home Assistant users.
+- Settings mappings, database metadata and database export remain administrator-only.
+- Missing optional equipment or measurements stay unavailable. Structural absence of PV may be used for a grid-only household balance without creating a fictitious PV measurement.

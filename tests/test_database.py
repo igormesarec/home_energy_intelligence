@@ -78,6 +78,19 @@ def test_checkpoint_upsert_is_idempotent_and_survives_daily_rebuild(tmp_path):
     assert checkpoints["hp"][0]["meter_kwh"] == 5
 
 
+def test_checkpoint_completeness_is_per_enabled_equipment(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    end = datetime(2026, 10, 25, 6, tzinfo=UTC)
+    db.upsert_checkpoint(start, end, "2026-10-25", "hp-a", {"quality": "good"})
+    assert db.missing_checkpoint_devices(start, end, {"hp-a", "hp-b", "ac-a"}) == {
+        "hp-b", "ac-a",
+    }
+    assert db.checkpoint_exists(start, end, "hp-a")
+    assert not db.checkpoint_exists(start, end, "hp-b")
+
+
 def test_mapping_revisions_preserve_source_replacement_history(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()

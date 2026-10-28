@@ -15,6 +15,8 @@ class NumericSample:
     value: float | None
     reason: str | None = None
     source: str | None = None
+    source_unit: str | None = None
+    normalized_unit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

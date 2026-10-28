@@ -11,5 +11,12 @@
 - Added escaped Unicode InfluxQL identifiers, bounded chunked reads, `autogen` support and Authorization-header credentials.
 - Moved database exports from `/config/www` to administrator-only protected storage.
 - Added mapping revisions, current Home Assistant runtime CI tests and expanded DST/recovery/security acceptance coverage.
+- Corrected Home Assistant test registration so the real config and Options Flow handlers are exercised.
+- Made Options Flow edit stable equipment and temperature records in place; unrelated changes no longer clear mappings.
+- Added canonical Wh/kWh/MWh → kWh, W/kW → W and °F → °C normalization with source-unit provenance.
+- Removed installation-specific dashboard keys; equipment metadata and allocation IDs now come from the authenticated WebSocket API.
+- Made checkpoint recovery complete each enabled equipment ID independently without replacing valid checkpoints.
+- Kept stable Recorder temperature states valid until an explicit unavailable state; freshness limits apply to point samples rather than value-change age.
+- Synchronized English and Slovenian guided-flow translations and documented administrator-only settings access.
 
 COP, thermal-profile modelling and weather-dependent forecasting remain deferred and display no invented values.

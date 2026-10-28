@@ -80,6 +80,25 @@ def test_historical_counter_correction_changes_residual_not_confirmed_classifica
     assert hp["authoritative_counter_source"] == "daily_recorder"
 
 
+def test_heat_pump_residual_is_assumed_only_for_reporting_and_remains_auditable():
+    day = date(2026, 10, 25)
+    start, end = local_day_bounds(day, "Europe/Ljubljana")
+    history = DeviceHistory(
+        counter=[NumericSample(start, 10), NumericSample(end, 20)],
+        kind="heat_pump", state_map={},
+    )
+    result = DailyAggregator(
+        "Europe/Ljubljana", assumed_heating_reporting="include_in_heating_total"
+    ).aggregate(day, DailyInput({"hp": history}, {}, {}))
+    hp = result.allocations["hp"]
+    assert hp["categories"].get("confirmed_heating", 0) == 0
+    assert hp["categories"].get("dhw", 0) == 0
+    assert hp["residual_kwh"] == 10
+    assert hp["uncertain_residual_kwh"] == 10
+    assert hp["reported_assumed_heating_kwh"] == 10
+    assert hp["reported_heating_kwh"] == 10
+
+
 def test_missing_optional_sources_remain_unavailable_not_zero():
     result = DailyAggregator("Europe/Ljubljana").aggregate(
         date(2026, 10, 24), DailyInput(devices={}, site_counters={}, temperatures={})
@@ -87,6 +106,21 @@ def test_missing_optional_sources_remain_unavailable_not_zero():
     assert result.household_kwh is None
     assert result.pv_kwh is None and result.import_kwh is None and result.export_kwh is None
     assert result.non_hvac_kwh is None and result.quality == "missing"
+
+
+def test_no_pv_installation_uses_grid_balance_without_inventing_pv_measurement():
+    day = date(2026, 10, 24)
+    start, end = local_day_bounds(day, "Europe/Ljubljana")
+    source = DailyInput(
+        devices={}, temperatures={}, site_configured={"import", "export"},
+        site_counters={
+            "import": [NumericSample(start, 10), NumericSample(end, 20)],
+            "export": [NumericSample(start, 2), NumericSample(end, 3)],
+        },
+    )
+    result = DailyAggregator("Europe/Ljubljana").aggregate(day, source)
+    assert result.pv_kwh is None
+    assert result.household_kwh == 9
 
 
 def test_temperature_rejection_payload_is_json_serializable_for_database():

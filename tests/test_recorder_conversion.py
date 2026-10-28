@@ -33,7 +33,31 @@ def test_measured_temperature_attribute_not_setpoint_state_is_used():
     stamp = datetime(2026, 1, 1, tzinfo=UTC)
     row = SimpleNamespace(
         state="55", last_updated=stamp,
-        attributes={"current_temperature": 48.5, "temperature": 55},
+        attributes={"current_temperature": 48.5, "temperature": 55,
+                    "unit_of_measurement": "°C"},
     )
-    samples = states_to_numeric([row], attribute="current_temperature")
+    samples = states_to_numeric([row], attribute="current_temperature", dimension="temperature")
     assert samples[0].value == 48.5
+
+
+def test_energy_power_and_temperature_units_are_normalized_with_provenance():
+    stamp = datetime(2026, 1, 1, tzinfo=UTC)
+    def row(value, unit):
+        return SimpleNamespace(state=str(value), last_updated=stamp,
+                               attributes={"unit_of_measurement": unit})
+
+    assert states_to_numeric([row(1500, "Wh")], dimension="energy")[0].value == 1.5
+    assert states_to_numeric([row(1.5, "MWh")], dimension="energy")[0].value == 1500
+    assert states_to_numeric([row(1.2, "kW")], dimension="power")[0].value == 1200
+    fahrenheit = states_to_numeric([row(14, "°F")], dimension="temperature")[0]
+    assert fahrenheit.value == -10
+    assert fahrenheit.source_unit == "°F" and fahrenheit.normalized_unit == "°C"
+
+
+def test_incompatible_unit_is_unavailable_not_a_false_zero():
+    stamp = datetime(2026, 1, 1, tzinfo=UTC)
+    row = SimpleNamespace(state="12", last_updated=stamp,
+                          attributes={"unit_of_measurement": "m³"})
+    sample = states_to_numeric([row], dimension="energy")[0]
+    assert sample.value is None
+    assert sample.reason == "incompatible_energy_unit:m³"

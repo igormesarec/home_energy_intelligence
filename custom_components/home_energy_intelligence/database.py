@@ -289,13 +289,30 @@ class EnergyDatabase:
             result.setdefault(row["device"], []).append(payload)
         return result
 
-    def checkpoint_exists(self, start: datetime, end: datetime) -> bool:
+    def checkpoint_exists(self, start: datetime, end: datetime, device: str | None = None) -> bool:
+        sql = "SELECT 1 FROM checkpoints WHERE interval_start_utc=? AND interval_end_utc=?"
+        arguments: list[Any] = [start.isoformat(), end.isoformat()]
+        if device is not None:
+            sql += " AND device=?"
+            arguments.append(device)
+        sql += " LIMIT 1"
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM checkpoints WHERE interval_start_utc=? AND interval_end_utc=? LIMIT 1",
-                (start.isoformat(), end.isoformat()),
-            ).fetchone()
+            row = connection.execute(sql, arguments).fetchone()
         return row is not None
+
+    def missing_checkpoint_devices(
+        self, start: datetime, end: datetime, enabled_devices: set[str]
+    ) -> set[str]:
+        """Return only enabled equipment missing this exact checkpoint."""
+        if not enabled_devices:
+            return set()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT device FROM checkpoints WHERE interval_start_utc=? AND interval_end_utc=?",
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+        present = {str(row["device"]) for row in rows}
+        return set(enabled_devices) - present
 
     def history(self, *, limit: int = 90, before: str | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 3660))

@@ -24,6 +24,12 @@ Covered acceptance cases include:
 - Unicode/escaped InfluxQL identifiers, `homeassistant`/`autogen`, bounded queries, and credentials absent from URLs.
 - Persisted-checkpoint daily classification after Recorder expiration and counter-correction residuals.
 - Variable equipment counts, optional sensors, remapped entity IDs and effective-dated source provenance.
+- Zero-AC and multiple-heat-pump configurations, no-PV grid balance, and absent temperature sources.
+- Wh/kWh/MWh, W/kW and °F/°C normalization plus incompatible-unit rejection and source-unit provenance.
+- Per-equipment checkpoint completeness, including one valid device beside independently missing devices.
+- Stable equipment/source IDs and temperature filters surviving unrelated Options Flow changes.
+- Equipment-neutral dashboard source checks and authenticated-user/admin authorization boundaries.
+- Unchanged Recorder temperatures remaining valid independently of their last value-change time.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.
 
 ## Home Assistant runtime suite

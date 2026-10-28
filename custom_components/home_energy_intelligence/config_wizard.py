@@ -39,21 +39,26 @@ def _general(values):
 
 def _equipment(kind, values=None, allow_skip=False):
     values = values or {}
-    return vol.Schema({
-        vol.Required("configure", default=not allow_skip): selector.BooleanSelector(),
+    schema = {
+        vol.Required("configure", default=bool(values) or not allow_skip): selector.BooleanSelector(),
         vol.Optional("equipment_id", default=values.get("equipment_id", uuid.uuid4().hex[:12])): str,
         vol.Optional("display_name", default=values.get("display_name", "Heat pump" if kind == "heat_pump" else "Air conditioner")): str,
         vol.Optional("enabled", default=values.get("enabled", True)): selector.BooleanSelector(),
-        vol.Optional("energy_entity", description={"suggested_value": values.get("energy_entity")}): _entity("sensor", "energy"),
-        vol.Optional("power_entity", description={"suggested_value": values.get("power_entity")}): _entity("sensor", "power"),
-        vol.Optional("state_entity", description={"suggested_value": values.get("state_entity")}): _entity(["sensor", "climate", "water_heater"]),
-        vol.Optional("state_attribute", description={"suggested_value": values.get("state_attribute")}): str,
-        vol.Optional("room_temperature_entity", description={"suggested_value": values.get("room_temperature_entity")}): _entity(["sensor", "climate"], "temperature"),
-        vol.Optional("supply_temperature_entity", description={"suggested_value": values.get("supply_temperature_entity")}): _entity("sensor", "temperature"),
-        vol.Optional("return_temperature_entity", description={"suggested_value": values.get("return_temperature_entity")}): _entity("sensor", "temperature"),
+        vol.Optional("energy_entity", default=values.get("energy_entity")): _entity("sensor", "energy"),
+        vol.Optional("power_entity", default=values.get("power_entity")): _entity("sensor", "power"),
+        vol.Optional("state_entity", default=values.get("state_entity")): _entity(["sensor", "climate", "water_heater"]),
+        vol.Optional("state_attribute", default=values.get("state_attribute")): str,
+        vol.Optional("room_temperature_entity", default=values.get("room_temperature_entity")): _entity(["sensor", "climate"], "temperature"),
+        vol.Optional("supply_temperature_entity", default=values.get("supply_temperature_entity")): _entity("sensor", "temperature"),
+        vol.Optional("return_temperature_entity", default=values.get("return_temperature_entity")): _entity("sensor", "temperature"),
         vol.Optional("state_map", default=json.dumps(values.get("state_map") or (DEFAULT_HP_MAP if kind == "heat_pump" else DEFAULT_AC_MAP))): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
         vol.Required("add_another", default=False): selector.BooleanSelector(),
-    })
+    }
+    if values.get("equipment_id"):
+        schema[vol.Required("action", default="update")] = selector.SelectSelector(
+            selector.SelectSelectorConfig(options=["update", "disable", "remove"])
+        )
+    return vol.Schema(schema)
 
 
 def _temperature(values=None):
@@ -63,8 +68,8 @@ def _temperature(values=None):
         vol.Optional("source_id", default=values.get("source_id", uuid.uuid4().hex[:12])): str,
         vol.Optional("display_name", default=values.get("display_name", "Temperature")): str,
         vol.Optional("role", default=values.get("role", "indoor")): selector.SelectSelector(selector.SelectSelectorConfig(options=["outdoor", "indoor", "supply", "return", "dhw", "equipment_room"])),
-        vol.Optional("entity_id", description={"suggested_value": values.get("entity_id")}): _entity(["sensor", "climate", "water_heater"]),
-        vol.Optional("attribute", description={"suggested_value": values.get("attribute")}): str,
+        vol.Optional("entity_id", default=values.get("entity_id")): _entity(["sensor", "climate", "water_heater"]),
+        vol.Optional("attribute", default=values.get("attribute")): str,
         vol.Optional("enabled", default=values.get("enabled", True)): selector.BooleanSelector(),
         vol.Optional("minimum", default=quality.get("minimum", -50)): vol.Coerce(float),
         vol.Optional("maximum", default=quality.get("maximum", 60)): vol.Coerce(float),
@@ -73,14 +78,17 @@ def _temperature(values=None):
         vol.Optional("freshness_minutes", default=quality.get("freshness_minutes", 360)): vol.Coerce(int),
         vol.Optional("missing_after_minutes", default=quality.get("missing_after_minutes", 360)): vol.Coerce(int),
         vol.Required("add_another", default=False): selector.BooleanSelector(),
+        **({vol.Required("action", default="update"): selector.SelectSelector(
+            selector.SelectSelectorConfig(options=["update", "disable", "remove"])
+        )} if values.get("source_id") else {}),
     })
 
 
 def _site(values):
     return vol.Schema({
-        vol.Optional("pv", description={"suggested_value": values.get("pv")}): _entity("sensor", "energy"),
-        vol.Optional("import", description={"suggested_value": values.get("import")}): _entity("sensor", "energy"),
-        vol.Optional("export", description={"suggested_value": values.get("export")}): _entity("sensor", "energy"),
+        vol.Optional("pv", default=values.get("pv")): _entity("sensor", "energy"),
+        vol.Optional("import", default=values.get("import")): _entity("sensor", "energy"),
+        vol.Optional("export", default=values.get("export")): _entity("sensor", "energy"),
     })
 
 
@@ -106,9 +114,16 @@ def _check_source(hass, entity_id, expected):
     if state is None: return "source_unavailable"
     unit = state.attributes.get("unit_of_measurement")
     state_class = state.attributes.get("state_class")
-    if expected == "energy" and (unit not in ENERGY_UNITS or state_class not in {"total", "total_increasing"}): return "incompatible_energy_source"
-    if expected == "power" and unit not in POWER_UNITS: return "incompatible_power_source"
-    if expected == "temperature" and unit not in TEMPERATURE_UNITS: return "incompatible_temperature_source"
+    device_class = state.attributes.get("device_class")
+    if expected == "energy" and (
+        unit not in ENERGY_UNITS or device_class != "energy"
+        or state_class not in {"total", "total_increasing"}
+    ): return "incompatible_energy_source"
+    if expected == "power" and (unit not in POWER_UNITS or device_class != "power"):
+        return "incompatible_power_source"
+    if expected == "temperature" and (
+        unit not in TEMPERATURE_UNITS or device_class != "temperature"
+    ): return "incompatible_temperature_source"
     return None
 
 
@@ -124,10 +139,16 @@ class _Wizard:
         self.result = dict(values)
         self.equipment = parse_json_records(self.result.get("equipment"))
         self.temperatures = parse_json_records(self.result.get("temperature_sources"))
+        self._editing = False
+        self._equipment_pending: dict[str, list[dict[str, Any]]] = {}
+        self._temperature_pending: list[dict[str, Any]] | None = None
 
     async def async_step_general(self, user_input=None):
         if user_input is not None:
-            self.result.update(user_input); self.equipment = []; self.temperatures = []
+            self.result.update(user_input)
+            if not self._editing:
+                self.equipment = []
+                self.temperatures = []
             return await self.async_step_heat_pumps()
         return self.async_show_form(step_id="general", data_schema=_general(self.result))
 
@@ -155,6 +176,42 @@ class _Wizard:
         return errors
 
     async def _equipment_step(self, step_id, kind, user_input, allow_skip):
+        if self._editing:
+            if kind not in self._equipment_pending:
+                self._equipment_pending[kind] = [item for item in self.equipment if item.get("kind") == kind]
+                self.equipment = [item for item in self.equipment if item.get("kind") != kind]
+            pending = self._equipment_pending[kind]
+            current = pending[0] if pending else None
+            if user_input is not None:
+                action = user_input.pop("action", "update")
+                add_another = bool(user_input.get("add_another"))
+                if current is not None:
+                    pending.pop(0)
+                    user_input["equipment_id"] = current["equipment_id"]
+                if action != "remove":
+                    if action == "disable":
+                        user_input["enabled"] = False
+                    errors = self._accept_equipment(kind, user_input)
+                    if errors:
+                        if current is not None:
+                            pending.insert(0, current)
+                        return self.async_show_form(
+                            step_id=step_id, data_schema=_equipment(kind, user_input, allow_skip),
+                            errors=errors,
+                        )
+                if pending:
+                    return self.async_show_form(
+                        step_id=step_id, data_schema=_equipment(kind, pending[0], allow_skip)
+                    )
+                if add_another:
+                    return self.async_show_form(
+                        step_id=step_id, data_schema=_equipment(kind, allow_skip=allow_skip)
+                    )
+                return await (self.async_step_air_conditioners() if kind == "heat_pump" else self.async_step_solar_grid())
+            if current is not None:
+                return self.async_show_form(
+                    step_id=step_id, data_schema=_equipment(kind, current, allow_skip)
+                )
         if user_input is not None:
             errors = self._accept_equipment(kind, user_input)
             if errors: return self.async_show_form(step_id=step_id, data_schema=_equipment(kind, user_input, allow_skip), errors=errors)
@@ -177,18 +234,46 @@ class _Wizard:
         return self.async_show_form(step_id="solar_grid", data_schema=_site(values))
 
     async def async_step_temperatures(self, user_input=None):
+        if self._editing:
+            if self._temperature_pending is None:
+                self._temperature_pending = list(self.temperatures)
+                self.temperatures = []
+            current = self._temperature_pending[0] if self._temperature_pending else None
+            if user_input is None and current is not None:
+                return self.async_show_form(step_id="temperatures", data_schema=_temperature(current))
+            if user_input is not None:
+                action = user_input.pop("action", "update")
+                add_another = bool(user_input.get("add_another"))
+                if current is not None:
+                    self._temperature_pending.pop(0)
+                    user_input["source_id"] = current["source_id"]
+                if action == "remove":
+                    if self._temperature_pending:
+                        return self.async_show_form(
+                            step_id="temperatures", data_schema=_temperature(self._temperature_pending[0])
+                        )
+                    return await (self.async_step_temperatures() if add_another else self.async_step_weather())
+                if action == "disable":
+                    user_input["enabled"] = False
         if user_input is not None:
             if not user_input.get("configure"): return await self.async_step_weather()
             errors = {}
             if error := _check_source(self.hass, user_input.get("entity_id"), "temperature"): errors["entity_id"] = error
             if user_input.get("role") in {"supply", "return"} and _circuit_2k(self.hass, user_input.get("entity_id")): errors["entity_id"] = "circuit_2k_forbidden"
             if user_input.get("minimum", 0) >= user_input.get("maximum", 0): errors["base"] = "invalid_temperature_limits"
-            if errors: return self.async_show_form(step_id="temperatures", data_schema=_temperature(user_input), errors=errors)
+            if errors:
+                if self._editing and current is not None:
+                    self._temperature_pending.insert(0, current)
+                return self.async_show_form(step_id="temperatures", data_schema=_temperature(user_input), errors=errors)
             add_another = user_input.pop("add_another"); user_input.pop("configure")
             invalid = tuple(float(x.strip()) for x in user_input.pop("invalid_values").split(",") if x.strip())
             quality_keys = ("minimum", "maximum", "maximum_change_per_minute", "freshness_minutes", "missing_after_minutes")
             quality = {k: user_input.pop(k) for k in quality_keys}; quality["invalid_values"] = invalid
             user_input["quality"] = quality; self.temperatures.append(user_input)
+            if self._editing and self._temperature_pending:
+                return self.async_show_form(
+                    step_id="temperatures", data_schema=_temperature(self._temperature_pending[0])
+                )
             return await (self.async_step_temperatures() if add_another else self.async_step_weather())
         return self.async_show_form(step_id="temperatures", data_schema=_temperature())
 
@@ -208,14 +293,22 @@ class _Wizard:
 
     async def async_step_data_quality(self, user_input=None):
         if user_input is not None:
+            if not any(item.get("kind") == "heat_pump" for item in self.equipment):
+                return self.async_show_form(
+                    step_id="data_quality", data_schema=self._data_quality_schema(),
+                    errors={"base": "heat_pump_required"},
+                )
             self.result.update(user_input); self.result["equipment"] = json.dumps(self.equipment); self.result["temperature_sources"] = json.dumps(self.temperatures)
             self.result["mapping_effective_at"] = datetime.now(UTC).isoformat()
             return self._finish(self.result)
-        return self.async_show_form(step_id="data_quality", data_schema=vol.Schema({
+        return self.async_show_form(step_id="data_quality", data_schema=self._data_quality_schema())
+
+    def _data_quality_schema(self):
+        return vol.Schema({
             vol.Required("maximum_power_gap_minutes", default=self.result.get("maximum_power_gap_minutes", 30)): vol.Coerce(int),
             vol.Required("counter_jump_limit_kwh", default=self.result.get("counter_jump_limit_kwh", 500)): vol.Coerce(float),
             vol.Required("assumed_heating_reporting", default=self.result.get("assumed_heating_reporting", "separate")): selector.SelectSelector(selector.SelectSelectorConfig(options=["separate", "include_in_heating_total"])),
-        }))
+        })
 
 
 class ConfigFlow(_Wizard, config_entries.ConfigFlow, domain=DOMAIN):
@@ -231,7 +324,10 @@ class ConfigFlow(_Wizard, config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlow(_Wizard, config_entries.OptionsFlow):
-    def __init__(self, config_entry): self.config_entry = config_entry; self._load({**config_entry.data, **config_entry.options})
+    def __init__(self, config_entry):
+        self.config_entry = config_entry
+        self._load({**config_entry.data, **config_entry.options})
+        self._editing = True
     async def async_step_init(self, user_input=None): return await self.async_step_general(user_input)
     def _finish(self, data):
         current = {**self.config_entry.data, **self.config_entry.options}

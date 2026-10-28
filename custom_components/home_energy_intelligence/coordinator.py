@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 import json
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from homeassistant.core import HomeAssistant
@@ -88,7 +89,9 @@ class HomeEnergyCoordinator:
             async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
         return changed
 
-    async def async_process_checkpoint(self, scheduled_at: datetime) -> int:
+    async def async_process_checkpoint(
+        self, scheduled_at: datetime, equipment_ids: set[str] | None = None
+    ) -> int:
         """Persist the last completed wall-clock cycle using UTC instants."""
         zone = ZoneInfo(self.timezone)
         local_end = scheduled_at.astimezone(zone).replace(minute=0, second=0, microsecond=0)
@@ -98,7 +101,7 @@ class HomeEnergyCoordinator:
             self.database.start_job, "checkpoint", {"start": start.isoformat(), "end": end.isoformat()}
         )
         try:
-            source = await self._async_collect_range(start, end)
+            source = await self._async_collect_range(start, end, equipment_ids=equipment_ids)
             changed = 0
             for device, history in source.devices.items():
                 classifier = configurable_classifier(
@@ -154,18 +157,26 @@ class HomeEnergyCoordinator:
         for offset in range(4, -1, -1):
             cycle_end = end - timedelta(hours=6 * offset)
             cycle_start = cycle_end - timedelta(hours=6)
-            exists = await self.hass.async_add_executor_job(
-                self.database.checkpoint_exists, cycle_start.astimezone(UTC), cycle_end.astimezone(UTC)
+            enabled = {
+                item.equipment_id for item in equipment_from_config(self.config) if item.enabled
+            }
+            missing = await self.hass.async_add_executor_job(
+                self.database.missing_checkpoint_devices,
+                cycle_start.astimezone(UTC), cycle_end.astimezone(UTC), enabled,
             )
-            if not exists:
-                await self.async_process_checkpoint(cycle_end)
+            if missing:
+                await self.async_process_checkpoint(cycle_end, equipment_ids=missing)
 
     async def _async_collect(self, day: date) -> DailyInput:
         start, end = local_day_bounds(day, self.timezone)
         return await self._async_collect_range(start, end)
 
-    async def _async_collect_range(self, start: datetime, end: datetime) -> DailyInput:
+    async def _async_collect_range(
+        self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None
+    ) -> DailyInput:
         equipment = [item for item in equipment_from_config(self.config) if item.enabled]
+        if equipment_ids is not None:
+            equipment = [item for item in equipment if item.equipment_id in equipment_ids]
         temperature_sources = [item for item in temperatures_from_config(self.config) if item.enabled]
         explicitly_mapped = {(item.entity_id, item.role) for item in temperature_sources}
         temperature_sources.extend(
@@ -202,22 +213,34 @@ class HomeEnergyCoordinator:
                 retention_policy=str(self.config.get("influx_retention_policy", "autogen")),
             )
 
+        def source_unit(entity_id: str | None) -> str | None:
+            state = self.hass.states.get(entity_id) if entity_id else None
+            return state.attributes.get("unit_of_measurement") if state else None
+
         async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
-                          attribute: str | None = None) -> list[NumericSample]:
+                          attribute: str | None = None, dimension: str | None = None) -> list[NumericSample]:
             if not entity_id:
                 return []
-            raw = [NumericSample(item.timestamp, item.value, item.reason, entity_id)
-                   for item in states_to_numeric(history.get(entity_id, []), attribute=attribute)]
+            raw = [NumericSample(item.timestamp, item.value, item.reason, entity_id,
+                                 item.source_unit, item.normalized_unit)
+                   for item in states_to_numeric(history.get(entity_id, []), attribute=attribute,
+                                                 dimension=dimension)]
             if len(raw) >= 2:
                 return raw
             if statistics_type:
                 from_statistics = (
-                    statistics_to_counter_samples(statistics.get(entity_id, []), start)
+                    statistics_to_counter_samples(
+                        statistics.get(entity_id, []), start,
+                        source_unit=source_unit(entity_id) or "kWh",
+                    )
                     if statistics_type == "counter"
-                    else statistics_to_numeric_samples(statistics.get(entity_id, []))
+                    else statistics_to_numeric_samples(
+                        statistics.get(entity_id, []), source_unit=source_unit(entity_id) or "°C"
+                    )
                 )
                 if len(from_statistics) >= 2:
-                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id)
+                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id,
+                                          item.source_unit, item.normalized_unit)
                             for item in from_statistics]
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
             if influx is not None and isinstance(mapping, dict):
@@ -227,24 +250,41 @@ class HomeEnergyCoordinator:
                 ))
                 if rows:
                     used_influx.append(source_key)
-                    return [NumericSample(timestamp, value, source=entity_id) for timestamp, value in rows]
+                    influx_unit = mapping.get("unit")
+                    converted = states_to_numeric([
+                        SimpleNamespace(
+                            last_updated=timestamp, state=value,
+                            attributes={"unit_of_measurement": influx_unit},
+                        )
+                        for timestamp, value in rows
+                    ], dimension=dimension)
+                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id,
+                                          item.source_unit, item.normalized_unit)
+                            for item in converted]
             return raw
 
         devices = {}
         for item in equipment:
             devices[item.equipment_id] = DeviceHistory(
                 counter=await numeric(f"equipment.{item.equipment_id}.energy", item.energy_entity,
-                                      statistics_type="counter"),
-                power=await numeric(f"equipment.{item.equipment_id}.power", item.power_entity),
+                                      statistics_type="counter", dimension="energy"),
+                power=await numeric(f"equipment.{item.equipment_id}.power", item.power_entity,
+                                    dimension="power"),
                 mode=states_to_modes(history.get(item.state_entity, [])) if item.state_entity else [],
                 kind=item.kind, state_map=item.state_map, state_attribute=item.state_attribute,
                 provenance={
                     "energy_entity": item.energy_entity, "power_entity": item.power_entity,
                     "state_entity": item.state_entity, "equipment_id": item.equipment_id,
+                    "source_units": {
+                        "energy": source_unit(item.energy_entity),
+                        "power": source_unit(item.power_entity),
+                    },
+                    "normalized_units": {"energy": "kWh", "power": "W"},
                 },
             )
         site_counters = {
-            name: await numeric(f"site.{name}", entity_id, statistics_type="counter")
+            name: await numeric(f"site.{name}", entity_id, statistics_type="counter",
+                                dimension="energy")
             for name, entity_id in site_sources.items()
         }
         temperatures = {}
@@ -254,7 +294,7 @@ class HomeEnergyCoordinator:
             temperatures[item.source_id] = await numeric(
                 f"temperature.{item.source_id}", item.entity_id,
                 statistics_type="mean" if item.attribute is None else None,
-                attribute=item.attribute,
+                attribute=item.attribute, dimension="temperature",
             )
             temperature_quality[item.source_id] = item.quality
             temperature_roles[item.source_id] = item.role
@@ -267,4 +307,5 @@ class HomeEnergyCoordinator:
             "influx_backfill_keys": used_influx,
             "collected_at": datetime.now(UTC).isoformat(),
             "mapping_effective_at": revision["effective_at"],
-        }, temperature_quality=temperature_quality, temperature_roles=temperature_roles)
+        }, temperature_quality=temperature_quality, temperature_roles=temperature_roles,
+            site_configured={key for key, entity in site_sources.items() if entity})

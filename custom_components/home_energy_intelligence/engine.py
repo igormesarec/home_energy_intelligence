@@ -33,6 +33,7 @@ class DailyInput:
     checkpoints: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     temperature_quality: dict[str, TemperatureQuality] = field(default_factory=dict)
     temperature_roles: dict[str, str] = field(default_factory=dict)
+    site_configured: set[str] = field(default_factory=set)
 
 
 def _sum_optional(values: list[float | None]) -> float | None:
@@ -139,6 +140,12 @@ class DailyAggregator:
                 # confirmed category.
                 residual = meter_value - sum(categories.values())
                 residual_known = True
+            positive_residual = (
+                max(0.0, residual)
+                if residual_known and history.kind == "heat_pump" else 0.0
+            )
+            assumed_from_modes = categories.get("heating_assumed", 0.0)
+            reporting_assumed = assumed_from_modes + positive_residual
             meter_totals.append(meter_value)
             allocations[device] = {
                 "meter_kwh": meter_value,
@@ -155,9 +162,11 @@ class DailyAggregator:
                 "source_provenance": history.provenance,
                 "checkpoint_source_provenance": checkpoint_sources,
                 "assumed_heating_reporting": self.assumed_heating_reporting,
+                "reported_assumed_heating_kwh": reporting_assumed,
+                "uncertain_residual_kwh": residual if residual_known else None,
                 "reported_heating_kwh": None if meter_value is None else (
                     categories.get("confirmed_heating", 0.0) + categories.get("heating", 0.0)
-                    + (categories.get("heating_assumed", 0.0)
+                    + (reporting_assumed
                        if self.assumed_heating_reporting == "include_in_heating_total" else 0.0)
                 ),
             }
@@ -168,8 +177,12 @@ class DailyAggregator:
                 source.site_counters.get(key, []), start, end,
                 maximum_delta_kwh=self.maximum_counter_delta_kwh,
             )[0]
+        configured_site = source.site_configured or {
+            key for key, samples in source.site_counters.items() if samples
+        }
+        pv_term = 0.0 if "pv" not in configured_site else site_values["pv"]
         household = _sum_optional([
-            site_values["pv"], site_values["import"],
+            pv_term, site_values["import"],
             None if site_values["export"] is None else -site_values["export"],
         ])
         hvac_total = _sum_optional(meter_totals)

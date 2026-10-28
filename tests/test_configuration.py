@@ -41,3 +41,17 @@ def test_duplicate_physical_meter_is_rejected_and_temperature_quality_is_per_sou
     assert not validate_no_duplicate_meters(equipment_from_config(config), {"pv": "sensor.shared"})
     quality = temperatures_from_config(config)[0].quality
     assert quality.minimum == -35 and quality.freshness_minutes == 20
+
+
+def test_multiple_heat_pumps_zero_ac_no_pv_and_no_temperatures_are_valid_shapes():
+    config = {"equipment": json.dumps([
+        {"equipment_id": "hp-1", "display_name": "Downstairs", "kind": "heat_pump",
+         "enabled": True, "energy_entity": "sensor.hp1"},
+        {"equipment_id": "hp-2", "display_name": "Upstairs", "kind": "heat_pump",
+         "enabled": False, "energy_entity": "sensor.hp2"},
+    ]), "site_sources": {}, "temperature_sources": "[]"}
+    equipment = equipment_from_config(config)
+    assert [item.kind for item in equipment] == ["heat_pump", "heat_pump"]
+    assert not [item for item in equipment if item.kind == "air_conditioner"]
+    assert temperatures_from_config(config) == []
+    assert validate_no_duplicate_meters(equipment, {})

@@ -7,6 +7,7 @@ from functools import partial
 from typing import Any
 
 from .models import NumericSample, StateSample
+from .units import IncompatibleUnitError, normalize_value, normalized_unit
 
 
 class RecorderReader:
@@ -45,17 +46,36 @@ class RecorderReader:
         )
 
 
-def states_to_numeric(rows: list[Any], *, attribute: str | None = None) -> list[NumericSample]:
+def states_to_numeric(
+    rows: list[Any], *, attribute: str | None = None, dimension: str | None = None
+) -> list[NumericSample]:
     result = []
     for row in rows:
         value = row.attributes.get(attribute) if attribute else row.state
+        unit = row.attributes.get("unit_of_measurement")
         if value in (None, "unknown", "unavailable", ""):
-            result.append(NumericSample(row.last_updated, None, str(value or "unavailable")))
+            result.append(NumericSample(
+                row.last_updated, None, str(value or "unavailable"),
+                source_unit=unit, normalized_unit=normalized_unit(dimension) if dimension else unit,
+            ))
             continue
         try:
-            result.append(NumericSample(row.last_updated, float(value)))
+            if dimension:
+                converted = normalize_value(float(value), unit, dimension)
+                result.append(NumericSample(
+                    row.last_updated, converted.value, source_unit=converted.source_unit,
+                    normalized_unit=converted.normalized_unit,
+                ))
+            else:
+                result.append(NumericSample(row.last_updated, float(value), source_unit=unit,
+                                            normalized_unit=unit))
+        except IncompatibleUnitError:
+            result.append(NumericSample(
+                row.last_updated, None, f"incompatible_{dimension}_unit:{unit or 'missing'}",
+                source_unit=unit, normalized_unit=normalized_unit(dimension),
+            ))
         except (TypeError, ValueError):
-            result.append(NumericSample(row.last_updated, None, "non_numeric"))
+            result.append(NumericSample(row.last_updated, None, "non_numeric", source_unit=unit))
     return result
 
 
@@ -64,27 +84,31 @@ def states_to_modes(rows: list[Any]) -> list[StateSample]:
 
 
 def statistics_to_counter_samples(rows: list[dict[str, Any]], start: datetime,
-                                  initial_sum: float = 0.0) -> list[NumericSample]:
+                                  initial_sum: float = 0.0,
+                                  source_unit: str = "kWh") -> list[NumericSample]:
     """Convert LTS sum/change rows to a monotonic synthetic counter.
 
     This preserves authoritative changes for old history but is not used for
     sub-hour mode boundaries; the resulting provenance is therefore partial.
     """
-    total = initial_sum
-    result = [NumericSample(start, total)]
+    factor = normalize_value(1.0, source_unit, "energy").value
+    total = initial_sum * factor
+    result = [NumericSample(start, total, source_unit=source_unit, normalized_unit="kWh")]
     for row in rows:
         change = row.get("change")
         if change is None:
             continue
-        total += max(0.0, float(change))
+        total += max(0.0, float(change) * factor)
         stamp = row.get("end", row["start"])
         if isinstance(stamp, (int, float)):
             stamp = datetime.fromtimestamp(stamp, tz=start.tzinfo)
-        result.append(NumericSample(stamp, total))
+        result.append(NumericSample(stamp, total, source_unit=source_unit, normalized_unit="kWh"))
     return result
 
 
-def statistics_to_numeric_samples(rows: list[dict[str, Any]]) -> list[NumericSample]:
+def statistics_to_numeric_samples(
+    rows: list[dict[str, Any]], *, source_unit: str = "°C"
+) -> list[NumericSample]:
     """Convert time-weighted Recorder statistics to numeric interval samples."""
     result = []
     for row in rows:
@@ -97,8 +121,13 @@ def statistics_to_numeric_samples(rows: list[dict[str, Any]]) -> list[NumericSam
             start = datetime.fromtimestamp(start, tz=UTC)
         if isinstance(end, (int, float)):
             end = datetime.fromtimestamp(end, tz=UTC)
-        bounds = f"statistics_bounds:{row.get('min', value)}:{row.get('max', value)}"
-        result.append(NumericSample(start, float(value), bounds))
+        converted = normalize_value(float(value), source_unit, "temperature")
+        minimum = normalize_value(float(row.get("min", value)), source_unit, "temperature").value
+        maximum = normalize_value(float(row.get("max", value)), source_unit, "temperature").value
+        bounds = f"statistics_bounds:{minimum}:{maximum}"
+        result.append(NumericSample(start, converted.value, bounds, source_unit=source_unit,
+                                    normalized_unit="°C"))
         if end is not None:
-            result.append(NumericSample(end, None, "statistics_interval_end"))
+            result.append(NumericSample(end, None, "statistics_interval_end",
+                                        source_unit=source_unit, normalized_unit="°C"))
     return result

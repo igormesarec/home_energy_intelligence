@@ -28,10 +28,31 @@ def _coordinator(hass):
 async def ws_overview(hass, connection, msg):
     coordinator = _coordinator(hass)
     if coordinator is None:
-        connection.send_result(msg["id"], {"configured": False, "latest": None})
+        connection.send_result(msg["id"], {"configured": False, "latest": None, "equipment": []})
         return
     latest = await hass.async_add_executor_job(coordinator.database.latest)
-    connection.send_result(msg["id"], {"configured": True, "latest": latest})
+    equipment = [
+        {
+            "equipment_id": item.equipment_id,
+            "display_name": item.display_name,
+            "kind": item.kind,
+            "enabled": item.enabled,
+        }
+        for item in equipment_from_config(coordinator.config)
+    ]
+    temperatures = [
+        {
+            "source_id": item.source_id,
+            "display_name": item.display_name,
+            "role": item.role,
+            "enabled": item.enabled,
+        }
+        for item in temperatures_from_config(coordinator.config)
+    ]
+    connection.send_result(msg["id"], {
+        "configured": True, "latest": latest, "equipment": equipment,
+        "temperature_sources": temperatures,
+    })
 
 
 @websocket_api.websocket_command({
@@ -39,7 +60,6 @@ async def ws_overview(hass, connection, msg):
     vol.Optional("limit", default=90): vol.All(vol.Coerce(int), vol.Range(min=1, max=3660)),
     vol.Optional("before"): str,
 })
-@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_history(hass, connection, msg):
     coordinator = _coordinator(hass)
