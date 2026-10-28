@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "home-energy-intelligence"
+version = "0.1.0"
+description = "Validated daily energy intelligence for Home Assistant"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.pytest-tmp"
+pythonpath = ["."]
+asyncio_mode = "auto"
+markers = ["asyncio: execute with pytest-asyncio (Home Assistant runtime suite)"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["custom_components/home_energy_intelligence"]
+omit = ["*/frontend/*"]

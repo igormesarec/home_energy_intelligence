@@ -50,6 +50,7 @@ coverage.xml
 *.lcov
 .hypothesis/
 .pytest_cache/
+.pytest-tmp/
 cover/
 
 # Translations
@@ -204,6 +205,16 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+
+# Local implementation briefings (may contain installation-specific entity IDs)
+CODEX_START_PROMPT.md
+HOME_ENERGY_INTELLIGENCE_V0_1_CODEX_SPEC.md
+HOME_ENERGY_INTELLIGENCE_DASHBOARD_DESIGN.md
+
+# Runtime data and exports
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Ruff stuff:
 .ruff_cache/
