@@ -49,6 +49,8 @@ class TemperatureResult:
     rejected_count: int
     rejected_reasons: tuple[str, ...]
     rejections: tuple[RejectedReading, ...] = ()
+    latest_value: float | None = None
+    latest_timestamp: str | None = None
 
     @property
     def coverage_percent(self) -> float:

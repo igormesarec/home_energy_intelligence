@@ -42,3 +42,12 @@ def test_dashboard_role_contract_keeps_settings_admin_only_not_history():
     settings_prefix = source[source.rindex("@websocket_api.websocket_command", 0, source.index("async def ws_settings")):source.index("async def ws_settings")]
     assert "require_admin" not in history_prefix
     assert "require_admin" in settings_prefix
+
+
+def test_indoor_and_outdoor_cards_share_one_component_contract():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert 'this.temperatureCard("indoor")' in source
+    assert 'this.temperatureCard("outdoor")' in source
+    assert "latest_value" in source and "latest_timestamp" in source
+    assert "coverage_percent" in source
+    assert "representative_${role}_source_id" in source

@@ -60,11 +60,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _six_hour(_now):
         await coordinator.async_process_checkpoint(_now)
 
+    async def _hourly(now):
+        end = now.astimezone(ZoneInfo("UTC")).replace(minute=0, second=0, microsecond=0)
+        await coordinator.async_process_hour(end - timedelta(hours=1), end)
+
     async def _daily_close(now):
         local_day = now.astimezone(ZoneInfo(hass.config.time_zone)).date() - timedelta(days=1)
         await coordinator.async_process_day(local_day, reason="05:00_daily_close")
 
     unsubscribers = [
+        async_track_time_change(hass, _hourly, minute=4, second=0),
         async_track_time_change(hass, _six_hour, hour=[0, 6, 12, 18], minute=0, second=0),
         async_track_time_change(hass, _daily_close, hour=5, minute=0, second=0),
         entry.add_update_listener(_async_reload_entry),

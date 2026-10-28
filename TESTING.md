@@ -29,6 +29,9 @@ Covered acceptance cases include:
 - Per-equipment checkpoint completeness, including one valid device beside independently missing devices.
 - Stable equipment/source IDs and temperature filters surviving unrelated Options Flow changes.
 - Equipment-neutral dashboard source checks and authenticated-user/admin authorization boundaries.
+- Canonical Overview/History/export energy fields, missing-equipment behavior and residual reconciliation.
+- Idempotent hourly persistence, bounded history pagination and all 25 elapsed hours on the October DST fallback day.
+- Python compilation and frontend JavaScript syntax validation for every release candidate.
 - Unchanged Recorder temperatures remaining valid independently of their last value-change time.
 - Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.

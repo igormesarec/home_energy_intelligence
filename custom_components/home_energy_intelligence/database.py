@@ -14,7 +14,7 @@ from typing import Any
 
 from .models import DailyRecord
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -68,9 +68,16 @@ CREATE TABLE IF NOT EXISTS mapping_revisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, effective_at TEXT NOT NULL,
   checksum TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hourly_records (
+  interval_start_utc TEXT NOT NULL, interval_end_utc TEXT NOT NULL,
+  local_date TEXT NOT NULL, timezone TEXT NOT NULL, payload_json TEXT NOT NULL,
+  checksum TEXT NOT NULL, quality TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (interval_start_utc, interval_end_utc)
+);
 CREATE INDEX IF NOT EXISTS idx_daily_records_date ON daily_records(local_date DESC);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_date ON checkpoints(local_date);
 CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hourly_local_date ON hourly_records(local_date, interval_start_utc);
 """
 MIGRATION_2 = """
 ALTER TABLE rejected_readings ADD COLUMN duration_seconds REAL;
@@ -80,6 +87,15 @@ CREATE TABLE IF NOT EXISTS mapping_revisions (
   checksum TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
+"""
+MIGRATION_3 = """
+CREATE TABLE IF NOT EXISTS hourly_records (
+  interval_start_utc TEXT NOT NULL, interval_end_utc TEXT NOT NULL,
+  local_date TEXT NOT NULL, timezone TEXT NOT NULL, payload_json TEXT NOT NULL,
+  checksum TEXT NOT NULL, quality TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (interval_start_utc, interval_end_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_hourly_local_date ON hourly_records(local_date, interval_start_utc);
 """
 
 
@@ -148,6 +164,10 @@ class EnergyDatabase:
                 connection.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
             elif row[0] == 1:
                 connection.executescript(MIGRATION_2)
+                connection.executescript(MIGRATION_3)
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            elif row[0] == 2:
+                connection.executescript(MIGRATION_3)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
@@ -332,9 +352,98 @@ class EnergyDatabase:
             result.append(item)
         return result
 
+    def history_range(
+        self, *, start_date: str | None = None, end_date: str | None = None,
+        limit: int = 90, offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return a bounded page and total count without loading all history."""
+        limit = max(1, min(limit, 366))
+        offset = max(0, offset)
+        clauses, args = [], []
+        if start_date:
+            clauses.append("local_date >= ?")
+            args.append(start_date)
+        if end_date:
+            clauses.append("local_date <= ?")
+            args.append(end_date)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            total = int(connection.execute(
+                f"SELECT COUNT(*) FROM daily_records{where}", args
+            ).fetchone()[0])
+            rows = connection.execute(
+                f"SELECT payload_json,revision,updated_at FROM daily_records{where} "
+                "ORDER BY local_date DESC LIMIT ? OFFSET ?", [*args, limit, offset],
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = json.loads(row["payload_json"])
+            item.update(revision=row["revision"], updated_at=row["updated_at"])
+            result.append(item)
+        return result, total
+
+    def upsert_hourly(self, payload: dict[str, Any]) -> bool:
+        """Store one completed elapsed-hour interval idempotently."""
+        serialized = _canonical_json(payload)
+        checksum = _checksum(serialized)
+        start = str(payload["period_start_utc"])
+        end = str(payload["period_end_utc"])
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            prior = connection.execute(
+                "SELECT checksum FROM hourly_records WHERE interval_start_utc=? AND interval_end_utc=?",
+                (start, end),
+            ).fetchone()
+            if prior and prior["checksum"] == checksum:
+                return False
+            connection.execute(
+                """INSERT INTO hourly_records VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(interval_start_utc,interval_end_utc) DO UPDATE SET
+                local_date=excluded.local_date,timezone=excluded.timezone,
+                payload_json=excluded.payload_json,checksum=excluded.checksum,
+                quality=excluded.quality,updated_at=excluded.updated_at""",
+                (start, end, payload["local_date"], payload["timezone"], serialized,
+                 checksum, payload.get("quality", "missing"), now),
+            )
+        return True
+
+    def hourly_range(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        """Load only intervals overlapping a bounded UTC range."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT payload_json,updated_at FROM hourly_records
+                WHERE interval_start_utc>=? AND interval_end_utc<=?
+                ORDER BY interval_start_utc""", (start.isoformat(), end.isoformat()),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = json.loads(row["payload_json"])
+            item["updated_at"] = row["updated_at"]
+            result.append(item)
+        return result
+
+    def hourly_exists(self, start: datetime, end: datetime) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM hourly_records WHERE interval_start_utc=? AND interval_end_utc=?",
+                (start.isoformat(), end.isoformat()),
+            ).fetchone() is not None
+
     def latest(self) -> dict[str, Any] | None:
         rows = self.history(limit=1)
         return rows[0] if rows else None
+
+    def daily(self, local_date: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json,revision,updated_at FROM daily_records WHERE local_date=?",
+                (local_date,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = json.loads(row["payload_json"])
+        item.update(revision=row["revision"], updated_at=row["updated_at"])
+        return item
 
     def export_to(self, destination: str | Path) -> Path:
         target = Path(destination)

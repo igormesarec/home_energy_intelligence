@@ -72,6 +72,7 @@ def time_weighted_temperature(
     rejected_reasons: list[str] = []
     rejections: list[RejectedReading] = []
     prior_valid: NumericSample | None = None
+    latest_valid: NumericSample | None = None
 
     for index, sample in enumerate(active):
         segment_start = max(start, sample.timestamp)
@@ -123,6 +124,7 @@ def time_weighted_temperature(
         coverage += seconds
         accepted_values.append(sample.value)
         prior_valid = sample
+        latest_valid = sample
         if sample.reason and sample.reason.startswith("statistics_bounds:"):
             try:
                 _prefix, minimum, maximum = sample.reason.split(":", 2)
@@ -145,4 +147,6 @@ def time_weighted_temperature(
         len(rejected_reasons),
         tuple(rejected_reasons),
         tuple(rejections),
+        latest_valid.value if latest_valid else None,
+        latest_valid.timestamp.isoformat() if latest_valid else None,
     )

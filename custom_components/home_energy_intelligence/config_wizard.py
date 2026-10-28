@@ -41,6 +41,8 @@ def _general(values):
     return vol.Schema({
         vol.Required("locale", default=values.get("locale", "en")): selector.SelectSelector(selector.SelectSelectorConfig(options=["en", "sl"])),
         vol.Required("floor_area_m2", default=values.get("floor_area_m2", 180)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=5000, step=1, unit_of_measurement="m²")),
+        vol.Required("energy_season_start_month", default=values.get("energy_season_start_month", 7)): vol.All(vol.Coerce(int), vol.Range(min=1, max=12)),
+        vol.Required("energy_season_start_day", default=values.get("energy_season_start_day", 1)): vol.All(vol.Coerce(int), vol.Range(min=1, max=28)),
     })
 
 
@@ -313,11 +315,32 @@ class _Wizard:
         return self.async_show_form(step_id="data_quality", data_schema=self._data_quality_schema())
 
     def _data_quality_schema(self):
-        return vol.Schema({
+        schema = {
             vol.Required("maximum_power_gap_minutes", default=self.result.get("maximum_power_gap_minutes", 30)): vol.Coerce(int),
             vol.Required("counter_jump_limit_kwh", default=self.result.get("counter_jump_limit_kwh", 500)): vol.Coerce(float),
             vol.Required("assumed_heating_reporting", default=self.result.get("assumed_heating_reporting", "separate")): selector.SelectSelector(selector.SelectSelectorConfig(options=["separate", "include_in_heating_total"])),
-        })
+        }
+        indoor = [item for item in self.temperatures
+                  if item.get("enabled", True) and item.get("role") in {"indoor", "equipment_room"}]
+        if indoor:
+            choices = [{"value": item["source_id"], "label": item.get("display_name", item["source_id"])}
+                       for item in indoor]
+            current = self.result.get("representative_indoor_source_id")
+            schema[vol.Optional("representative_indoor_source_id",
+                                default=current or indoor[0]["source_id"])] = selector.SelectSelector(
+                selector.SelectSelectorConfig(options=choices)
+            )
+        outdoor = [item for item in self.temperatures
+                   if item.get("enabled", True) and item.get("role") == "outdoor"]
+        if outdoor:
+            choices = [{"value": item["source_id"], "label": item.get("display_name", item["source_id"])}
+                       for item in outdoor]
+            current = self.result.get("representative_outdoor_source_id")
+            schema[vol.Optional("representative_outdoor_source_id",
+                                default=current or outdoor[0]["source_id"])] = selector.SelectSelector(
+                selector.SelectSelectorConfig(options=choices)
+            )
+        return vol.Schema(schema)
 
 
 class ConfigFlow(_Wizard, config_entries.ConfigFlow, domain=DOMAIN):

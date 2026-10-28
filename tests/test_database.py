@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import sqlite3
 
 from custom_components.home_energy_intelligence.database import EnergyDatabase, protected_export_path
@@ -140,3 +140,36 @@ def test_detailed_temperature_rejection_audit_is_persisted(tmp_path):
             "SELECT observed_at,value,duration_seconds,reason,source FROM rejected_readings"
         ).fetchone()
     assert tuple(row) == ("2026-10-25T01:00:00+00:00", "-55", 900, "invalid_sentinel", "sensor.outdoor")
+
+
+def test_hourly_records_are_idempotent_bounded_and_dst_safe(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    for index in range(25):
+        interval_start = start + timedelta(hours=index)
+        payload = {
+            "local_date": "2026-10-25", "timezone": "Europe/Ljubljana",
+            "period_start_utc": interval_start.isoformat(),
+            "period_end_utc": (interval_start + timedelta(hours=1)).isoformat(),
+            "quality": "good", "day_seconds": 3600,
+        }
+        assert db.upsert_hourly(payload)
+        assert not db.upsert_hourly(payload)
+    rows = db.hourly_range(start, start + timedelta(hours=25))
+    assert len(rows) == 25
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+
+
+def test_bounded_history_pagination(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    for index, day in enumerate(("2026-10-23", "2026-10-24", "2026-10-25")):
+        item = record(index + 1)
+        item.local_date = day
+        db.upsert_daily(item)
+    rows, total = db.history_range(start_date="2026-10-24", end_date="2026-10-25",
+                                   limit=1, offset=1)
+    assert total == 2
+    assert [row["local_date"] for row in rows] == ["2026-10-24"]

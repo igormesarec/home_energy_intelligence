@@ -53,6 +53,23 @@ class HomeEnergyCoordinator:
             for key, legacy in LEGACY_SITE_KEYS.items()
         }
 
+    def _aggregator(self) -> DailyAggregator:
+        freshness_minutes = int(self.config.get(CONF_TEMPERATURE_FRESHNESS_MINUTES, 0))
+        return DailyAggregator(
+            self.timezone,
+            cycle_hours=int(self.config.get(CONF_CYCLE_HOURS, 6)),
+            temperature_freshness=(timedelta(minutes=freshness_minutes)
+                                   if freshness_minutes else None),
+            seasonal_fallback=bool(self.config.get(CONF_SEASONAL_FALLBACK, False)),
+            maximum_power_gap=timedelta(
+                minutes=int(self.config.get("maximum_power_gap_minutes", 30))
+            ),
+            maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
+            assumed_heating_reporting=str(
+                self.config.get("assumed_heating_reporting", "separate")
+            ),
+        )
+
     async def async_process_day(self, day: date, *, reason: str = "daily_close") -> bool:
         job_id = await self.hass.async_add_executor_job(
             self.database.start_job, "daily", {"date": day.isoformat(), "reason": reason}
@@ -62,17 +79,7 @@ class HomeEnergyCoordinator:
             source.checkpoints = await self.hass.async_add_executor_job(
                 self.database.checkpoints_for_day, day.isoformat()
             )
-            freshness_minutes = int(self.config.get(CONF_TEMPERATURE_FRESHNESS_MINUTES, 0))
-            freshness = timedelta(minutes=freshness_minutes) if freshness_minutes else None
-            aggregator = DailyAggregator(
-                self.timezone,
-                cycle_hours=int(self.config.get(CONF_CYCLE_HOURS, 6)),
-                temperature_freshness=freshness,
-                seasonal_fallback=bool(self.config.get(CONF_SEASONAL_FALLBACK, False)),
-                maximum_power_gap=timedelta(minutes=int(self.config.get("maximum_power_gap_minutes", 30))),
-                maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
-                assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate")),
-            )
+            aggregator = self._aggregator()
             record = await self.hass.async_add_executor_job(aggregator.aggregate, day, source)
             changed = await self.hass.async_add_executor_job(
                 lambda: self.database.upsert_daily(record, reason=reason)
@@ -87,6 +94,42 @@ class HomeEnergyCoordinator:
         )
         if changed:
             async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
+        return changed
+
+    async def async_process_hour(self, start: datetime, end: datetime) -> bool:
+        """Persist one completed elapsed hour; safe to retry after restart."""
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("hourly interval must be an ordered aware range")
+        source = await self._async_collect_range(start, end)
+        local_date = start.astimezone(ZoneInfo(self.timezone)).date()
+        record = await self.hass.async_add_executor_job(
+            self._aggregator().aggregate_range, local_date, start, end, source
+        )
+        payload = record.as_dict()
+        payload["interval_kind"] = "completed_hour"
+        payload["collected_at"] = datetime.now(UTC).isoformat()
+        changed = await self.hass.async_add_executor_job(self.database.upsert_hourly, payload)
+        if changed:
+            async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
+        return changed
+
+    async def async_refresh_hourly(self, now: datetime | None = None) -> int:
+        """Recover bounded missing hours for today and yesterday."""
+        instant = (now or datetime.now(UTC)).astimezone(UTC)
+        completed_end = instant.replace(minute=0, second=0, microsecond=0)
+        zone = ZoneInfo(self.timezone)
+        local_today = instant.astimezone(zone).date()
+        scan_start, _ = local_day_bounds(local_today - timedelta(days=1), self.timezone)
+        changed = 0
+        cursor = scan_start
+        while cursor + timedelta(hours=1) <= completed_end:
+            end = cursor + timedelta(hours=1)
+            exists = await self.hass.async_add_executor_job(
+                self.database.hourly_exists, cursor, end
+            )
+            if not exists:
+                changed += int(await self.async_process_hour(cursor, end))
+            cursor = end
         return changed
 
     async def async_process_checkpoint(
@@ -136,6 +179,7 @@ class HomeEnergyCoordinator:
         return changed
 
     async def async_catch_up(self) -> None:
+        await self.async_refresh_hourly()
         await self.async_recover_checkpoints()
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
         yesterday = local_today - timedelta(days=1)

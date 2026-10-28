@@ -4,7 +4,15 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 
 ![Approved dashboard design](docs/design/home_energy_intelligence_dashboard.png)
 
-## V0.1 features
+## V0.1.1 features
+
+- Overview defaults to today's actuals through the latest completed hour, with a same-cutoff yesterday comparison, full-yesterday reference, explicit partial/stale state and manual refresh.
+- A single backend energy contract drives Overview, History and authenticated CSV export, including confirmed, assumed, selected, estimated, unknown, residual and discrepancy evidence.
+- Compact idempotent hourly rows survive restarts and complement—not replace—the six-hour classification checkpoints and 05:00 authoritative daily close.
+- History supports bounded date ranges, pagination, daily/weekly/monthly/year/energy-season presets and CSV export.
+- Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
+
+## V0.1 foundation
 
 - Guided General, Heat pumps, Air conditioners, Solar/grid, Temperatures, Weather, Data sources, and Data quality UI sections. Every source entity and operating-state mapping is configurable.
 - Options Flow edits, disables or removes individual devices while preserving stable IDs, unrelated mappings and historical records.
@@ -32,7 +40,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
    Energy counters must use the `energy` device class, Wh/kWh/MWh and `total` or `total_increasing`; power sources must use the `power` device class and W/kW.
 5. Add optional PV/grid, temperature and weather sources. Temperature sources accept °C or °F and each has its own physical limits, invalid sentinels, spike limit, point-sample freshness and missing-data thresholds.
 6. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
-7. Confirm the Home Assistant time zone and wait for the first completed six-hour checkpoint. The previous calendar day is finalized at 05:00 local time.
+7. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 

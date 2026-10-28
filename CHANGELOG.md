@@ -1,5 +1,15 @@
 # Changelog
 
+## V0.1.1 — draft
+
+- Added idempotent completed-hour aggregation, restart recovery and an additive SQLite schema V3 migration.
+- Made the backend canonical energy contract authoritative for Overview, History and authenticated CSV export.
+- Added today-through-last-completed-hour actuals, yesterday same-cutoff/full-day comparisons, freshness labels and manual/hourly refresh.
+- Added dynamic per-equipment evidence, representative indoor-source selection, temperature timelines and guarded PV analytics.
+- Added matching representative indoor/outdoor cards and selectors with latest-valid timestamps, time-weighted period statistics, coverage, quality, yesterday comparisons and gap-preserving timelines.
+- Expanded History with bounded date filtering, pagination, period presets and CSV export.
+- Preserved the approved six-tab design and kept COP, thermal modelling and forecasts explicitly deferred.
+
 ## V0.1.0 — draft
 
 ### Corrected after review
