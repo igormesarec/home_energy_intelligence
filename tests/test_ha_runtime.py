@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import importlib.util
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -39,6 +40,8 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
     # integration's real flow handler and runtime setup rather than failing in
     # dependency discovery. Recorder helper signatures are tested separately.
     hass.config.components.update({"frontend", "http", "recorder"})
+    static_paths = AsyncMock()
+    hass.http = SimpleNamespace(async_register_static_paths=static_paths)
     flow = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
     assert flow["type"].value == "form" and flow["step_id"] == "general"
 
@@ -53,6 +56,7 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
         assert entry.state is ConfigEntryState.LOADED
         assert entry.entry_id in hass.data[DOMAIN]
         assert PANEL_URL in hass.data.get("frontend_panels", {})
+        static_paths.assert_awaited_once()
         panel_count = len(hass.data.get("frontend_panels", {}))
         await async_register_panel(hass)
         assert len(hass.data.get("frontend_panels", {})) == panel_count

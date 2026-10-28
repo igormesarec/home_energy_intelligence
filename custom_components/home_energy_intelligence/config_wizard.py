@@ -23,6 +23,13 @@ DEFAULT_HP_MAP = {"heating_zones": "confirmed_heating", "heating_water": "dhw", 
 DEFAULT_AC_MAP = {"heating": "heating", "cooling": "cooling", "idle": "standby", "off": "standby"}
 
 
+def _optional(name: str, value: Any = None, **kwargs):
+    """Return an optional key without manufacturing an invalid None default."""
+    if value is None:
+        return vol.Optional(name, **kwargs)
+    return vol.Optional(name, default=value, **kwargs)
+
+
 def _entity(domains, device_class=None):
     if isinstance(domains, str): domains = [domains]
     config = {"domain": domains}
@@ -44,13 +51,13 @@ def _equipment(kind, values=None, allow_skip=False):
         vol.Optional("equipment_id", default=values.get("equipment_id", uuid.uuid4().hex[:12])): str,
         vol.Optional("display_name", default=values.get("display_name", "Heat pump" if kind == "heat_pump" else "Air conditioner")): str,
         vol.Optional("enabled", default=values.get("enabled", True)): selector.BooleanSelector(),
-        vol.Optional("energy_entity", default=values.get("energy_entity")): _entity("sensor", "energy"),
-        vol.Optional("power_entity", default=values.get("power_entity")): _entity("sensor", "power"),
-        vol.Optional("state_entity", default=values.get("state_entity")): _entity(["sensor", "climate", "water_heater"]),
-        vol.Optional("state_attribute", default=values.get("state_attribute")): str,
-        vol.Optional("room_temperature_entity", default=values.get("room_temperature_entity")): _entity(["sensor", "climate"], "temperature"),
-        vol.Optional("supply_temperature_entity", default=values.get("supply_temperature_entity")): _entity("sensor", "temperature"),
-        vol.Optional("return_temperature_entity", default=values.get("return_temperature_entity")): _entity("sensor", "temperature"),
+        _optional("energy_entity", values.get("energy_entity")): _entity("sensor", "energy"),
+        _optional("power_entity", values.get("power_entity")): _entity("sensor", "power"),
+        _optional("state_entity", values.get("state_entity")): _entity(["sensor", "climate", "water_heater"]),
+        _optional("state_attribute", values.get("state_attribute")): str,
+        _optional("room_temperature_entity", values.get("room_temperature_entity")): _entity(["sensor", "climate"], "temperature"),
+        _optional("supply_temperature_entity", values.get("supply_temperature_entity")): _entity("sensor", "temperature"),
+        _optional("return_temperature_entity", values.get("return_temperature_entity")): _entity("sensor", "temperature"),
         vol.Optional("state_map", default=json.dumps(values.get("state_map") or (DEFAULT_HP_MAP if kind == "heat_pump" else DEFAULT_AC_MAP))): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
         vol.Required("add_another", default=False): selector.BooleanSelector(),
     }
@@ -68,8 +75,8 @@ def _temperature(values=None):
         vol.Optional("source_id", default=values.get("source_id", uuid.uuid4().hex[:12])): str,
         vol.Optional("display_name", default=values.get("display_name", "Temperature")): str,
         vol.Optional("role", default=values.get("role", "indoor")): selector.SelectSelector(selector.SelectSelectorConfig(options=["outdoor", "indoor", "supply", "return", "dhw", "equipment_room"])),
-        vol.Optional("entity_id", default=values.get("entity_id")): _entity(["sensor", "climate", "water_heater"]),
-        vol.Optional("attribute", default=values.get("attribute")): str,
+        _optional("entity_id", values.get("entity_id")): _entity(["sensor", "climate", "water_heater"]),
+        _optional("attribute", values.get("attribute")): str,
         vol.Optional("enabled", default=values.get("enabled", True)): selector.BooleanSelector(),
         vol.Optional("minimum", default=quality.get("minimum", -50)): vol.Coerce(float),
         vol.Optional("maximum", default=quality.get("maximum", 60)): vol.Coerce(float),
@@ -86,9 +93,9 @@ def _temperature(values=None):
 
 def _site(values):
     return vol.Schema({
-        vol.Optional("pv", default=values.get("pv")): _entity("sensor", "energy"),
-        vol.Optional("import", default=values.get("import")): _entity("sensor", "energy"),
-        vol.Optional("export", default=values.get("export")): _entity("sensor", "energy"),
+        _optional("pv", values.get("pv")): _entity("sensor", "energy"),
+        _optional("import", values.get("import")): _entity("sensor", "energy"),
+        _optional("export", values.get("export")): _entity("sensor", "energy"),
     })
 
 
@@ -279,7 +286,9 @@ class _Wizard:
 
     async def async_step_weather(self, user_input=None):
         if user_input is not None: self.result.update(user_input); return await self.async_step_data_sources()
-        return self.async_show_form(step_id="weather", data_schema=vol.Schema({vol.Optional("weather_entity", description={"suggested_value": self.result.get("weather_entity")}): _entity("weather")}))
+        return self.async_show_form(step_id="weather", data_schema=vol.Schema({
+            _optional("weather_entity", self.result.get("weather_entity")): _entity("weather")
+        }))
 
     async def async_step_data_sources(self, user_input=None):
         if user_input is not None:

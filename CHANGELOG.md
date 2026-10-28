@@ -20,6 +20,7 @@
 - Synchronized English and Slovenian guided-flow translations and documented administrator-only settings access.
 - Replaced removed `frontend.async_panel_exists` usage with the supported frontend panel registry and made static-path/panel registration reload-safe.
 - Updated Options Flow for Home Assistant's framework-provided, read-only `config_entry` property.
+- Removed invalid `None` defaults from optional guided-flow fields and supplied the isolated runtime harness with Home Assistant's HTTP registration contract.
 - Reject contaminated long-term temperature-statistic intervals when their min/max bounds contain sentinels or physical outliers.
 
 COP, thermal-profile modelling and weather-dependent forecasting remain deferred and display no invented values.
