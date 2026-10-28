@@ -29,6 +29,7 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
     hass, enable_custom_integrations
 ):
     from homeassistant.config_entries import ConfigEntryState
+    from homeassistant.helpers import entity_registry as er
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     from custom_components.home_energy_intelligence.const import DOMAIN, PANEL_URL
@@ -60,7 +61,11 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
         panel_count = len(hass.data.get("frontend_panels", {}))
         await async_register_panel(hass)
         assert len(hass.data.get("frontend_panels", {})) == panel_count
-        assert any(state.entity_id.endswith("latest_data_quality") for state in hass.states.async_all())
+        quality_entity = er.async_get(hass).async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_latest_data_quality"
+        )
+        assert quality_entity is not None
+        assert hass.states.get(quality_entity) is not None
 
         options = await hass.config_entries.options.async_init(entry.entry_id)
         assert options["type"].value == "form" and options["step_id"] == "general"
