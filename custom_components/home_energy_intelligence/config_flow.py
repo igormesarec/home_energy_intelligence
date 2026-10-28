@@ -73,7 +73,7 @@ def _options_schema(values: dict[str, Any]) -> vol.Schema:
     return vol.Schema(schema)
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class LegacyConfigFlow:
     VERSION = 1
 
     def __init__(self) -> None:
@@ -106,7 +106,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlow()
 
 
-class OptionsFlow(config_entries.OptionsFlow):
+class LegacyOptionsFlow:
     async def async_step_init(self, user_input=None):
         current = {**self.config_entry.data, **self.config_entry.options}
         if user_input is not None:
@@ -117,3 +117,8 @@ class OptionsFlow(config_entries.OptionsFlow):
                 user_input[CONF_INFLUX_PASSWORD] = current[CONF_INFLUX_PASSWORD]
             return self.async_create_entry(title="", data=user_input)
         return self.async_show_form(step_id="init", data_schema=_options_schema(current))
+
+
+# V2 uses the equipment-neutral guided editor. Keeping the old schema helpers in
+# this module makes migration code readable without registering the legacy flow.
+from .config_wizard import ConfigFlow, OptionsFlow  # noqa: E402,F401

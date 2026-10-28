@@ -14,7 +14,7 @@ from typing import Any
 
 from .models import DailyRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 CREATE TABLE IF NOT EXISTS rejected_readings (
   id INTEGER PRIMARY KEY AUTOINCREMENT, local_date TEXT NOT NULL,
-  entity_key TEXT NOT NULL, observed_at TEXT, value TEXT, reason TEXT NOT NULL
+  entity_key TEXT NOT NULL, observed_at TEXT, value TEXT, reason TEXT NOT NULL,
+  duration_seconds REAL, source TEXT
 );
 CREATE TABLE IF NOT EXISTS job_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_type TEXT NOT NULL,
@@ -63,8 +64,22 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
 CREATE TABLE IF NOT EXISTS model_parameters (
   key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mapping_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, effective_at TEXT NOT NULL,
+  checksum TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_daily_records_date ON daily_records(local_date DESC);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_date ON checkpoints(local_date);
+CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
+"""
+MIGRATION_2 = """
+ALTER TABLE rejected_readings ADD COLUMN duration_seconds REAL;
+ALTER TABLE rejected_readings ADD COLUMN source TEXT;
+CREATE TABLE IF NOT EXISTS mapping_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, effective_at TEXT NOT NULL,
+  checksum TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
 """
 
 
@@ -74,6 +89,13 @@ def _canonical_json(value: Any) -> str:
 
 def _checksum(payload: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def protected_export_path(config_path: str | Path, stamp: str) -> Path:
+    """Return a non-web-served backup path owned by the integration."""
+    if not stamp or any(char not in "0123456789-" for char in stamp):
+        raise ValueError("invalid export timestamp")
+    return Path(config_path) / ".storage" / "home_energy_intelligence" / "exports" / f"home_energy_intelligence-{stamp}.sqlite3"
 
 
 class EnergyDatabase:
@@ -124,6 +146,9 @@ class EnergyDatabase:
             row = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if row is None:
                 connection.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+            elif row[0] == 1:
+                connection.executescript(MIGRATION_2)
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
         return recovered
@@ -174,12 +199,40 @@ class EnergyDatabase:
                         (record.local_date, device, f"energy_readings_rejected:{count}"),
                     )
             for entity_key, data in record.temperatures.items():
+                detailed = data.get("rejections", [])
+                for rejection in detailed:
+                    connection.execute(
+                        """INSERT INTO rejected_readings
+                        (local_date,entity_key,observed_at,value,reason,duration_seconds,source)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (record.local_date, entity_key, rejection.get("timestamp"),
+                         rejection.get("value"), rejection.get("reason", "invalid"),
+                         rejection.get("duration_seconds"), rejection.get("source")),
+                    )
+                if detailed:
+                    continue
                 for rejection in data.get("rejected_reasons", []):
                     reason, _, value = str(rejection).partition(":")
                     connection.execute(
                         "INSERT INTO rejected_readings(local_date,entity_key,value,reason) VALUES (?,?,?,?)",
                         (record.local_date, entity_key, value or None, reason),
                     )
+        return True
+
+    def store_mapping_revision(self, payload: dict[str, Any]) -> bool:
+        serialized = _canonical_json(payload)
+        checksum = _checksum(_canonical_json({key: value for key, value in payload.items()
+                                              if key != "effective_at"}))
+        with self.connect() as connection:
+            prior = connection.execute(
+                "SELECT 1 FROM mapping_revisions WHERE checksum=?", (checksum,)
+            ).fetchone()
+            if prior:
+                return False
+            connection.execute(
+                "INSERT INTO mapping_revisions(effective_at,checksum,payload_json) VALUES (?,?,?)",
+                (payload.get("effective_at", datetime.now(UTC).isoformat()), checksum, serialized),
+            )
         return True
 
     def start_job(self, job_type: str, details: dict[str, Any] | None = None) -> int:
@@ -217,6 +270,32 @@ class EnergyDatabase:
                 (start.isoformat(), end.isoformat(), local_date, device, serialized, checksum, now),
             )
         return True
+
+    def checkpoints_for_day(self, local_date: str) -> dict[str, list[dict[str, Any]]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT interval_start_utc,interval_end_utc,device,payload_json,updated_at
+                FROM checkpoints WHERE local_date=? ORDER BY interval_start_utc""",
+                (local_date,),
+            ).fetchall()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            payload.update(
+                interval_start_utc=row["interval_start_utc"],
+                interval_end_utc=row["interval_end_utc"],
+                updated_at=row["updated_at"],
+            )
+            result.setdefault(row["device"], []).append(payload)
+        return result
+
+    def checkpoint_exists(self, start: datetime, end: datetime) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM checkpoints WHERE interval_start_utc=? AND interval_end_utc=? LIMIT 1",
+                (start.isoformat(), end.isoformat()),
+            ).fetchone()
+        return row is not None
 
     def history(self, *, limit: int = 90, before: str | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 3660))

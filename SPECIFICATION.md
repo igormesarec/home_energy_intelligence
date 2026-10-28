@@ -13,6 +13,9 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 5. Temperature means use elapsed seconds, the last valid reading at/before the period start, explicit unavailable markers, range checks, and source coverage.
 6. Local day boundaries come from the Home Assistant time zone and are stored as UTC instants. A local day may contain 23, 24, or 25 elapsed hours.
 7. Whole-house electricity is `PV + grid import - grid export`. Negative non-HVAC residuals are flagged, never clamped.
+8. Persisted six-hour checkpoints are the primary daily classification evidence. Daily Recorder counter changes reconcile totals but do not overwrite valid checkpoint categories.
+9. Every source is a UI mapping. Equipment IDs and mapping revisions preserve provenance across entity replacement.
+10. Temperature rejection is sensor-specific and auditable; −55 °C and 155 °C are default invalid sentinels, while legitimate sub-zero outdoor readings remain valid.
 
 ## Runtime schedule
 
@@ -29,3 +32,12 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - No weather-dependent forecast in V0.1.
 - No direct SQL access to Home Assistant Recorder.
 - No Recorder/InfluxDB writes or retention changes.
+- No permanent web-accessible database exports or credentials in query URLs.
+
+## Configurable equipment model
+
+- One or more heat pumps and zero or more air conditioners, each named, enabled/disabled and independently mapped.
+- Optional PV, import/export, indoor/outdoor, supply/return, DHW and weather sources.
+- Installation-specific operating-state maps; Mitsubishi/MELCloud strings are suggestions, not engine assumptions.
+- Options Flow can rebuild mappings without deleting daily records. Mapping revisions store effective dates.
+- Circuit 2K is not accepted for supply/return; no return sensor is inferred.

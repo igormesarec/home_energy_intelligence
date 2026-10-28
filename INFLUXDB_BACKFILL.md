@@ -2,7 +2,7 @@
 
 InfluxDB is optional and is only consulted when Recorder raw history and applicable long-term statistics cannot provide at least two usable observations.
 
-Enable it in integration options and supply host, port, database, and optional credentials. The mapping is JSON keyed by the integration mapping name:
+Enable it in integration options and supply host, port, TLS verification, database (normally `homeassistant`), retention policy (normally `autogen`), and optional credentials. The mapping is JSON keyed by the configured source key:
 
 ```json
 {
@@ -19,6 +19,8 @@ Enable it in integration options and supply host, port, database, and optional c
 }
 ```
 
-Identifiers accept only letters, numbers, and underscores; entity tags additionally accept `.`, `_`, and `-`. Queries are HTTP `GET` requests containing only `SELECT … WHERE time … ORDER BY time`. The client has no write, retention, purge, or administrative operation.
+Unicode measurement and field names, including `°C`, are supported through escaped InfluxQL identifiers. Tag values are escaped separately. Queries are bounded to at most 31 days, split into one-day requests, limited by a point budget, and deduplicated by source timestamp.
+
+Queries use HTTP `POST`; credentials are sent using the Authorization header and never appear in URL query parameters. The client exposes no write, retention, purge, or administrative operation.
 
 Influx schemas vary. Verify the measurement, field, entity tag, unit, and counter semantics against your own database before enabling a mapping. If returned history cannot be verified, leave the mapping absent; the resulting period remains unavailable.

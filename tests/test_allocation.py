@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from custom_components.home_energy_intelligence.allocation import ac_category, allocate_interval, counter_delta, ecodan_category
+from custom_components.home_energy_intelligence.allocation import ac_category, allocate_interval, configurable_classifier, counter_delta, ecodan_category
 from custom_components.home_energy_intelligence.models import NumericSample, StateSample
 
 
@@ -73,3 +73,13 @@ def test_counter_spike_is_rejected():
     ], START, END, maximum_delta_kwh=100)
     assert delta == 0
     assert rejected == 1
+
+
+def test_non_melcloud_heat_pump_state_mapping_is_configurable():
+    classifier = configurable_classifier(
+        {"space_heat": "confirmed_heating", "hot_water": "dhw", "stopped": "idle"},
+        kind="heat_pump",
+    )
+    assert classifier(StateSample(START, "space_heat")) == "confirmed_heating"
+    assert classifier(StateSample(START, "hot_water")) == "dhw"
+    assert classifier(StateSample(START, "vendor_new_state")) == "heating_assumed"

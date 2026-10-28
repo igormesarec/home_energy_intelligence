@@ -14,6 +14,18 @@ class NumericSample:
     timestamp: datetime
     value: float | None
     reason: str | None = None
+    source: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedReading:
+    """Auditable rejected source interval."""
+
+    timestamp: datetime
+    value: float | None
+    duration_seconds: float
+    reason: str
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +46,7 @@ class TemperatureResult:
     period_seconds: float
     rejected_count: int
     rejected_reasons: tuple[str, ...]
+    rejections: tuple[RejectedReading, ...] = ()
 
     @property
     def coverage_percent(self) -> float:

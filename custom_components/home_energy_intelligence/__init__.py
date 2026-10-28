@@ -19,7 +19,7 @@ from .const import (
     SERVICE_REPROCESS_DATE, SERVICE_REPROCESS_RANGE,
 )
 from .coordinator import HomeEnergyCoordinator
-from .database import EnergyDatabase
+from .database import EnergyDatabase, protected_export_path
 from .panel import async_register_panel, async_remove_panel
 from .websocket import async_register_websocket
 
@@ -30,6 +30,13 @@ RANGE_SCHEMA = vol.Schema({vol.Required("start_date"): cv.date, vol.Required("en
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
     hass.data.setdefault(DOMAIN, {})
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Move V1 entries to the extensible schema without deleting legacy mappings."""
+    if entry.version == 1:
+        hass.config_entries.async_update_entry(entry, version=2)
     return True
 
 
@@ -96,10 +103,14 @@ def _register_services(hass: HomeAssistant) -> None:
             day += timedelta(days=1)
         return {"changed_days": changed}
 
-    async def export_database(_call: ServiceCall):
+    async def export_database(call: ServiceCall):
         coordinator = active_coordinator()
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None or not user.is_admin:
+                raise PermissionError("Database export requires a Home Assistant administrator")
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        destination = Path(hass.config.path("www", f"home_energy_intelligence-{stamp}.sqlite3"))
+        destination = protected_export_path(hass.config.config_dir, stamp)
         await hass.async_add_executor_job(coordinator.database.export_to, destination)
         return {"path": str(destination)}
 

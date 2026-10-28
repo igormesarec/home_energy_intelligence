@@ -6,7 +6,8 @@ import voluptuous as vol
 
 from homeassistant.components import websocket_api
 
-from .const import DOMAIN, ENTITY_FIELDS
+from .configuration import equipment_from_config, temperatures_from_config
+from .const import DOMAIN
 
 
 def async_register_websocket(hass) -> None:
@@ -38,6 +39,7 @@ async def ws_overview(hass, connection, msg):
     vol.Optional("limit", default=90): vol.All(vol.Coerce(int), vol.Range(min=1, max=3660)),
     vol.Optional("before"): str,
 })
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_history(hass, connection, msg):
     coordinator = _coordinator(hass)
@@ -51,6 +53,7 @@ async def ws_history(hass, connection, msg):
 
 
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/settings"})
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_settings(hass, connection, msg):
     coordinator = _coordinator(hass)
@@ -58,8 +61,17 @@ async def ws_settings(hass, connection, msg):
         connection.send_result(msg["id"], {"configured": False})
         return
     config = coordinator.config
-    mapping = [{"key": key, "label": label, "entity_id": config.get(key)}
-               for key, (label, _domains) in ENTITY_FIELDS.items()]
+    mapping = []
+    for item in equipment_from_config(config):
+        for source_type in ("energy", "power", "state", "room_temperature", "supply_temperature", "return_temperature"):
+            entity_id = getattr(item, f"{source_type}_entity", None)
+            if entity_id:
+                mapping.append({"key": f"equipment.{item.equipment_id}.{source_type}",
+                                "label": item.display_name, "entity_id": entity_id,
+                                "enabled": item.enabled})
+    for item in temperatures_from_config(config):
+        mapping.append({"key": f"temperature.{item.source_id}", "label": item.display_name,
+                        "entity_id": item.entity_id, "enabled": item.enabled})
     connection.send_result(msg["id"], {
         "configured": True,
         "entry_id": coordinator.entry.entry_id,

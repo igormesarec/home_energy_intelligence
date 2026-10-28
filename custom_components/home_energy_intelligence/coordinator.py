@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .allocation import ac_category, allocate_interval, ecodan_category
+from .allocation import allocate_interval, configurable_classifier
+from .configuration import (
+    equipment_from_config, equipment_temperature_mappings, mapping_revision,
+    temperatures_from_config,
+)
 from .const import (
     CONF_CYCLE_HOURS, CONF_INFLUX_DATABASE, CONF_INFLUX_ENABLED, CONF_INFLUX_HOST,
     CONF_INFLUX_MAPPING, CONF_INFLUX_PASSWORD, CONF_INFLUX_PORT, CONF_INFLUX_USERNAME,
@@ -27,22 +31,7 @@ from .recorder import (
 )
 from .timeutils import local_day_bounds
 
-DEVICE_KEYS = {
-    "ecodan": ("ecodan_energy", "ecodan_power", "ecodan_mode"),
-    "ac_1": ("ac_1_energy", "ac_1_power", "ac_1_climate"),
-    "ac_2": ("ac_2_energy", "ac_2_power", "ac_2_climate"),
-    "ac_3": ("ac_3_energy", "ac_3_power", "ac_3_climate"),
-}
-SITE_KEYS = {"pv": "pv_energy", "import": "grid_import", "export": "grid_export"}
-TEMPERATURE_SOURCES = {
-    "outdoor": ("outdoor_temperature", None),
-    "flow": ("flow_temperature", None),
-    "representative_indoor": ("representative_room_temperature", None),
-    "ac_1_room": ("ac_1_temperature", None),
-    "ac_2_room": ("ac_2_temperature", None),
-    "ac_3_room": ("ac_3_climate", "current_temperature"),
-    "dhw_tank": ("ecodan_dhw", "current_temperature"),
-}
+LEGACY_SITE_KEYS = {"pv": "pv_energy", "import": "grid_import", "export": "grid_export"}
 
 
 class HomeEnergyCoordinator:
@@ -54,12 +43,24 @@ class HomeEnergyCoordinator:
         self.reader = RecorderReader(hass)
         self.timezone = hass.config.time_zone
 
+    def _site_sources(self) -> dict[str, str | None]:
+        configured = self.config.get("site_sources", {})
+        if isinstance(configured, str):
+            configured = json.loads(configured or "{}")
+        return {
+            key: configured.get(key) or self.config.get(legacy)
+            for key, legacy in LEGACY_SITE_KEYS.items()
+        }
+
     async def async_process_day(self, day: date, *, reason: str = "daily_close") -> bool:
         job_id = await self.hass.async_add_executor_job(
             self.database.start_job, "daily", {"date": day.isoformat(), "reason": reason}
         )
         try:
             source = await self._async_collect(day)
+            source.checkpoints = await self.hass.async_add_executor_job(
+                self.database.checkpoints_for_day, day.isoformat()
+            )
             freshness_minutes = int(self.config.get(CONF_TEMPERATURE_FRESHNESS_MINUTES, 0))
             freshness = timedelta(minutes=freshness_minutes) if freshness_minutes else None
             aggregator = DailyAggregator(
@@ -67,6 +68,9 @@ class HomeEnergyCoordinator:
                 cycle_hours=int(self.config.get(CONF_CYCLE_HOURS, 6)),
                 temperature_freshness=freshness,
                 seasonal_fallback=bool(self.config.get(CONF_SEASONAL_FALLBACK, False)),
+                maximum_power_gap=timedelta(minutes=int(self.config.get("maximum_power_gap_minutes", 30))),
+                maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
+                assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate")),
             )
             record = await self.hass.async_add_executor_job(aggregator.aggregate, day, source)
             changed = await self.hass.async_add_executor_job(
@@ -97,15 +101,23 @@ class HomeEnergyCoordinator:
             source = await self._async_collect_range(start, end)
             changed = 0
             for device, history in source.devices.items():
-                classifier = ecodan_category if device == "ecodan" else partial(
-                    ac_category, seasonal_fallback=bool(self.config.get(CONF_SEASONAL_FALLBACK, False))
+                classifier = configurable_classifier(
+                    history.state_map, kind=history.kind,
+                    state_attribute=history.state_attribute,
+                    seasonal_fallback=bool(self.config.get(CONF_SEASONAL_FALLBACK, False)),
                 )
                 result = await self.hass.async_add_executor_job(partial(
                     allocate_interval, start=start, end=end, mode_samples=history.mode,
                     power_samples=history.power, counter_samples=history.counter,
                     classifier=classifier,
+                    maximum_power_gap=timedelta(minutes=int(self.config.get("maximum_power_gap_minutes", 30))),
+                    maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
                 ))
-                payload = {**asdict(result), "coverage_percent": result.coverage_percent}
+                payload = {
+                    **asdict(result), "coverage_percent": result.coverage_percent,
+                    "source_provenance": history.provenance,
+                    "collected_at": datetime.now(UTC).isoformat(),
+                }
                 changed += int(await self.hass.async_add_executor_job(
                     self.database.upsert_checkpoint, start, end, local_start.date().isoformat(),
                     device, payload,
@@ -121,6 +133,7 @@ class HomeEnergyCoordinator:
         return changed
 
     async def async_catch_up(self) -> None:
+        await self.async_recover_checkpoints()
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
         yesterday = local_today - timedelta(days=1)
         latest = await self.hass.async_add_executor_job(self.database.latest)
@@ -130,22 +143,48 @@ class HomeEnergyCoordinator:
             await self.async_process_day(next_day, reason="startup_catchup")
             next_day += timedelta(days=1)
 
+    async def async_recover_checkpoints(self) -> None:
+        """Recreate missed completed cycles after restart, without duplicates."""
+        zone = ZoneInfo(self.timezone)
+        now = datetime.now(UTC).astimezone(zone)
+        latest_hour = max(hour for hour in (0, 6, 12, 18) if hour <= now.hour)
+        end = now.replace(hour=latest_hour, minute=0, second=0, microsecond=0)
+        if end > now:
+            end -= timedelta(hours=6)
+        for offset in range(4, -1, -1):
+            cycle_end = end - timedelta(hours=6 * offset)
+            cycle_start = cycle_end - timedelta(hours=6)
+            exists = await self.hass.async_add_executor_job(
+                self.database.checkpoint_exists, cycle_start.astimezone(UTC), cycle_end.astimezone(UTC)
+            )
+            if not exists:
+                await self.async_process_checkpoint(cycle_end)
+
     async def _async_collect(self, day: date) -> DailyInput:
         start, end = local_day_bounds(day, self.timezone)
         return await self._async_collect_range(start, end)
 
     async def _async_collect_range(self, start: datetime, end: datetime) -> DailyInput:
-        entity_ids = [self.config[key] for keys in DEVICE_KEYS.values() for key in keys if self.config.get(key)]
-        entity_ids += [self.config[key] for key in SITE_KEYS.values() if self.config.get(key)]
-        entity_ids += [self.config[key] for key, _attribute in TEMPERATURE_SOURCES.values() if self.config.get(key)]
+        equipment = [item for item in equipment_from_config(self.config) if item.enabled]
+        temperature_sources = [item for item in temperatures_from_config(self.config) if item.enabled]
+        explicitly_mapped = {(item.entity_id, item.role) for item in temperature_sources}
+        temperature_sources.extend(
+            item for item in equipment_temperature_mappings(equipment)
+            if (item.entity_id, item.role) not in explicitly_mapped
+        )
+        site_sources = self._site_sources()
+        entity_ids = [
+            entity for item in equipment
+            for entity in (item.energy_entity, item.power_entity, item.state_entity)
+            if entity
+        ]
+        entity_ids += [entity for entity in site_sources.values() if entity]
+        entity_ids += [item.entity_id for item in temperature_sources]
         history = await self.reader.async_history(sorted(set(entity_ids)), start, end)
 
-        statistic_entities = {
-            self.config[key] for keys in DEVICE_KEYS.values() for key in keys[:1] if self.config.get(key)
-        } | {self.config[key] for key in SITE_KEYS.values() if self.config.get(key)} | {
-            self.config[key] for key, attribute in TEMPERATURE_SOURCES.values()
-            if attribute is None and self.config.get(key)
-        }
+        statistic_entities = {item.energy_entity for item in equipment if item.energy_entity}
+        statistic_entities |= {entity for entity in site_sources.values() if entity}
+        statistic_entities |= {item.entity_id for item in temperature_sources if item.attribute is None}
         statistics = await self.reader.async_statistics(statistic_entities, start, end)
         used_influx: list[str] = []
         try:
@@ -158,14 +197,17 @@ class HomeEnergyCoordinator:
                 host=self.config[CONF_INFLUX_HOST], port=int(self.config.get(CONF_INFLUX_PORT, 8086)),
                 database=self.config[CONF_INFLUX_DATABASE], username=self.config.get(CONF_INFLUX_USERNAME),
                 password=self.config.get(CONF_INFLUX_PASSWORD),
+                use_ssl=bool(self.config.get("influx_use_ssl", False)),
+                verify_ssl=bool(self.config.get("influx_verify_ssl", True)),
+                retention_policy=str(self.config.get("influx_retention_policy", "autogen")),
             )
 
-        async def numeric(key: str, *, statistics_type: str | None = None,
+        async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
                           attribute: str | None = None) -> list[NumericSample]:
-            entity_id = self.config.get(key)
             if not entity_id:
                 return []
-            raw = states_to_numeric(history.get(entity_id, []), attribute=attribute)
+            raw = [NumericSample(item.timestamp, item.value, item.reason, entity_id)
+                   for item in states_to_numeric(history.get(entity_id, []), attribute=attribute)]
             if len(raw) >= 2:
                 return raw
             if statistics_type:
@@ -175,45 +217,54 @@ class HomeEnergyCoordinator:
                     else statistics_to_numeric_samples(statistics.get(entity_id, []))
                 )
                 if len(from_statistics) >= 2:
-                    return from_statistics
-            mapping = influx_mapping.get(key) if isinstance(influx_mapping, dict) else None
+                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id)
+                            for item in from_statistics]
+            mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
             if influx is not None and isinstance(mapping, dict):
                 rows = await self.hass.async_add_executor_job(partial(
                     influx.query, mapping["measurement"], mapping.get("field", "value"),
                     start, end, entity_tag=mapping.get("entity_tag"),
                 ))
                 if rows:
-                    used_influx.append(key)
-                    return [NumericSample(timestamp, value) for timestamp, value in rows]
+                    used_influx.append(source_key)
+                    return [NumericSample(timestamp, value, source=entity_id) for timestamp, value in rows]
             return raw
 
-        numeric_values = {}
-        for keys in DEVICE_KEYS.values():
-            numeric_values[keys[0]] = await numeric(keys[0], statistics_type="counter")
-            numeric_values[keys[1]] = await numeric(keys[1])
-        for key in SITE_KEYS.values():
-            numeric_values[key] = await numeric(key, statistics_type="counter")
-
-        devices = {
-            device: DeviceHistory(
-                counter=numeric_values[energy_key],
-                power=numeric_values[power_key],
-                mode=states_to_modes(history.get(self.config[mode_key], [])),
+        devices = {}
+        for item in equipment:
+            devices[item.equipment_id] = DeviceHistory(
+                counter=await numeric(f"equipment.{item.equipment_id}.energy", item.energy_entity,
+                                      statistics_type="counter"),
+                power=await numeric(f"equipment.{item.equipment_id}.power", item.power_entity),
+                mode=states_to_modes(history.get(item.state_entity, [])) if item.state_entity else [],
+                kind=item.kind, state_map=item.state_map, state_attribute=item.state_attribute,
+                provenance={
+                    "energy_entity": item.energy_entity, "power_entity": item.power_entity,
+                    "state_entity": item.state_entity, "equipment_id": item.equipment_id,
+                },
             )
-            for device, (energy_key, power_key, mode_key) in DEVICE_KEYS.items()
+        site_counters = {
+            name: await numeric(f"site.{name}", entity_id, statistics_type="counter")
+            for name, entity_id in site_sources.items()
         }
-        site_counters = {name: numeric_values[key] for name, key in SITE_KEYS.items()}
         temperatures = {}
-        for name, (key, attribute) in TEMPERATURE_SOURCES.items():
-            if self.config.get(key):
-                temperatures[name] = await numeric(
-                    key, statistics_type="mean" if attribute is None else None,
-                    attribute=attribute,
-                )
+        temperature_quality = {}
+        temperature_roles = {}
+        for item in temperature_sources:
+            temperatures[item.source_id] = await numeric(
+                f"temperature.{item.source_id}", item.entity_id,
+                statistics_type="mean" if item.attribute is None else None,
+                attribute=item.attribute,
+            )
+            temperature_quality[item.source_id] = item.quality
+            temperature_roles[item.source_id] = item.role
+        revision = mapping_revision(self.config)
+        await self.hass.async_add_executor_job(self.database.store_mapping_revision, revision)
         return DailyInput(devices, site_counters, temperatures, provenance={
             "primary_source": "home_assistant_recorder",
             "raw_history_includes_preceding_state": True,
             "long_term_statistics_fallback": True,
             "influx_backfill_keys": used_influx,
             "collected_at": datetime.now(UTC).isoformat(),
-        })
+            "mapping_effective_at": revision["effective_at"],
+        }, temperature_quality=temperature_quality, temperature_roles=temperature_roles)

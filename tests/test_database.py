@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 import sqlite3
 
-from custom_components.home_energy_intelligence.database import EnergyDatabase
+from custom_components.home_energy_intelligence.database import EnergyDatabase, protected_export_path
 from custom_components.home_energy_intelligence.models import DailyRecord
 
 
@@ -63,3 +63,67 @@ def test_job_metadata_and_rejected_readings_are_persisted(tmp_path):
         job = connection.execute("SELECT status,finished_at FROM job_runs WHERE id=?", (job_id,)).fetchone()
     assert tuple(rejected) == ("155", "out_of_range")
     assert job["status"] == "success" and job["finished_at"]
+
+
+def test_checkpoint_upsert_is_idempotent_and_survives_daily_rebuild(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    end = datetime(2026, 10, 25, 6, tzinfo=UTC)
+    payload = {"meter_kwh": 5, "allocations_kwh": {"heating_assumed": 5}, "quality": "uncertain"}
+    assert db.upsert_checkpoint(start, end, "2026-10-25", "hp", payload)
+    assert not db.upsert_checkpoint(start, end, "2026-10-25", "hp", payload)
+    db.upsert_daily(record())
+    checkpoints = db.checkpoints_for_day("2026-10-25")
+    assert checkpoints["hp"][0]["meter_kwh"] == 5
+
+
+def test_mapping_revisions_preserve_source_replacement_history(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    assert db.store_mapping_revision({"effective_at": "2026-01-01T00:00:00+00:00", "entity": "sensor.old"})
+    assert not db.store_mapping_revision({"effective_at": "2026-01-01T00:00:00+00:00", "entity": "sensor.old"})
+    assert db.store_mapping_revision({"effective_at": "2026-02-01T00:00:00+00:00", "entity": "sensor.new"})
+    with db.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM mapping_revisions").fetchone()[0] == 2
+
+
+def test_realistic_ten_year_checkpoint_volume_remains_compact(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    now = datetime.now(UTC).isoformat()
+    payload = '{"meter_kwh":5.0,"quality":"good","allocations_kwh":{"heating":5.0}}'
+    with db.connect() as connection:
+        rows = []
+        for day_index in range(3650):
+            for cycle in range(4):
+                for device in ("hp", "ac_1", "ac_2", "ac_3"):
+                    start = f"{day_index:04d}-{cycle}"
+                    rows.append((start, f"{start}-end", f"day-{day_index:04d}", device,
+                                 payload, f"{day_index}-{cycle}-{device}", now))
+        connection.executemany("INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?)", rows)
+    assert db.size_bytes() < 50_000_000
+
+
+def test_protected_export_never_uses_www_and_rejects_path_injection(tmp_path):
+    target = protected_export_path(tmp_path, "20261028-010203")
+    assert ".storage" in target.parts and "www" not in target.parts
+    import pytest
+    with pytest.raises(ValueError):
+        protected_export_path(tmp_path, "../../www/backup")
+
+
+def test_detailed_temperature_rejection_audit_is_persisted(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {"rejections": [{
+        "timestamp": "2026-10-25T01:00:00+00:00", "value": -55,
+        "duration_seconds": 900, "reason": "invalid_sentinel", "source": "sensor.outdoor",
+    }]}}
+    db.upsert_daily(item)
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT observed_at,value,duration_seconds,reason,source FROM rejected_readings"
+        ).fetchone()
+    assert tuple(row) == ("2026-10-25T01:00:00+00:00", "-55", 900, "invalid_sentinel", "sensor.outdoor")

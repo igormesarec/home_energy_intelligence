@@ -20,4 +20,4 @@ reprocess_range:
         date:
 export_database:
   name: Export database
-  description: Create a consistent SQLite backup in the Home Assistant www directory.
+  description: Create an administrator-only consistent SQLite backup under protected Home Assistant storage.

@@ -16,12 +16,16 @@ Covered acceptance cases include:
 - Counter reconciliation, reset, spike rejection, missing power, and visible residual.
 - Correct 5 °C for 60 minutes plus 6 °C for 5 minutes result: 5.076923 °C.
 - Rejection of a 155 °C outdoor spike.
+- Rejection of −55 °C sentinels, temporal jumps, and audited invalid durations without rejecting legitimate winter temperatures.
 - Explicit unavailable spans and freshness-limited coverage.
 - Idempotent daily upserts and revision increments after corrections.
 - Database corruption preservation/recovery and ten-year compact-growth evidence.
 - Optional InfluxQL query constrained to read-only `SELECT`.
+- Unicode/escaped InfluxQL identifiers, `homeassistant`/`autogen`, bounded queries, and credentials absent from URLs.
+- Persisted-checkpoint daily classification after Recorder expiration and counter-correction residuals.
+- Variable equipment counts, optional sensors, remapped entity IDs and effective-dated source provenance.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.
 
-## Integration test limitation
+## Home Assistant runtime suite
 
-The repository's pure calculation and storage suite runs without installing the large Home Assistant test harness. Before release, install the integration in a disposable Home Assistant instance and verify config-flow selectors, Recorder imports, panel registration, services, and reload/unload behavior against the minimum supported Home Assistant version.
+CI installs current Home Assistant and `pytest-homeassistant-custom-component`. Runtime tests verify the Recorder helper signatures plus config/Options Flow entry points, setup, reload, unload, sidebar registration and sensor creation/refresh. These tests are skipped locally when the Home Assistant harness is absent; a disposable real Home Assistant smoke test remains required before tagging V0.1.

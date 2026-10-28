@@ -16,10 +16,43 @@ ECODAN_MODE_MAP = {
     "idle": "idle",
 }
 
+VALID_HEAT_PUMP_CATEGORIES = {
+    "confirmed_heating", "heating_assumed", "dhw", "cooling", "idle", "unknown"
+}
+VALID_AC_CATEGORIES = {
+    "heating", "cooling", "standby", "dry_fan", "unknown",
+    "heating_selected", "cooling_selected", "heating_estimated", "cooling_estimated",
+}
+
 
 def ecodan_category(state: StateSample) -> str:
     """Map Ecodan operation without hiding uncertainty."""
     return ECODAN_MODE_MAP.get(state.state.lower(), "heating_assumed")
+
+
+def configurable_classifier(
+    state_map: dict[str, str],
+    *,
+    kind: str,
+    state_attribute: str | None = None,
+    seasonal_fallback: bool = False,
+) -> Callable[[StateSample], str]:
+    """Build a classifier from UI configuration without vendor assumptions."""
+    normalized = {str(key).lower(): str(value) for key, value in state_map.items()}
+    allowed = VALID_HEAT_PUMP_CATEGORIES if kind == "heat_pump" else VALID_AC_CATEGORIES
+    if not set(normalized.values()).issubset(allowed):
+        raise ValueError("state mapping contains unsupported allocation categories")
+
+    def classify(sample: StateSample) -> str:
+        raw = sample.attributes.get(state_attribute) if state_attribute else sample.state
+        mapped = normalized.get(str(raw).lower())
+        if mapped:
+            return mapped
+        if kind == "heat_pump":
+            return "heating_assumed"
+        return ac_category(sample, seasonal_fallback=seasonal_fallback)
+
+    return classify
 
 
 def ac_category(state: StateSample, *, seasonal_fallback: bool = False) -> str:
@@ -110,6 +143,7 @@ def allocate_interval(
     classifier: Callable[[StateSample], str],
     maximum_power_w: float = 25_000.0,
     maximum_power_gap: timedelta = timedelta(minutes=30),
+    maximum_counter_delta_kwh: float = 500.0,
     reconciliation_tolerance_kwh: float = 0.05,
 ) -> AllocationResult:
     """Allocate energy by transitions, retaining any reconciliation residual."""
@@ -145,7 +179,9 @@ def allocate_interval(
         allocations[category] = allocations.get(category, 0.0) + power.value * seconds / 3_600_000
         covered_seconds += seconds
 
-    meter_kwh, reset_count, counter_rejected = counter_delta(counter_samples, start, end)
+    meter_kwh, reset_count, counter_rejected = counter_delta(
+        counter_samples, start, end, maximum_delta_kwh=maximum_counter_delta_kwh
+    )
     allocated_total = sum(allocations.values())
     residual = None if meter_kwh is None else meter_kwh - allocated_total
     if residual is not None and abs(residual) <= reconciliation_tolerance_kwh:

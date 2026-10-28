@@ -17,6 +17,8 @@ class RecorderReader:
 
     async def async_history(self, entity_ids: list[str], start: datetime,
                             end: datetime) -> dict[str, list[Any]]:
+        if not entity_ids:
+            return {}
         from homeassistant.components.recorder import get_instance, history
 
         instance = get_instance(self.hass)
@@ -33,6 +35,8 @@ class RecorderReader:
 
     async def async_statistics(self, statistic_ids: set[str], start: datetime,
                                end: datetime) -> dict[str, list[dict[str, Any]]]:
+        if not statistic_ids:
+            return {}
         from homeassistant.components.recorder import get_instance, statistics
 
         return await get_instance(self.hass).async_add_executor_job(

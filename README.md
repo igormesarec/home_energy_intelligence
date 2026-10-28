@@ -6,10 +6,10 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 
 ## V0.1 features
 
-- UI config flow and editable options for Home Assistant entity mapping.
+- Guided General, Heat pumps, Air conditioners, Solar/grid, Temperatures, Weather, Data sources, and Data quality UI sections. Every source entity and operating-state mapping is configurable.
 - Recorder-first raw history and long-term-statistics reads, always off the event loop.
-- Six-hour, transition-aware electricity allocation for one heat pump and three AC units.
-- Explicit `heating_assumed` for unknown Ecodan operation; idle and residual energy remain separate.
+- Persisted six-hour, transition-aware allocations for any configured heat pumps and zero or more AC units; checkpoints are the primary daily classification evidence.
+- Unknown heat-pump operation is `heating_assumed`; confirmed idle and raw reconciliation residual remain separate.
 - True elapsed-time-weighted temperature mean/min/max with preceding-state lookup, missing coverage, freshness limits, and outlier rejection.
 - DST-safe 23-, 24-, and 25-hour local days using the Home Assistant time zone.
 - Idempotent 05:00 daily close and correction-safe catch-up in a dedicated compact SQLite database.
@@ -24,8 +24,10 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 1. In HACS, open **Integrations**, choose **Custom repositories**, and add `https://github.com/igormesarec/home_energy_intelligence` as an Integration repository.
 2. Install **Home Energy Intelligence** and restart Home Assistant.
 3. Go to **Settings → Devices & services → Add integration** and select **Home Energy Intelligence**.
-4. Select the cumulative energy, power, operation-mode, temperature, PV, import, and export entities that represent the physical devices in your home.
-5. Confirm the Home Assistant time zone and wait for the first completed six-hour checkpoint. The previous calendar day is finalized at 05:00 local time.
+4. Add each heat pump and optional AC with a display name, electrical counter, power and operating-state entity. Map the installation's state strings to the documented categories.
+5. Add optional PV/grid, temperature and weather sources. Each temperature has its own physical limits, invalid sentinels, spike limit, freshness and missing-data thresholds.
+6. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
+7. Confirm the Home Assistant time zone and wait for the first completed six-hour checkpoint. The previous calendar day is finalized at 05:00 local time.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
@@ -37,13 +39,13 @@ The integration never writes to Recorder or InfluxDB, changes retention, or modi
 <config>/.storage/home_energy_intelligence/home_energy_intelligence.sqlite3
 ```
 
-Do not map the same physical counter more than once. Do not select a secondary circuit sensor as a supply or return sensor. V0.1 never derives thermal energy from electricity or from a supply temperature without a measured return temperature and flow.
+Do not map the same physical counter more than once. Circuit 2K is explicitly rejected for supply/return mapping. Missing return temperature remains missing: the integration never substitutes another circuit. V0.1 never derives thermal energy from electricity.
 
 ## Services
 
 - `home_energy_intelligence.reprocess_date`: rebuild one day.
 - `home_energy_intelligence.reprocess_range`: rebuild up to 31 days.
-- `home_energy_intelligence.export_database`: create a consistent SQLite backup in `<config>/www`.
+- `home_energy_intelligence.export_database`: administrator-only consistent backup under `<config>/.storage/home_energy_intelligence/exports`; it is never exposed through `/config/www`.
 
 ## Development
 
