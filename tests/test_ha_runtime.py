@@ -33,6 +33,11 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
     from custom_components.home_energy_intelligence.const import DOMAIN, PANEL_URL
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
 
+    # The isolated HA fixture does not bootstrap a full Recorder/frontend stack.
+    # Mark declared platform dependencies loaded so the test exercises this
+    # integration's real flow handler and runtime setup rather than failing in
+    # dependency discovery. Recorder helper signatures are tested separately.
+    hass.config.components.update({"frontend", "http", "recorder"})
     flow = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
     assert flow["type"].value == "form" and flow["step_id"] == "general"
 
@@ -67,6 +72,8 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     from custom_components.home_energy_intelligence.const import DOMAIN
+
+    hass.config.components.update({"frontend", "http", "recorder"})
 
     hass.states.async_set("sensor.hp_energy", "100", {
         "device_class": "energy", "state_class": "total_increasing", "unit_of_measurement": "kWh",
