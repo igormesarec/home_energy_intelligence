@@ -12,6 +12,7 @@ requires-python = ">=3.13"
 testpaths = ["tests"]
 addopts = "-q --basetemp=.pytest-tmp"
 pythonpath = ["."]
+asyncio_mode = "auto"
 markers = ["asyncio: execute with pytest-asyncio (Home Assistant runtime suite)"]
 
 [tool.ruff]
