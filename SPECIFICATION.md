@@ -52,3 +52,14 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - Overview and validated History are available to authenticated Home Assistant users.
 - Settings mappings, database metadata and database export remain administrator-only.
 - Missing optional equipment or measurements stay unavailable. Structural absence of PV may be used for a grid-only household balance without creating a fictitious PV measurement.
+
+## V0.1.1 dashboard integrity requirements
+
+- Today and same-cutoff comparisons enumerate every expected persisted hour and expose missing internal intervals, coverage percentage and partial quality. Delayed poor/partial hours may be repaired idempotently.
+- Complete measured zero, complete total, known partial subtotal and unavailable total are distinct states. Missing allocations never become complete zero heating, DHW or cooling.
+- History ranges are resolved in the Home Assistant timezone and include all requested day, Monday–Sunday week, calendar-month, calendar-year, configurable energy-season and custom presets.
+- Period summaries cover the complete selected range independently of paginated detail records. CSV exports that same complete selected range without a 366-day truncation.
+- Dynamic per-device heating and cooling preserve confirmed, selected and estimated evidence. Device subtotals reconcile with canonical category totals when complete.
+- Energy Split keeps heating, DHW, cooling, idle, other household, unknown and signed discrepancy separate. Negative discrepancies are warnings, never clipped to zero.
+- Indoor/outdoor timelines and summaries retain source IDs, mapping history, validated gaps, daily min/max/coverage and duration-weighted means across all valid elapsed seconds.
+- PV, grid and household analytics use measured counters and physically valid balances; unavailable sources never generate a zero or invented rate.

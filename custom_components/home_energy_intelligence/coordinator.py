@@ -113,7 +113,9 @@ class HomeEnergyCoordinator:
             async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
         return changed
 
-    async def async_refresh_hourly(self, now: datetime | None = None) -> int:
+    async def async_refresh_hourly(
+        self, now: datetime | None = None, *, reprocess_poor: bool = False,
+    ) -> int:
         """Recover bounded missing hours for today and yesterday."""
         instant = (now or datetime.now(UTC)).astimezone(UTC)
         completed_end = instant.replace(minute=0, second=0, microsecond=0)
@@ -124,10 +126,13 @@ class HomeEnergyCoordinator:
         cursor = scan_start
         while cursor + timedelta(hours=1) <= completed_end:
             end = cursor + timedelta(hours=1)
-            exists = await self.hass.async_add_executor_job(
-                self.database.hourly_exists, cursor, end
+            needs_reprocess = await self.hass.async_add_executor_job(
+                partial(
+                    self.database.hourly_needs_reprocess, cursor, end,
+                    include_partial=reprocess_poor,
+                )
             )
-            if not exists:
+            if needs_reprocess:
                 changed += int(await self.async_process_hour(cursor, end))
             cursor = end
         return changed

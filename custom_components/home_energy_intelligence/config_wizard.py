@@ -322,6 +322,12 @@ class _Wizard:
         }
         indoor = [item for item in self.temperatures
                   if item.get("enabled", True) and item.get("role") in {"indoor", "equipment_room"}]
+        indoor.extend({
+            "source_id": f"{item['equipment_id']}_equipment_room",
+            "display_name": f"{item.get('display_name', item['equipment_id'])} room",
+            "role": "equipment_room", "enabled": item.get("enabled", True),
+        } for item in self.equipment if item.get("enabled", True)
+          and item.get("room_temperature_entity"))
         if indoor:
             choices = [{"value": item["source_id"], "label": item.get("display_name", item["source_id"])}
                        for item in indoor]

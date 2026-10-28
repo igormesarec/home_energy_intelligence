@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
 from custom_components.home_energy_intelligence.analytics import (
-    attach_canonical, canonical_energy, combine_interval_records,
+    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records,
+    interval_coverage,
 )
 
 
@@ -47,7 +48,57 @@ def test_missing_equipment_never_becomes_false_zero():
     energy = canonical_energy({"allocations": {}, "quality": "missing"}, EQUIPMENT)
     assert energy["complete"] is False
     assert energy["unallocated_discrepancy_kwh"] is None
+    assert energy["space_heating_kwh"] is None
+    assert energy["dhw_kwh"] is None
+    assert energy["cooling_kwh"] is None
+    assert energy["known_space_heating_kwh"] == 0
     assert all(item["available"] is False for item in energy["equipment"])
+
+
+def test_missing_ac_preserves_known_hp_subtotal_but_total_is_unavailable():
+    record = {"allocations": {"hp-a": {"meter_kwh": 2, "categories": {
+        "confirmed_heating": 2}, "residual_kwh": 0}}, "quality": "partial"}
+    energy = canonical_energy(record, EQUIPMENT)
+    assert energy["known_space_heating_kwh"] == 2
+    assert energy["space_heating_kwh"] is None
+    assert energy["confirmed_heat_pump_heating_kwh"] == 2
+    assert energy["confirmed_ac_heating_kwh"] is None
+
+
+def test_missing_device_meter_does_not_render_false_device_zeroes():
+    record = {"allocations": {
+        "hp-a": {"meter_kwh": None, "categories": {}, "quality": "missing_counter"},
+    }}
+    energy = canonical_energy(record, EQUIPMENT[:1])
+    device = energy["equipment"][0]
+    assert device["available"] is False
+    assert device["confirmed_heating_kwh"] is None
+    assert device["cooling_kwh"] is None
+    assert device["known_confirmed_heating_kwh"] == 0
+
+
+def test_device_level_selected_and_estimated_cooling_are_explicit():
+    record = {"allocations": {
+        "hp-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0},
+        "ac-a": {"meter_kwh": 3, "categories": {
+            "cooling": 1, "cooling_selected": .75, "cooling_estimated": .25,
+            "standby": 1}, "residual_kwh": 0},
+    }}
+    energy = canonical_energy(record, EQUIPMENT)
+    ac = next(item for item in energy["equipment"] if item["equipment_id"] == "ac-a")
+    assert ac["confirmed_cooling_kwh"] == 1
+    assert ac["selected_cooling_kwh"] == .75
+    assert ac["estimated_cooling_kwh"] == .25
+    assert ac["cooling_kwh"] == energy["cooling_kwh"] == 2
+
+
+def test_negative_discrepancy_is_preserved_with_its_sign():
+    record = {"allocations": {
+        "hp-a": {"meter_kwh": 1, "categories": {"confirmed_heating": 2},
+                 "residual_kwh": -1},
+        "ac-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0},
+    }}
+    assert canonical_energy(record, EQUIPMENT)["unallocated_discrepancy_kwh"] == -1
 
 
 def _hour(start, household=1.0):
@@ -74,6 +125,31 @@ def test_combined_25_hour_day_keeps_all_elapsed_hours():
     assert result["energy"]["space_heating_kwh"] == 25
 
 
+def test_internal_missing_hour_is_detected_even_when_latest_hour_exists():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    records = [_hour(start), _hour(start + timedelta(hours=2))]
+    coverage = interval_coverage(records, start, start + timedelta(hours=3))
+    assert coverage["present_intervals"] == 2
+    assert coverage["coverage_percent"] == 200 / 3
+    assert coverage["missing_intervals"] == [{
+        "start": (start + timedelta(hours=1)).isoformat(),
+        "end": (start + timedelta(hours=2)).isoformat(),
+    }]
+    combined = combine_interval_records(
+        records, expected_start=start, expected_end=start + timedelta(hours=3)
+    )
+    assert combined["household_kwh"] is None
+    assert combined["known_household_kwh"] == 2
+    assert attach_canonical(combined, EQUIPMENT[:1])["energy"]["space_heating_kwh"] is None
+
+
+def test_23_and_25_hour_expected_interval_counts():
+    spring = datetime(2026, 3, 28, 23, tzinfo=UTC)
+    fall = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    assert interval_coverage([], spring, spring + timedelta(hours=23))["expected_intervals"] == 23
+    assert interval_coverage([], fall, fall + timedelta(hours=25))["expected_intervals"] == 25
+
+
 def test_month_temperature_mean_is_weighted_by_valid_elapsed_duration():
     first = _hour(datetime(2026, 10, 1, tzinfo=UTC))
     first["temperatures"] = {"indoor": {"mean": 10, "minimum": 9, "maximum": 11,
@@ -93,3 +169,26 @@ def test_month_temperature_mean_is_weighted_by_valid_elapsed_duration():
     assert temperature["maximum"] == 21
     assert temperature["coverage_percent"] == 80
     assert temperature["quality"] == "partial"
+
+
+def test_missing_temperature_day_reduces_period_coverage_instead_of_denominator():
+    first = _hour(datetime(2026, 10, 1, tzinfo=UTC))
+    first["temperatures"] = {"indoor": {
+        "mean": 10, "minimum": 10, "maximum": 10,
+        "coverage_seconds": 3600, "period_seconds": 3600, "quality": "good",
+    }}
+    second = _hour(datetime(2026, 10, 2, tzinfo=UTC))
+    combined = combine_interval_records([first, second])
+    assert combined["temperatures"]["indoor"]["coverage_percent"] == 50
+    assert combined["temperatures"]["indoor"]["quality"] == "partial"
+
+
+def test_full_period_summary_is_independent_of_page_and_marks_missing_day():
+    first = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    first["local_date"] = "2026-01-01"
+    third = _hour(datetime(2026, 1, 3, tzinfo=UTC), 4)
+    third["local_date"] = "2026-01-03"
+    combined = combine_daily_records([first, third], "2026-01-01", "2026-01-03")
+    assert combined["known_household_kwh"] == 6
+    assert combined["period_coverage"]["missing_dates"] == ["2026-01-02"]
+    assert canonical_energy(combined, EQUIPMENT[:1])["space_heating_kwh"] is None

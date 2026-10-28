@@ -51,3 +51,23 @@ def test_indoor_and_outdoor_cards_share_one_component_contract():
     assert "latest_value" in source and "latest_timestamp" in source
     assert "coverage_percent" in source
     assert "representative_${role}_source_id" in source
+
+
+def test_all_history_presets_are_backend_resolved_and_refresh_state_is_preserved():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    backend = (INTEGRATION / "periods.py").read_text(encoding="utf-8")
+    for preset in (
+        "today", "yesterday", "day_2", "day_7", "this_week", "previous_week",
+        "last_7_completed", "this_month", "previous_month", "older_month",
+        "this_year", "previous_year", "current_season", "previous_season", "custom",
+    ):
+        assert preset in frontend or preset in backend
+    assert "new Date(" not in frontend
+    assert "preset:this.historyPreset" in frontend
+
+
+def test_csv_uses_unpaginated_selected_period_query():
+    source = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    csv_handler = source[source.index("async def ws_csv"):source.index("async def ws_settings")]
+    assert "history_period" in csv_handler
+    assert "limit=366" not in csv_handler

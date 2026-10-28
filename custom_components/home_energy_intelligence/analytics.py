@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 from typing import Any
 
 
@@ -44,18 +45,31 @@ def canonical_energy(
         "unknown_kwh": 0.0,
         "hvac_meter_kwh": 0.0,
     }
-    complete = True
+    period_complete = (
+        record.get("period_coverage") or record.get("interval_coverage") or {}
+    ).get("complete", True)
+    complete = bool(period_complete)
+    heat_pump_complete = bool(period_complete)
+    ac_complete = bool(period_complete)
     residual_evidence = 0.0
     for item in enabled:
         equipment_id = str(item["equipment_id"])
         allocation = allocations.get(equipment_id)
         if not isinstance(allocation, dict):
             complete = False
+            if item.get("kind") == "heat_pump":
+                heat_pump_complete = False
+            else:
+                ac_complete = False
             breakdown.append({**item, "available": False, "quality": "missing"})
             continue
         meter = _number(allocation.get("meter_kwh"))
         if meter is None:
             complete = False
+            if item.get("kind") == "heat_pump":
+                heat_pump_complete = False
+            else:
+                ac_complete = False
         else:
             totals["hvac_meter_kwh"] += meter
         kind = item.get("kind")
@@ -72,6 +86,7 @@ def canonical_energy(
             idle = _category(allocation, ("idle",))
             unknown = _category(allocation, ("unknown",))
             selected = estimated = 0.0
+            selected_cooling = estimated_cooling = 0.0
             totals["confirmed_heat_pump_heating_kwh"] += confirmed
             totals["assumed_heat_pump_heating_kwh"] += assumed
             totals["dhw_kwh"] += dhw
@@ -102,39 +117,94 @@ def canonical_energy(
         if residual is None:
             residual = _number(allocation.get("residual_kwh"))
         residual_evidence += residual or 0.0
+        device_complete = meter is not None
         breakdown.append({
-            **item, "available": meter is not None, "meter_kwh": meter,
-            "confirmed_heating_kwh": confirmed,
-            "assumed_heating_kwh": assumed if kind == "heat_pump" else 0.0,
-            "selected_heating_kwh": selected, "estimated_heating_kwh": estimated,
-            "dhw_kwh": dhw, "cooling_kwh": cooling, "idle_kwh": idle,
+            **item, "available": device_complete, "meter_kwh": meter,
+            "known_confirmed_heating_kwh": confirmed,
+            "known_assumed_heating_kwh": assumed if kind == "heat_pump" else 0.0,
+            "known_selected_heating_kwh": selected,
+            "known_estimated_heating_kwh": estimated,
+            "known_dhw_kwh": dhw, "known_confirmed_cooling_kwh": cooling,
+            "known_selected_cooling_kwh": selected_cooling,
+            "known_estimated_cooling_kwh": estimated_cooling,
+            "known_cooling_kwh": cooling + selected_cooling + estimated_cooling,
+            "known_idle_kwh": idle,
+            "confirmed_heating_kwh": confirmed if device_complete else None,
+            "assumed_heating_kwh": (
+                assumed if kind == "heat_pump" and device_complete else
+                (0.0 if kind != "heat_pump" and device_complete else None)
+            ),
+            "selected_heating_kwh": selected if device_complete else None,
+            "estimated_heating_kwh": estimated if device_complete else None,
+            "dhw_kwh": dhw if device_complete else None,
+            "confirmed_cooling_kwh": cooling if device_complete else None,
+            "selected_cooling_kwh": selected_cooling if device_complete else None,
+            "estimated_cooling_kwh": estimated_cooling if device_complete else None,
+            "cooling_kwh": (
+                cooling + selected_cooling + estimated_cooling if device_complete else None
+            ),
+            "idle_kwh": idle if device_complete else None,
             "unknown_kwh": unknown, "residual_kwh": residual,
             "coverage_percent": allocation.get("coverage_percent"),
             "quality": allocation.get("quality", "missing"),
         })
 
-    totals["space_heating_kwh"] = (
+    known_space_heating = (
         totals["confirmed_heat_pump_heating_kwh"]
         + totals["assumed_heat_pump_heating_kwh"]
         + totals["confirmed_ac_heating_kwh"]
         + totals["selected_ac_heating_kwh"]
         + totals["estimated_ac_heating_kwh"]
     )
-    totals["heating_and_dhw_kwh"] = totals["space_heating_kwh"] + totals["dhw_kwh"]
-    totals["cooling_kwh"] = (
+    known_dhw = totals["dhw_kwh"]
+    known_cooling = (
         totals["confirmed_cooling_kwh"] + totals["selected_cooling_kwh"]
         + totals["estimated_cooling_kwh"]
     )
+    known_idle = totals["idle_kwh"]
+    known_hvac_meter = totals["hvac_meter_kwh"]
+    heating_complete = heat_pump_complete and ac_complete
+    cooling_complete = heat_pump_complete and ac_complete
+    category_requirements = {
+        "confirmed_heat_pump_heating_kwh": heat_pump_complete,
+        "assumed_heat_pump_heating_kwh": heat_pump_complete,
+        "confirmed_ac_heating_kwh": ac_complete,
+        "selected_ac_heating_kwh": ac_complete,
+        "estimated_ac_heating_kwh": ac_complete,
+        "confirmed_cooling_kwh": cooling_complete,
+        "selected_cooling_kwh": ac_complete,
+        "estimated_cooling_kwh": ac_complete,
+    }
+    for key, is_complete in category_requirements.items():
+        totals[f"known_{key}"] = totals[key]
+        if not is_complete:
+            totals[key] = None
+    totals.update({
+        "known_space_heating_kwh": known_space_heating,
+        "known_dhw_kwh": known_dhw,
+        "known_cooling_kwh": known_cooling,
+        "known_idle_kwh": known_idle,
+        "known_hvac_meter_kwh": known_hvac_meter,
+        "space_heating_kwh": known_space_heating if heating_complete else None,
+        "dhw_kwh": known_dhw if heat_pump_complete else None,
+        "cooling_kwh": known_cooling if cooling_complete else None,
+        "idle_kwh": known_idle if complete else None,
+        "hvac_meter_kwh": known_hvac_meter if complete else None,
+        "heating_and_dhw_kwh": (
+            known_space_heating + known_dhw
+            if heating_complete and heat_pump_complete else None
+        ),
+    })
     household = _number(record.get("household_kwh"))
     pv = _number(record.get("pv_kwh"))
     imported = _number(record.get("import_kwh"))
     exported = _number(record.get("export_kwh"))
     other_household = _number(record.get("non_hvac_kwh"))
     classified_hvac = (
-        totals["space_heating_kwh"] + totals["dhw_kwh"] + totals["cooling_kwh"]
-        + totals["idle_kwh"] + totals["other_hvac_kwh"] + totals["unknown_kwh"]
+        known_space_heating + known_dhw + known_cooling
+        + known_idle + totals["other_hvac_kwh"] + totals["unknown_kwh"]
     )
-    discrepancy = None if not complete else totals["hvac_meter_kwh"] - classified_hvac
+    discrepancy = None if not complete else known_hvac_meter - classified_hvac
     consumed_pv = (
         None if pv is None or exported is None or pv < 0 or exported < 0 or exported > pv
         else pv - exported
@@ -154,8 +224,12 @@ def canonical_energy(
         "pv_consumed_on_site_kwh": consumed_pv,
         "pv_self_consumption_percent": self_consumption,
         "self_sufficiency_percent": self_sufficiency,
-        "quality": record.get("quality", "missing"),
+        "quality": record.get("quality", "missing") if complete else "partial",
         "complete": complete,
+        "completeness": {
+            "space_heating": heating_complete, "dhw": heat_pump_complete,
+            "cooling": cooling_complete, "idle": complete, "hvac_meter": complete,
+        },
         "equipment": breakdown,
     }
 
@@ -165,7 +239,45 @@ def attach_canonical(record: dict[str, Any], equipment: Iterable[dict[str, Any]]
     return {**record, "energy": canonical_energy(record, equipment)}
 
 
-def combine_interval_records(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+def interval_coverage(
+    records: list[dict[str, Any]], start: datetime, end: datetime,
+) -> dict[str, Any]:
+    """Validate exact elapsed-hour coverage, including internal gaps and DST."""
+    expected: list[tuple[str, str]] = []
+    cursor = start
+    while cursor < end:
+        interval_end = min(cursor + timedelta(hours=1), end)
+        expected.append((cursor.isoformat(), interval_end.isoformat()))
+        cursor = interval_end
+    present = {
+        (str(item.get("period_start_utc")), str(item.get("period_end_utc")))
+        for item in records
+    }
+    missing = [item for item in expected if item not in present]
+    poor = [
+        (str(item.get("period_start_utc")), str(item.get("period_end_utc")))
+        for item in records
+        if item.get("quality") in {"missing", "poor", "missing_counter", "unreconciled"}
+    ]
+    expected_seconds = max(0.0, (end - start).total_seconds())
+    present_seconds = sum(
+        max(0.0, (datetime.fromisoformat(item[1]) - datetime.fromisoformat(item[0])).total_seconds())
+        for item in expected if item in present
+    )
+    return {
+        "expected_intervals": len(expected), "present_intervals": len(expected) - len(missing),
+        "missing_intervals": [{"start": item[0], "end": item[1]} for item in missing],
+        "poor_quality_intervals": [{"start": item[0], "end": item[1]} for item in poor],
+        "coverage_seconds": present_seconds, "expected_seconds": expected_seconds,
+        "coverage_percent": 100 * present_seconds / expected_seconds if expected_seconds else 100.0,
+        "complete": not missing and not poor,
+    }
+
+
+def combine_interval_records(
+    records: list[dict[str, Any]], *, expected_start: datetime | None = None,
+    expected_end: datetime | None = None,
+) -> dict[str, Any] | None:
     """Combine contiguous compact intervals without inventing missing values."""
     if not records:
         return None
@@ -175,13 +287,29 @@ def combine_interval_records(records: list[dict[str, Any]]) -> dict[str, Any] | 
         values = [_number(item.get(key)) for item in records]
         return None if any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
 
+    def record_seconds(item: dict[str, Any]) -> float:
+        seconds = _number(item.get("day_seconds"))
+        if seconds is not None:
+            return max(0.0, seconds)
+        try:
+            return max(0.0, (
+                datetime.fromisoformat(str(item["period_end_utc"]))
+                - datetime.fromisoformat(str(item["period_start_utc"]))
+            ).total_seconds())
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
     equipment_ids = set().union(*(set(item.get("allocations", {})) for item in records))
     allocations: dict[str, dict[str, Any]] = {}
     for equipment_id in equipment_ids:
         parts = [item.get("allocations", {}).get(equipment_id) for item in records]
         available = [part for part in parts if isinstance(part, dict)]
         categories = set().union(*(set(part.get("categories", {})) for part in available))
-        seconds = sum(float(part.get("period_seconds", 0) or 0) for part in available)
+        seconds = sum(
+            float(part.get("period_seconds", 0) or 0)
+            if isinstance(part, dict) else record_seconds(record)
+            for record, part in zip(records, parts, strict=True)
+        )
         covered = sum(float(part.get("covered_seconds", 0) or 0) for part in available)
         allocations[equipment_id] = {
             "meter_kwh": (None if len(available) != len(records) or any(
@@ -209,7 +337,11 @@ def combine_interval_records(records: list[dict[str, Any]]) -> dict[str, Any] | 
         parts = [item.get("temperatures", {}).get(source_id) for item in records]
         available = [part for part in parts if isinstance(part, dict)]
         coverage = sum(float(part.get("coverage_seconds", 0) or 0) for part in available)
-        period = sum(float(part.get("period_seconds", 0) or 0) for part in available)
+        period = sum(
+            float(part.get("period_seconds", 0) or 0)
+            if isinstance(part, dict) else record_seconds(record)
+            for record, part in zip(records, parts, strict=True)
+        )
         means = [(float(part["mean"]), float(part.get("coverage_seconds", 0) or 0))
                  for part in available if _number(part.get("mean")) is not None]
         temperatures[source_id] = {
@@ -229,16 +361,78 @@ def combine_interval_records(records: list[dict[str, Any]]) -> dict[str, Any] | 
             "latest_timestamp": next((part.get("latest_timestamp") for part in reversed(available)
                                       if part.get("latest_timestamp")), None),
         }
+    coverage = (
+        interval_coverage(records, expected_start, expected_end)
+        if expected_start is not None and expected_end is not None else None
+    )
+    household = optional_sum("household_kwh")
+    pv = optional_sum("pv_kwh")
+    imported = optional_sum("import_kwh")
+    exported = optional_sum("export_kwh")
+    non_hvac = optional_sum("non_hvac_kwh")
+    interval_complete = coverage is None or coverage["complete"]
     return {
         "local_date": records[0]["local_date"], "timezone": records[0]["timezone"],
-        "period_start_utc": records[0]["period_start_utc"],
-        "period_end_utc": records[-1]["period_end_utc"],
-        "day_seconds": sum(int(item.get("day_seconds", 0)) for item in records),
-        "household_kwh": optional_sum("household_kwh"), "pv_kwh": optional_sum("pv_kwh"),
-        "import_kwh": optional_sum("import_kwh"), "export_kwh": optional_sum("export_kwh"),
-        "non_hvac_kwh": optional_sum("non_hvac_kwh"),
-        "quality": "good" if all(item.get("quality") == "good" for item in records) else "partial",
+        "period_start_utc": (expected_start.isoformat() if expected_start else records[0]["period_start_utc"]),
+        "period_end_utc": (expected_end.isoformat() if expected_end else records[-1]["period_end_utc"]),
+        "day_seconds": int((expected_end - expected_start).total_seconds())
+        if expected_start and expected_end else sum(int(item.get("day_seconds", 0)) for item in records),
+        "known_household_kwh": household, "known_pv_kwh": pv,
+        "known_import_kwh": imported, "known_export_kwh": exported,
+        "known_non_hvac_kwh": non_hvac,
+        "household_kwh": household if interval_complete else None,
+        "pv_kwh": pv if interval_complete else None,
+        "import_kwh": imported if interval_complete else None,
+        "export_kwh": exported if interval_complete else None,
+        "non_hvac_kwh": non_hvac if interval_complete else None,
+        "quality": "good" if interval_complete and all(
+            item.get("quality") == "good" for item in records
+        ) else "partial",
+        "interval_coverage": coverage,
         "updated_at": records[-1].get("updated_at") or records[-1].get("collected_at"),
         "temperatures": temperatures, "allocations": allocations,
         "provenance": {"source": "persisted_hourly_records", "interval_count": len(records)},
     }
+
+
+def daily_coverage(
+    records: list[dict[str, Any]], start_date: str, end_date: str,
+) -> dict[str, Any]:
+    """Return explicit complete/missing daily coverage for a local-date range."""
+    start = datetime.fromisoformat(start_date).date()
+    end = datetime.fromisoformat(end_date).date()
+    expected: list[str] = []
+    cursor = start
+    while cursor <= end:
+        expected.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    present = {str(item.get("local_date")) for item in records}
+    missing = [day for day in expected if day not in present]
+    poor = [str(item["local_date"]) for item in records
+            if item.get("quality") in {"missing", "poor", "unreconciled"}]
+    return {
+        "expected_days": len(expected), "present_days": len(expected) - len(missing),
+        "missing_dates": missing, "poor_quality_dates": poor,
+        "coverage_percent": 100 * (len(expected) - len(missing)) / len(expected)
+        if expected else 100.0,
+        "complete": not missing and not poor,
+    }
+
+
+def combine_daily_records(
+    records: list[dict[str, Any]], start_date: str, end_date: str,
+) -> dict[str, Any] | None:
+    """Combine the full requested daily range with explicit missing dates."""
+    if not records:
+        return None
+    combined = combine_interval_records(records)
+    assert combined is not None
+    coverage = daily_coverage(records, start_date, end_date)
+    combined["period_coverage"] = coverage
+    if not coverage["complete"]:
+        for key in ("household_kwh", "pv_kwh", "import_kwh", "export_kwh", "non_hvac_kwh"):
+            combined[key] = None
+    combined["quality"] = "good" if coverage["complete"] and all(
+        item.get("quality") == "good" for item in records
+    ) else "partial"
+    return combined

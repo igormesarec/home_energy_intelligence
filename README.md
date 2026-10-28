@@ -9,7 +9,10 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Overview defaults to today's actuals through the latest completed hour, with a same-cutoff yesterday comparison, full-yesterday reference, explicit partial/stale state and manual refresh.
 - A single backend energy contract drives Overview, History and authenticated CSV export, including confirmed, assumed, selected, estimated, unknown, residual and discrepancy evidence.
 - Compact idempotent hourly rows survive restarts and complement—not replace—the six-hour classification checkpoints and 05:00 authoritative daily close.
-- History supports bounded date ranges, pagination, daily/weekly/monthly/year/energy-season presets and CSV export.
+- History supports Home Assistant-timezone presets for Today, Yesterday, −2 through −7 days, Monday–Sunday weeks, seven completed days, calendar months/years, configurable energy seasons and custom ranges. Its authoritative summary covers the entire range independently of the paginated detail rows, and CSV exports the entire selected range.
+- Expected completed hours are checked individually, so internal gaps are visible and late Recorder data can safely replace poor-quality hourly rows without duplicating energy.
+- Missing allocations expose known partial subtotals separately and never become complete zero heating, DHW or cooling totals. Device-level heating/cooling evidence and signed reconciliation discrepancies remain visible.
+- PV, grid and household history uses measured, physically valid balances and reports self-sufficiency/self-consumption only when its required inputs are available.
 - Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
 
 ## V0.1 foundation
@@ -25,7 +28,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Idempotent 05:00 daily close and correction-safe catch-up in a dedicated compact SQLite database.
 - Optional read-only InfluxDB 1.x backfill for explicitly mapped sources.
 - Responsive Overview, History, and Settings panel with six-tab navigation. Deferred tabs never display invented measurements.
-- Dashboard equipment is loaded dynamically. Authenticated users can view Overview and History; source mappings, database details and exports remain administrator-only.
+- Dashboard equipment is loaded dynamically. Authenticated users can view Overview, History and export their selected history range; source mappings and database details remain administrator-only. Database backup remains an administrator-only service.
 - Sidebar registration is idempotent across config-entry reloads: one static route and one panel are maintained, and the panel is removed on final unload.
 - Daily summary and quality sensors only; no duplicate high-frequency entities.
 

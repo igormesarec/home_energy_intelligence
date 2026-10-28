@@ -173,3 +173,41 @@ def test_bounded_history_pagination(tmp_path):
                                    limit=1, offset=1)
     assert total == 2
     assert [row["local_date"] for row in rows] == ["2026-10-24"]
+
+
+def test_poor_hour_can_be_reprocessed_after_late_recorder_data(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start = datetime(2026, 10, 28, 10, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    poor = {"local_date": "2026-10-28", "timezone": "Europe/Ljubljana",
+            "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+            "quality": "partial", "household_kwh": None}
+    assert db.upsert_hourly(poor)
+    assert not db.hourly_needs_reprocess(start, end)
+    assert not db.hourly_needs_reprocess(start, end, include_partial=True)
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE hourly_records SET updated_at=?",
+            ((datetime.now(UTC) - timedelta(minutes=20)).isoformat(),),
+        )
+    assert db.hourly_needs_reprocess(start, end, include_partial=True)
+    corrected = {**poor, "quality": "good", "household_kwh": 2.5}
+    assert db.upsert_hourly(corrected)
+    assert not db.hourly_needs_reprocess(start, end, include_partial=True)
+    assert db.hourly_range(start, end)[0]["household_kwh"] == 2.5
+
+
+def test_authoritative_full_year_is_not_limited_by_history_page(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    for index in range(366):
+        item = record(1)
+        item.local_date = (start + timedelta(days=index)).date().isoformat()
+        db.upsert_daily(item)
+    page, total = db.history_range(start_date="2024-01-01", end_date="2024-12-31",
+                                   limit=90)
+    period = db.history_period("2024-01-01", "2024-12-31")
+    assert len(page) == 90 and total == 366
+    assert len(period) == 366

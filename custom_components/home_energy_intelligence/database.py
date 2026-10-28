@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -382,6 +382,27 @@ class EnergyDatabase:
             result.append(item)
         return result, total
 
+    def history_period(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        """Load an entire explicitly bounded period independently of page size."""
+        from datetime import date
+
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        if end < start or (end - start).days > 3660:
+            raise ValueError("history period must be ordered and no longer than ten years")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT payload_json,revision,updated_at FROM daily_records
+                WHERE local_date>=? AND local_date<=? ORDER BY local_date""",
+                (start_date, end_date),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = json.loads(row["payload_json"])
+            item.update(revision=row["revision"], updated_at=row["updated_at"])
+            result.append(item)
+        return result
+
     def upsert_hourly(self, payload: dict[str, Any]) -> bool:
         """Store one completed elapsed-hour interval idempotently."""
         serialized = _canonical_json(payload)
@@ -429,6 +450,25 @@ class EnergyDatabase:
                 (start.isoformat(), end.isoformat()),
             ).fetchone() is not None
 
+    def hourly_needs_reprocess(
+        self, start: datetime, end: datetime, *, include_partial: bool = False,
+    ) -> bool:
+        """Return whether an interval is absent or eligible for controlled repair."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT quality,updated_at FROM hourly_records
+                WHERE interval_start_utc=? AND interval_end_utc=?""",
+                (start.isoformat(), end.isoformat()),
+            ).fetchone()
+        if row is None:
+            return True
+        retryable = {"missing", "poor", "missing_counter", "unreconciled"}
+        if include_partial:
+            updated = datetime.fromisoformat(row["updated_at"])
+            if datetime.now(UTC) - updated >= timedelta(minutes=15):
+                retryable.add("partial")
+        return str(row["quality"]) in retryable
+
     def latest(self) -> dict[str, Any] | None:
         rows = self.history(limit=1)
         return rows[0] if rows else None
@@ -444,6 +484,13 @@ class EnergyDatabase:
         item = json.loads(row["payload_json"])
         item.update(revision=row["revision"], updated_at=row["updated_at"])
         return item
+
+    def daily_bounds(self) -> tuple[str | None, str | None]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(local_date),MAX(local_date) FROM daily_records"
+            ).fetchone()
+        return row[0], row[1]
 
     def export_to(self, destination: str | Path) -> Path:
         target = Path(destination)

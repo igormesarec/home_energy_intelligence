@@ -8,6 +8,12 @@
 - Added dynamic per-equipment evidence, representative indoor-source selection, temperature timelines and guarded PV analytics.
 - Added matching representative indoor/outdoor cards and selectors with latest-valid timestamps, time-weighted period statistics, coverage, quality, yesterday comparisons and gap-preserving timelines.
 - Expanded History with bounded date filtering, pagination, period presets and CSV export.
+- Corrected missing-energy semantics: complete measured zero, complete totals, known partial subtotals and unavailable totals are now distinct in Overview, History, device tables, charts and CSV.
+- Added exact expected-hour coverage with internal-gap detection, 23/25-hour DST handling and controlled idempotent repair of delayed partial intervals.
+- Added all requested Home Assistant-timezone calendar presets, configurable July–June energy seasons and authoritative whole-period summaries independent of detail pagination.
+- Added complete dynamic device heating/cooling evidence, including confirmed/selected/estimated AC cooling, and preserved signed negative reconciliation discrepancies.
+- Added measured PV/import/export/on-site-use/household history with guarded self-sufficiency and PV self-consumption rates.
+- Made CSV export honor the actual selected range beyond 366 days and preserve History filters during automatic refresh.
 - Preserved the approved six-tab design and kept COP, thermal modelling and forecasts explicitly deferred.
 
 ## V0.1.0 — draft
