@@ -32,6 +32,7 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
 
     from custom_components.home_energy_intelligence.const import DOMAIN, PANEL_URL
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.panel import async_register_panel
 
     # The isolated HA fixture does not bootstrap a full Recorder/frontend stack.
     # Mark declared platform dependencies loaded so the test exercises this
@@ -52,6 +53,9 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
         assert entry.state is ConfigEntryState.LOADED
         assert entry.entry_id in hass.data[DOMAIN]
         assert PANEL_URL in hass.data.get("frontend_panels", {})
+        panel_count = len(hass.data.get("frontend_panels", {}))
+        await async_register_panel(hass)
+        assert len(hass.data.get("frontend_panels", {})) == panel_count
         assert any(state.entity_id.endswith("latest_data_quality") for state in hass.states.async_all())
 
         options = await hass.config_entries.options.async_init(entry.entry_id)
@@ -60,8 +64,11 @@ async def test_config_options_setup_reload_unload_panel_and_sensor_refresh(
         await hass.config_entries.async_reload(entry.entry_id)
         await hass.async_block_till_done()
         assert entry.state is ConfigEntryState.LOADED
+        assert PANEL_URL in hass.data.get("frontend_panels", {})
+        assert hass.data[DOMAIN]["panel_static_path_registered"] is True
         assert await hass.config_entries.async_unload(entry.entry_id)
         assert entry.state is ConfigEntryState.NOT_LOADED
+        assert PANEL_URL not in hass.data.get("frontend_panels", {})
 
 
 @pytest.mark.asyncio

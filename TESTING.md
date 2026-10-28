@@ -30,6 +30,9 @@ Covered acceptance cases include:
 - Stable equipment/source IDs and temperature filters surviving unrelated Options Flow changes.
 - Equipment-neutral dashboard source checks and authenticated-user/admin authorization boundaries.
 - Unchanged Recorder temperatures remaining valid independently of their last value-change time.
+- Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
+- Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
+- Current Home Assistant read-only Options Flow `config_entry` lifecycle.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.
 
 ## Home Assistant runtime suite

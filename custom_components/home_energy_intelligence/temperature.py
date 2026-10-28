@@ -97,6 +97,17 @@ def time_weighted_temperature(
             prior_valid=prior_valid,
             maximum_change_per_minute=maximum_change_per_minute,
         )
+        if rejection is None and sample.reason and sample.reason.startswith("statistics_bounds:"):
+            try:
+                _prefix, bound_minimum, bound_maximum = sample.reason.split(":", 2)
+                bounds = (float(bound_minimum), float(bound_maximum))
+                if any(
+                    value in invalid_values or not minimum_valid <= value <= maximum_valid
+                    for value in bounds
+                ):
+                    rejection = "contaminated_statistics_bounds"
+            except ValueError:
+                rejection = "invalid_statistics_bounds"
         if rejection:
             rejected_reasons.append(f"{rejection}:{sample.value:g}")
             rejections.append(RejectedReading(
@@ -117,7 +128,8 @@ def time_weighted_temperature(
                 _prefix, minimum, maximum = sample.reason.split(":", 2)
                 accepted_values.extend((float(minimum), float(maximum)))
             except ValueError:
-                rejected_reasons.append("invalid_statistics_bounds")
+                # Malformed bounds are rejected above and cannot reach here.
+                pass
 
     if coverage == 0:
         return TemperatureResult(

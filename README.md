@@ -18,6 +18,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Optional read-only InfluxDB 1.x backfill for explicitly mapped sources.
 - Responsive Overview, History, and Settings panel with six-tab navigation. Deferred tabs never display invented measurements.
 - Dashboard equipment is loaded dynamically. Authenticated users can view Overview and History; source mappings, database details and exports remain administrator-only.
+- Sidebar registration is idempotent across config-entry reloads: one static route and one panel are maintained, and the panel is removed on final unload.
 - Daily summary and quality sensors only; no duplicate high-frequency entities.
 
 ## Installation

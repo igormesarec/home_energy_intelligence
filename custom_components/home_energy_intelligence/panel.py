@@ -11,12 +11,18 @@ from .const import DOMAIN, PANEL_ICON, PANEL_TITLE, PANEL_URL, VERSION
 
 
 async def async_register_panel(hass) -> None:
-    if frontend.async_panel_exists(hass, PANEL_URL):
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if not domain_data.get("panel_static_path_registered"):
+        frontend_dir = Path(__file__).parent / "frontend"
+        await hass.http.async_register_static_paths([
+            StaticPathConfig(f"/{DOMAIN}_static", str(frontend_dir), True)
+        ])
+        domain_data["panel_static_path_registered"] = True
+    # Current Home Assistant keeps the supported panel registry here.  The old
+    # frontend.async_panel_exists helper was removed.  Consult the registry so
+    # setup/reload is idempotent without swallowing registration errors.
+    if PANEL_URL in hass.data.get("frontend_panels", {}):
         return
-    frontend_dir = Path(__file__).parent / "frontend"
-    await hass.http.async_register_static_paths([
-        StaticPathConfig(f"/{DOMAIN}_static", str(frontend_dir), True)
-    ])
     await panel_custom.async_register_panel(
         hass=hass,
         frontend_url_path=PANEL_URL,
@@ -31,4 +37,5 @@ async def async_register_panel(hass) -> None:
 
 
 def async_remove_panel(hass) -> None:
-    frontend.async_remove_panel(hass, PANEL_URL, warn_if_unknown=False)
+    if PANEL_URL in hass.data.get("frontend_panels", {}):
+        frontend.async_remove_panel(hass, PANEL_URL, warn_if_unknown=False)

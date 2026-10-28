@@ -78,6 +78,18 @@ def test_long_term_statistic_bounds_do_not_distort_weighted_mean():
     assert result.maximum == 7
 
 
+@pytest.mark.parametrize("contaminated", [-55, 155])
+def test_contaminated_long_term_statistics_have_no_measured_coverage(contaminated):
+    result = time_weighted_temperature(
+        [NumericSample(dt(), 5.5, f"statistics_bounds:4:{contaminated}"),
+         NumericSample(dt(1), None, "statistics_interval_end")],
+        dt(), dt(1), minimum_valid=-50, maximum_valid=60,
+    )
+    assert result.mean is None
+    assert result.coverage_seconds == 0
+    assert result.rejections[0].reason == "contaminated_statistics_bounds"
+
+
 @pytest.mark.parametrize("bad", [-55.0, 155.0])
 def test_known_invalid_sentinels_have_zero_measured_coverage_and_audit_detail(bad):
     result = time_weighted_temperature(

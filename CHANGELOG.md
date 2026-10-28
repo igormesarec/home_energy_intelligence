@@ -18,5 +18,8 @@
 - Made checkpoint recovery complete each enabled equipment ID independently without replacing valid checkpoints.
 - Kept stable Recorder temperature states valid until an explicit unavailable state; freshness limits apply to point samples rather than value-change age.
 - Synchronized English and Slovenian guided-flow translations and documented administrator-only settings access.
+- Replaced removed `frontend.async_panel_exists` usage with the supported frontend panel registry and made static-path/panel registration reload-safe.
+- Updated Options Flow for Home Assistant's framework-provided, read-only `config_entry` property.
+- Reject contaminated long-term temperature-statistic intervals when their min/max bounds contain sentinels or physical outliers.
 
 COP, thermal-profile modelling and weather-dependent forecasting remain deferred and display no invented values.

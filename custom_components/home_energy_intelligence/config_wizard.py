@@ -320,15 +320,21 @@ class ConfigFlow(_Wizard, config_entries.ConfigFlow, domain=DOMAIN):
     def _finish(self, data): return self.async_create_entry(title="Home Energy Intelligence", data=data)
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry): return OptionsFlow(config_entry)
+    def async_get_options_flow(config_entry): return OptionsFlow()
 
 
 class OptionsFlow(_Wizard, config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
-        self._load({**config_entry.data, **config_entry.options})
-        self._editing = True
-    async def async_step_init(self, user_input=None): return await self.async_step_general(user_input)
+    def __init__(self):
+        self._loaded_entry = False
+
+    async def async_step_init(self, user_input=None):
+        # Home Assistant supplies config_entry through the OptionsFlow handler
+        # after initialization.  It is a read-only property in current HA.
+        if not self._loaded_entry:
+            self._load({**self.config_entry.data, **self.config_entry.options})
+            self._editing = True
+            self._loaded_entry = True
+        return await self.async_step_general(user_input)
     def _finish(self, data):
         current = {**self.config_entry.data, **self.config_entry.options}
         if current.get("influx_password") and not data.get("influx_password"): data["influx_password"] = current["influx_password"]
