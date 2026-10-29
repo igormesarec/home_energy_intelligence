@@ -152,9 +152,25 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
         "influx_database": "homeassistant", "influx_retention_policy": "autogen",
         "influx_mapping_json": "{}",
     })
+    representative_field = next(
+        field for field in result["data_schema"].schema
+        if str(field) == "representative_outdoor_source_id"
+    )
+    assert representative_field.default() == "__none__"
     result = await hass.config_entries.options.async_configure(result["flow_id"], {
         "maximum_power_gap_minutes": 30, "counter_jump_limit_kwh": 500,
         "assumed_heating_reporting": "separate",
+        "representative_outdoor_source_id": "stable-outdoor",
+        "test_representative_sources": True,
+    })
+    assert result["step_id"] == "data_quality"
+    assert "Outdoor" in result["description_placeholders"]["representative_preview"]
+    assert "5.00 °C" in result["description_placeholders"]["representative_preview"]
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {
+        "maximum_power_gap_minutes": 30, "counter_jump_limit_kwh": 500,
+        "assumed_heating_reporting": "separate",
+        "representative_outdoor_source_id": "__none__",
+        "test_representative_sources": False,
     })
     assert result["type"].value == "create_entry"
     saved_equipment = json.loads(result["data"]["equipment"])
@@ -162,6 +178,7 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert saved_equipment[0]["equipment_id"] == "stable-hp"
     assert saved_temperatures[0]["source_id"] == "stable-outdoor"
     assert saved_temperatures[0]["quality"]["invalid_values"] == [-55.0, 155.0]
+    assert "representative_outdoor_source_id" not in result["data"]
 
 
 @pytest.mark.asyncio

@@ -31,3 +31,12 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - `poor`: less than half of the period classified.
 - `missing`: no defensible value.
 - `unreconciled`: derived totals contradict source totals.
+
+## Coverage layers
+
+- **Date availability** is elapsed local-date duration present in the compact archive; DST days contribute their actual 23-, 24- or 25-hour duration.
+- **Meter coverage** is elapsed duration with each required authoritative counter available. It does not depend on a temperature sensor.
+- **Allocation coverage** is classified elapsed duration across every enabled equipment ID. A device with 18 classified hours in a 24-hour day contributes 75%, not 0% or 100%; no configured equipment is reported as unavailable rather than full coverage.
+- **Temperature coverage** is valid elapsed duration for each source independently. A representative card with no explicit selection says **Not configured** and never reports 100%.
+
+These layers are intentionally independent. A complete household meter can remain complete when an indoor sensor is missing, while a partial HVAC classifier keeps its meter total and raw residual evidence without promoting missing categories to confirmed zero.

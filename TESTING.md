@@ -41,6 +41,9 @@ Covered acceptance cases include:
 - Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
 - History Today replacement from completed hourly rows without daily writes, shared cutoff propagation and Home Assistant-timezone labelling.
 - Separate date/meter/allocation/temperature period quality, missing-date temperature denominators and preservation of valid meter totals when temperature coverage is partial.
+- Elapsed-time allocation coverage for partial equipment, unavailable (not 100%) coverage with no configured equipment, explicit representative-source opt-in and representative live preview evidence.
+- Supplied-site PV/grid rounding balance and heat-pump/partial-AC classification baselines without converting partial classifications into confirmed zeroes.
+- Frontend contracts for the electrical-only normalized heating-response profile, explicit unconfigured representatives, bounded pagination and compact mobile controls.
 - Nonzero Other HVAC fan/dry allocation with zero discrepancy, plus configured representative-source enforcement in frontend charts.
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
 - Current Home Assistant read-only Options Flow `config_entry` lifecycle.

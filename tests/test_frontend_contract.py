@@ -77,7 +77,7 @@ def test_overview_and_history_share_today_period_controls_and_cutoff():
     frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
     websocket = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
     assert 'this.historyPreset = "today"' in frontend
-    assert frontend.count("${this.periodControls()}") == 2
+    assert frontend.count("${this.periodControls()}") == 3
     assert "cutoff_utc:this.overviewData.cutoff_utc" in frontend
     assert "replace_with_partial_day(" in websocket and "stored_records, partial_today" in websocket
     assert websocket.count("_current_day_snapshot(") >= 3
@@ -105,3 +105,31 @@ def test_cutoff_is_rendered_in_home_assistant_timezone():
     websocket = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
     assert "cutoff_local" in frontend and "overviewData?.timezone" in frontend
     assert '"cutoff_local"' in websocket and '"timezone": coordinator.timezone' in websocket
+
+
+def test_unconfigured_representatives_are_explicit_and_never_claim_coverage():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert "Not configured" in source
+    assert "No coverage percentage is inferred" in source
+    assert 'return "Not configured"' in source
+    assert "weather provider or water-circuit sensor is never substituted" in source
+
+
+def test_thermal_profile_is_electrical_and_withholds_unmeasured_heat_output():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    backend = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    assert "Whole-House Electrical Heating Response" in source
+    assert "complete daily points only" in source
+    assert "Thermal output / COP" in source and "Unavailable" in source
+    assert "Electricity is not heat output" in source
+    assert '"response_profile"' in backend
+    assert '"representative_outdoor_source_id"' in backend
+    assert "heat_pump_heating_kwh" in backend and "ac_heating_kwh" in backend
+
+
+def test_mobile_controls_hide_irrelevant_fields_and_pager_has_real_bounds():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert 'this.historyPreset==="older_month"?"visible":""' in source
+    assert 'this.historyPreset==="custom"?"visible":""' in source
+    assert "this.historyTotal" in source and "button:disabled" in source
+    assert "-webkit-overflow-scrolling:touch" in source

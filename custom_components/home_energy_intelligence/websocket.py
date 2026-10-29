@@ -15,7 +15,7 @@ from .configuration import (
     equipment_from_config, equipment_temperature_mappings, temperatures_from_config,
 )
 from .analytics import (
-    attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
+    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records, daily_coverage,
     interval_coverage, replace_with_partial_day,
 )
 from .const import DOMAIN
@@ -131,6 +131,7 @@ async def ws_overview(hass, connection, msg):
         "yesterday_interval_coverage": comparison_coverage,
         "energy_season_start_month": int(coordinator.config.get("energy_season_start_month", 7)),
         "energy_season_start_day": int(coordinator.config.get("energy_season_start_day", 1)),
+        "floor_area_m2": coordinator.config.get("floor_area_m2"),
         "equipment": equipment,
         "temperature_sources": temperatures,
         "representative_indoor_source_id": coordinator.config.get(
@@ -165,6 +166,7 @@ async def ws_history(hass, connection, msg):
         connection.send_result(msg["id"], {"records": []})
         return
     equipment = _equipment(coordinator)
+    equipment_ids = [item["equipment_id"] for item in equipment if item["enabled"]]
     start_date, end_date = msg.get("start_date"), msg.get("end_date")
     selected_label = None
     if preset := msg.get("preset"):
@@ -231,8 +233,12 @@ async def ws_history(hass, connection, msg):
         combined = combine_daily_records(
             period_records, start_date, end_date,
             temperature_source_ids=temperature_source_ids,
+            equipment_ids=equipment_ids, timezone=coordinator.timezone,
         )
-        selected_coverage = daily_coverage(period_records, start_date, end_date)
+        selected_coverage = daily_coverage(
+            period_records, start_date, end_date,
+            equipment_ids=equipment_ids, timezone=coordinator.timezone,
+        )
         if combined:
             selected_coverage = combined["period_coverage"]
     elif records:
@@ -241,12 +247,46 @@ async def ws_history(hass, connection, msg):
         combined = combine_daily_records(
             records, min(page_dates), max(page_dates),
             temperature_source_ids=temperature_source_ids,
+            equipment_ids=equipment_ids, timezone=coordinator.timezone,
         )
         selected_coverage = combined["period_coverage"] if combined else None
     else:
         period_records = []
         combined = None
         selected_coverage = None
+    representative_outdoor_id = coordinator.config.get(
+        "representative_outdoor_source_id"
+    )
+    response_points = []
+    if representative_outdoor_id:
+        for record in period_records:
+            if record.get("partial") is True or record.get("finalized") is False:
+                continue
+            temperature = (record.get("temperatures") or {}).get(
+                representative_outdoor_id
+            ) or {}
+            energy = canonical_energy(record, equipment)
+            if temperature.get("mean") is None or energy.get("space_heating_kwh") is None:
+                continue
+            devices = energy.get("equipment") or []
+            response_points.append({
+                "local_date": record.get("local_date"),
+                "outdoor_mean_c": temperature.get("mean"),
+                "temperature_coverage_percent": temperature.get("coverage_percent"),
+                "space_heating_kwh": energy.get("space_heating_kwh"),
+                "heat_pump_heating_kwh": sum(
+                    float(item.get("confirmed_heating_kwh", 0) or 0)
+                    + float(item.get("assumed_heating_kwh", 0) or 0)
+                    for item in devices if item.get("kind") == "heat_pump"
+                ),
+                "ac_heating_kwh": sum(
+                    float(item.get("confirmed_heating_kwh", 0) or 0)
+                    + float(item.get("selected_heating_kwh", 0) or 0)
+                    + float(item.get("estimated_heating_kwh", 0) or 0)
+                    for item in devices if item.get("kind") == "air_conditioner"
+                ),
+                "quality": energy.get("quality"),
+            })
     connection.send_result(msg["id"], {
         "records": [attach_canonical(record, equipment) for record in records],
         "summary": attach_canonical(combined, equipment) if combined else None,
@@ -260,6 +300,10 @@ async def ws_history(hass, connection, msg):
         "cutoff_local": (history_cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat()
                          if history_cutoff else None),
         "timezone": coordinator.timezone,
+        "response_profile": {
+            "outdoor_source_id": representative_outdoor_id,
+            "points": response_points,
+        },
     })
 
 

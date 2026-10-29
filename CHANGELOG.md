@@ -20,6 +20,11 @@
 - Split period quality into date availability, household-meter, HVAC-allocation and per-source temperature coverage so unrelated temperature gaps no longer erase valid meter totals.
 - Counted absent local dates, including 23/25-hour days, in period temperature coverage while retaining duration-weighted valid means and validated min/max.
 - Added the shared Home Assistant-timezone period selector to Overview and made representative-source charts honor only the configured stable source ID.
+- Removed silent first-source representative defaults, added an in-flow representative-source preview/test, and made unconfigured indoor/outdoor cards explicitly unavailable instead of showing inferred 100% coverage.
+- Changed allocation coverage from binary good-day counts to classified elapsed seconds across every enabled equipment ID; partial device meters and classification evidence remain visible without promoting unknown categories to zero.
+- Added an evidence-bound whole-house **electrical** heating-response profile normalized by floor area while explicitly withholding unmeasured thermal output, COP and design-day claims.
+- Added mobile period-control disclosure, bounded pager state, compact empty states, touch-sized controls and horizontally scrollable evidence tables for 360–430 px layouts.
+- Added explicit PV/grid balance evidence (`PV − export`, `self-use + import`) without overwriting measured household electricity.
 
 ## V0.1.0 — draft
 
