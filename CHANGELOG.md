@@ -15,6 +15,11 @@
 - Added measured PV/import/export/on-site-use/household history with guarded self-sufficiency and PV self-consumption rates.
 - Made CSV export honor the actual selected range beyond 366 days and preserve History filters during automatic refresh.
 - Preserved the approved six-tab design and kept COP, thermal modelling and forecasts explicitly deferred.
+- Made History → Today use the same completed-hour cutoff as Overview without creating a finalized daily row; Today CSV uses the same in-memory partial record.
+- Added a separately reconciled Other HVAC category for fan/dry operation across split charts, device tables and CSV, while keeping unallocated energy and signed discrepancy distinct.
+- Split period quality into date availability, household-meter, HVAC-allocation and per-source temperature coverage so unrelated temperature gaps no longer erase valid meter totals.
+- Counted absent local dates, including 23/25-hour days, in period temperature coverage while retaining duration-weighted valid means and validated min/max.
+- Added the shared Home Assistant-timezone period selector to Overview and made representative-source charts honor only the configured stable source ID.
 
 ## V0.1.0 — draft
 

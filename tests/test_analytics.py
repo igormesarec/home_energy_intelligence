@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from custom_components.home_energy_intelligence.analytics import (
     attach_canonical, canonical_energy, combine_daily_records, combine_interval_records,
-    interval_coverage,
+    daily_coverage, interval_coverage, replace_with_partial_day,
 )
 
 
@@ -101,6 +101,18 @@ def test_negative_discrepancy_is_preserved_with_its_sign():
     assert canonical_energy(record, EQUIPMENT)["unallocated_discrepancy_kwh"] == -1
 
 
+def test_other_hvac_fan_dry_reconciles_without_discrepancy():
+    record = {"household_kwh": 2, "allocations": {
+        "hp-a": {"meter_kwh": 0, "categories": {}, "quality": "good"},
+        "ac-a": {"meter_kwh": 2, "categories": {"dry_fan": 2}, "quality": "good"},
+    }}
+    energy = canonical_energy(record, EQUIPMENT)
+    assert energy["other_hvac_kwh"] == 2
+    assert energy["known_other_hvac_kwh"] == 2
+    assert energy["unknown_kwh"] == 0
+    assert energy["unallocated_discrepancy_kwh"] == 0
+
+
 def _hour(start, household=1.0):
     end = start + timedelta(hours=1)
     return {
@@ -192,3 +204,51 @@ def test_full_period_summary_is_independent_of_page_and_marks_missing_day():
     assert combined["known_household_kwh"] == 6
     assert combined["period_coverage"]["missing_dates"] == ["2026-01-02"]
     assert canonical_energy(combined, EQUIPMENT[:1])["space_heating_kwh"] is None
+
+
+def test_period_quality_layers_do_not_invalidate_unrelated_meter_totals():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "quality": "partial", "day_seconds": 86400})
+    coverage = daily_coverage([record], "2026-01-01", "2026-01-01")
+    assert coverage["complete"] is False
+    assert coverage["date_coverage"]["complete"] is True
+    assert coverage["meter_coverage"]["complete"] is True
+    assert coverage["allocation_coverage"]["complete"] is True
+    record["period_coverage"] = coverage
+    energy = canonical_energy(record, EQUIPMENT[:1])
+    assert energy["household_kwh"] == 2
+    assert energy["space_heating_kwh"] == 2
+
+
+def test_absent_daily_record_counts_in_temperature_period_denominator():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "day_seconds": 86400})
+    record["temperatures"] = {"outdoor-selected": {
+        "mean": 5, "minimum": 3, "maximum": 7,
+        "coverage_seconds": 86400, "period_seconds": 86400, "quality": "good",
+    }}
+    combined = combine_daily_records(
+        [record], "2026-01-01", "2026-01-02",
+        temperature_source_ids=["outdoor-selected"],
+    )
+    temperature = combined["temperatures"]["outdoor-selected"]
+    assert temperature["mean"] == 5
+    assert temperature["minimum"] == 3
+    assert temperature["maximum"] == 7
+    assert temperature["coverage_percent"] == 50
+    assert temperature["quality"] == "partial"
+
+
+def test_today_partial_replaces_finalized_row_in_memory_only():
+    finalized = {"local_date": "2026-10-29", "household_kwh": 99, "finalized": True}
+    earlier = {"local_date": "2026-10-28", "household_kwh": 10}
+    partial = {"local_date": "2026-10-29", "household_kwh": 4}
+    result = replace_with_partial_day([finalized, earlier], partial)
+    assert [item["local_date"] for item in result] == ["2026-10-28", "2026-10-29"]
+    assert result[-1]["household_kwh"] == 4
+    assert result[-1]["partial"] is True
+    assert result[-1]["finalized"] is False
+    assert finalized["household_kwh"] == 99
+    assert replace_with_partial_day(
+        [finalized, earlier], None, local_date="2026-10-29"
+    ) == [earlier]

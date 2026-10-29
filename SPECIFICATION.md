@@ -62,4 +62,9 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - Dynamic per-device heating and cooling preserve confirmed, selected and estimated evidence. Device subtotals reconcile with canonical category totals when complete.
 - Energy Split keeps heating, DHW, cooling, idle, other household, unknown and signed discrepancy separate. Negative discrepancies are warnings, never clipped to zero.
 - Indoor/outdoor timelines and summaries retain source IDs, mapping history, validated gaps, daily min/max/coverage and duration-weighted means across all valid elapsed seconds.
+- History Today is an in-memory view of validated completed-hour rows at the same cutoff as Overview. It is explicitly partial and never inserted into finalized daily history.
+- Period quality is layered: date availability, meter coverage, allocation coverage and temperature coverage are reported independently. An unrelated temperature gap cannot invalidate a valid meter total.
+- Missing local dates contribute their full DST-aware duration to temperature coverage denominators; valid observations alone contribute to duration-weighted means and validated min/max.
+- Energy Split includes Other HVAC (including fan/dry), other household, unallocated energy and signed reconciliation discrepancy as distinct evidence.
+- Overview and History share one Home Assistant-timezone period selection. Heating-versus-outdoor analytics use only the explicitly selected representative outdoor source.
 - PV, grid and household analytics use measured counters and physically valid balances; unavailable sources never generate a zero or invented rate.

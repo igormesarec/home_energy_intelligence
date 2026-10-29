@@ -39,6 +39,9 @@ Covered acceptance cases include:
 - Python compilation and frontend JavaScript syntax validation for every release candidate.
 - Unchanged Recorder temperatures remaining valid independently of their last value-change time.
 - Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
+- History Today replacement from completed hourly rows without daily writes, shared cutoff propagation and Home Assistant-timezone labelling.
+- Separate date/meter/allocation/temperature period quality, missing-date temperature denominators and preservation of valid meter totals when temperature coverage is partial.
+- Nonzero Other HVAC fan/dry allocation with zero discrepancy, plus configured representative-source enforcement in frontend charts.
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
 - Current Home Assistant read-only Options Flow `config_entry` lifecycle.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.

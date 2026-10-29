@@ -16,7 +16,7 @@ from .configuration import (
 )
 from .analytics import (
     attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
-    interval_coverage,
+    interval_coverage, replace_with_partial_day,
 )
 from .const import DOMAIN
 from .periods import period_bounds, previous_day_same_local_cutoff
@@ -56,6 +56,30 @@ def _temperatures(coordinator):
     return explicit + generated
 
 
+async def _current_day_snapshot(
+    hass, coordinator, cutoff: datetime | None = None, *, now: datetime | None = None,
+):
+    """Build today's non-persisted partial exclusively from completed hourly rows."""
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    completed_cutoff = now.replace(minute=0, second=0, microsecond=0)
+    cutoff = min(cutoff or completed_cutoff, completed_cutoff)
+    zone = ZoneInfo(coordinator.timezone)
+    today = now.astimezone(zone).date()
+    today_start, _ = local_day_bounds(today, coordinator.timezone)
+    if cutoff < today_start:
+        raise ValueError("cutoff is outside the current Home Assistant local day")
+    hours = await hass.async_add_executor_job(
+        coordinator.database.hourly_range, today_start, cutoff
+    )
+    coverage = interval_coverage(hours, today_start, cutoff)
+    current = combine_interval_records(
+        hours, expected_start=today_start, expected_end=cutoff
+    )
+    if current is not None:
+        current.update({"partial": True, "finalized": False})
+    return current, hours, coverage, cutoff, today
+
+
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/overview"})
 @websocket_api.async_response
 async def ws_overview(hass, connection, msg):
@@ -64,17 +88,8 @@ async def ws_overview(hass, connection, msg):
         connection.send_result(msg["id"], {"configured": False, "latest": None, "equipment": []})
         return
     equipment = _equipment(coordinator)
-    now = datetime.now(UTC)
-    zone = ZoneInfo(coordinator.timezone)
-    today = now.astimezone(zone).date()
-    today_start, _ = local_day_bounds(today, coordinator.timezone)
-    cutoff = now.replace(minute=0, second=0, microsecond=0)
-    today_hours = await hass.async_add_executor_job(
-        coordinator.database.hourly_range, today_start, cutoff
-    )
-    today_coverage = interval_coverage(today_hours, today_start, cutoff)
-    current = combine_interval_records(
-        today_hours, expected_start=today_start, expected_end=cutoff
+    current, today_hours, today_coverage, cutoff, today = await _current_day_snapshot(
+        hass, coordinator
     )
     yesterday = today - timedelta(days=1)
     yesterday_start, comparison_end = previous_day_same_local_cutoff(
@@ -108,7 +123,9 @@ async def ws_overview(hass, connection, msg):
                                    if comparison else None),
         "yesterday_full": (attach_canonical(yesterday_full, equipment)
                            if yesterday_full else None),
-        "cutoff_utc": cutoff.isoformat(), "latest_hour_end_utc": latest_hour_end,
+        "cutoff_utc": cutoff.isoformat(),
+        "cutoff_local": cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat(),
+        "timezone": coordinator.timezone, "latest_hour_end_utc": latest_hour_end,
         "partial": True, "stale": not today_coverage["complete"],
         "today_interval_coverage": today_coverage,
         "yesterday_interval_coverage": comparison_coverage,
@@ -138,6 +155,7 @@ async def ws_overview(hass, connection, msg):
     vol.Optional("end_date"): str,
     vol.Optional("preset"): str,
     vol.Optional("older_month"): str,
+    vol.Optional("cutoff_utc"): str,
     vol.Optional("offset", default=0): vol.All(vol.Coerce(int), vol.Range(min=0)),
 })
 @websocket_api.async_response
@@ -162,7 +180,41 @@ async def ws_history(hass, connection, msg):
         except ValueError as error:
             connection.send_error(msg["id"], "invalid_period", str(error))
             return
-    if start_date or end_date or msg.get("offset"):
+    partial_today = None
+    local_today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    if start_date and end_date and start_date <= local_today.isoformat() <= end_date:
+        requested_cutoff = None
+        if msg.get("cutoff_utc"):
+            try:
+                requested_cutoff = datetime.fromisoformat(msg["cutoff_utc"])
+                if requested_cutoff.tzinfo is None:
+                    raise ValueError("cutoff must include a timezone")
+                requested_cutoff = requested_cutoff.astimezone(UTC)
+            except ValueError as error:
+                connection.send_error(msg["id"], "invalid_cutoff", str(error))
+                return
+        try:
+            partial_today, _hours, _coverage, history_cutoff, _today = (
+                await _current_day_snapshot(hass, coordinator, requested_cutoff)
+            )
+        except ValueError as error:
+            connection.send_error(msg["id"], "invalid_cutoff", str(error))
+            return
+    else:
+        history_cutoff = None
+
+    if start_date and end_date:
+        stored_records = await hass.async_add_executor_job(
+            coordinator.database.history_period, start_date, end_date
+        )
+        period_records = replace_with_partial_day(
+            stored_records, partial_today,
+            local_date=local_today.isoformat()
+            if start_date <= local_today.isoformat() <= end_date else None,
+        )
+        total = len(period_records)
+        records = list(reversed(period_records))[msg["offset"]:msg["offset"] + msg["limit"]]
+    elif start_date or end_date or msg.get("offset"):
         records, total = await hass.async_add_executor_job(
             lambda: coordinator.database.history_range(
                 start_date=start_date, end_date=end_date,
@@ -174,16 +226,22 @@ async def ws_history(hass, connection, msg):
             lambda: coordinator.database.history(limit=msg["limit"], before=msg.get("before"))
         )
         total = len(records)
+    temperature_source_ids = [item.source_id for item in _temperatures(coordinator) if item.enabled]
     if start_date and end_date:
-        period_records = await hass.async_add_executor_job(
-            coordinator.database.history_period, start_date, end_date
+        combined = combine_daily_records(
+            period_records, start_date, end_date,
+            temperature_source_ids=temperature_source_ids,
         )
-        combined = combine_daily_records(period_records, start_date, end_date)
         selected_coverage = daily_coverage(period_records, start_date, end_date)
+        if combined:
+            selected_coverage = combined["period_coverage"]
     elif records:
         period_records = records
         page_dates = [item["local_date"] for item in records]
-        combined = combine_daily_records(records, min(page_dates), max(page_dates))
+        combined = combine_daily_records(
+            records, min(page_dates), max(page_dates),
+            temperature_source_ids=temperature_source_ids,
+        )
         selected_coverage = combined["period_coverage"] if combined else None
     else:
         period_records = []
@@ -197,6 +255,11 @@ async def ws_history(hass, connection, msg):
         "period_coverage": selected_coverage,
         "selected_period": {"preset": msg.get("preset"), "label": selected_label,
                             "start_date": start_date, "end_date": end_date},
+        "partial": partial_today is not None,
+        "cutoff_utc": history_cutoff.isoformat() if history_cutoff else None,
+        "cutoff_local": (history_cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat()
+                         if history_cutoff else None),
+        "timezone": coordinator.timezone,
     })
 
 
@@ -214,6 +277,7 @@ async def ws_refresh(hass, connection, msg):
 @websocket_api.websocket_command({
     vol.Required("type"): f"{DOMAIN}/history_csv",
     vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+    vol.Optional("cutoff_utc"): str,
 })
 @websocket_api.async_response
 async def ws_csv(hass, connection, msg):
@@ -229,15 +293,34 @@ async def ws_csv(hass, connection, msg):
     records = [] if not start_date or not end_date else await hass.async_add_executor_job(
         coordinator.database.history_period, start_date, end_date
     )
+    local_today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    if start_date and end_date and start_date <= local_today.isoformat() <= end_date:
+        requested_cutoff = None
+        try:
+            if msg.get("cutoff_utc"):
+                requested_cutoff = datetime.fromisoformat(msg["cutoff_utc"])
+                if requested_cutoff.tzinfo is None:
+                    raise ValueError("cutoff must include a timezone")
+                requested_cutoff = requested_cutoff.astimezone(UTC)
+            partial_today, _hours, _coverage, _cutoff, _today = await _current_day_snapshot(
+                hass, coordinator, requested_cutoff
+            )
+        except ValueError as error:
+            connection.send_error(msg["id"], "invalid_cutoff", str(error))
+            return
+        records = replace_with_partial_day(
+            records, partial_today, local_date=local_today.isoformat()
+        )
     equipment = _equipment(coordinator)
     output = io.StringIO()
     fields = ["date", "household_kwh", "confirmed_heat_pump_heating_kwh",
               "assumed_heat_pump_heating_kwh", "confirmed_ac_heating_kwh",
               "selected_ac_heating_kwh", "estimated_ac_heating_kwh", "space_heating_kwh",
               "dhw_kwh", "heating_and_dhw_kwh", "cooling_kwh",
-              "idle_kwh", "other_household_kwh", "unknown_kwh",
+              "idle_kwh", "other_hvac_kwh", "other_household_kwh", "unknown_kwh",
               "unallocated_discrepancy_kwh", "known_space_heating_kwh", "known_dhw_kwh",
-              "known_cooling_kwh", "known_idle_kwh", "pv_kwh", "import_kwh", "export_kwh",
+              "known_cooling_kwh", "known_idle_kwh", "known_other_hvac_kwh",
+              "pv_kwh", "import_kwh", "export_kwh",
               "complete", "quality"]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()

@@ -6,6 +6,7 @@ import inspect
 import importlib.util
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from datetime import UTC, datetime
 
 import pytest
 
@@ -161,3 +162,40 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert saved_equipment[0]["equipment_id"] == "stable-hp"
     assert saved_temperatures[0]["source_id"] == "stable-outdoor"
     assert saved_temperatures[0]["quality"]["invalid_values"] == [-55.0, 155.0]
+
+
+@pytest.mark.asyncio
+async def test_current_day_snapshot_uses_completed_hourly_rows_without_daily_write(hass):
+    from custom_components.home_energy_intelligence.websocket import _current_day_snapshot
+
+    start = datetime(2025, 12, 31, 23, tzinfo=UTC)
+    row = {
+        "local_date": "2026-01-01", "timezone": "Europe/Ljubljana",
+        "period_start_utc": start.isoformat(),
+        "period_end_utc": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        "day_seconds": 3600, "household_kwh": 1.5, "pv_kwh": None,
+        "import_kwh": 1.5, "export_kwh": 0, "non_hvac_kwh": 1.5,
+        "quality": "good", "allocations": {}, "temperatures": {},
+    }
+
+    class ReadOnlyDatabase:
+        def __init__(self):
+            self.daily_writes = 0
+
+        def hourly_range(self, range_start, range_end):
+            assert range_start == start
+            assert range_end == datetime(2026, 1, 1, tzinfo=UTC)
+            return [row]
+
+    database = ReadOnlyDatabase()
+    coordinator = SimpleNamespace(database=database, timezone="Europe/Ljubljana")
+    current, hours, coverage, cutoff, local_day = await _current_day_snapshot(
+        hass, coordinator, datetime(2026, 1, 1, tzinfo=UTC),
+        now=datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+    )
+    assert current["household_kwh"] == 1.5
+    assert current["partial"] is True and current["finalized"] is False
+    assert hours == [row] and coverage["complete"] is True
+    assert cutoff == datetime(2026, 1, 1, tzinfo=UTC)
+    assert local_day.isoformat() == "2026-01-01"
+    assert database.daily_writes == 0

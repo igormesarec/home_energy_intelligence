@@ -18,7 +18,9 @@ The dedicated SQLite database uses WAL mode, foreign keys, transactional writes,
 
 `daily_records.local_date` is unique. `hourly_records` is unique by exact UTC start/end, so both repeated local hours on a DST fallback day remain distinct and retries are idempotent. Upserting unchanged content is a no-op; corrected daily content increments `revision`. Schema V3 adds hourly storage without replacing daily records, checkpoints, mapping revisions or rejection audits. Database integrity is checked at startup. A corrupt file is preserved with a timestamped `.corrupt-*.sqlite3` name before a new schema is created.
 
-Overview, History and CSV export receive the same backend `energy` object. It separates confirmed, assumed, selected and estimated classifications; raw residual evidence; unknown energy; other household use; and reconciliation discrepancy. Missing required sources remain `null`, never a manufactured zero.
+Overview, History and CSV export receive the same backend `energy` object. It separates confirmed, assumed, selected and estimated classifications; idle; other HVAC (fan/dry); raw residual evidence; unallocated energy; other household use; and signed reconciliation discrepancy. Missing required sources remain `null`, never a manufactured zero.
+
+Period responses expose independent `date_coverage`, `meter_coverage`, `allocation_coverage` and per-source `temperature_coverage`. A current-date response may contain an in-memory `partial: true`, `finalized: false` record assembled from `hourly_records`; this record is not stored in finalized daily history.
 
 Checkpoint upserts use interval/device primary keys and checksums, making restart recovery and retries idempotent. Daily finalization reads stored checkpoints first and uses Recorder's daily counter change to reconcile rather than reclassify valid checkpoint evidence.
 

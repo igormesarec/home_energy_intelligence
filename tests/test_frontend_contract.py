@@ -71,3 +71,37 @@ def test_csv_uses_unpaginated_selected_period_query():
     csv_handler = source[source.index("async def ws_csv"):source.index("async def ws_settings")]
     assert "history_period" in csv_handler
     assert "limit=366" not in csv_handler
+
+
+def test_overview_and_history_share_today_period_controls_and_cutoff():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    websocket = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    assert 'this.historyPreset = "today"' in frontend
+    assert frontend.count("${this.periodControls()}") == 2
+    assert "cutoff_utc:this.overviewData.cutoff_utc" in frontend
+    assert "replace_with_partial_day(" in websocket and "stored_records, partial_today" in websocket
+    assert websocket.count("_current_day_snapshot(") >= 3
+    assert '"partial": True, "finalized": False' in websocket
+
+
+def test_energy_split_exposes_other_hvac_unallocated_and_signed_discrepancy():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert "known_other_hvac_kwh" in source
+    assert "Other HVAC (fan/dry)" in source
+    assert "Unallocated" in source
+    assert "Δ discrepancy (signed)" in source
+
+
+def test_representative_outdoor_source_is_not_replaced_by_first_role_match():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    method = source[source.index("representativeSource(role)"):source.index("selectedRecord()")]
+    assert "representative_${role}_source_id" in method
+    assert "item.role === role" not in method
+    assert "this.representativeSource(role)" in source[source.index("scatterChart()") - 500:]
+
+
+def test_cutoff_is_rendered_in_home_assistant_timezone():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    websocket = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    assert "cutoff_local" in frontend and "overviewData?.timezone" in frontend
+    assert '"cutoff_local"' in websocket and '"timezone": coordinator.timezone' in websocket
