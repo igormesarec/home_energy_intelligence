@@ -1,5 +1,26 @@
 # Changelog
 
+## V0.1.1 — draft
+
+- Added idempotent completed-hour aggregation, restart recovery and an additive SQLite schema V3 migration.
+- Made the backend canonical energy contract authoritative for Overview, History and authenticated CSV export.
+- Added today-through-last-completed-hour actuals, yesterday same-cutoff/full-day comparisons, freshness labels and manual/hourly refresh.
+- Added dynamic per-equipment evidence, representative indoor-source selection, temperature timelines and guarded PV analytics.
+- Added matching representative indoor/outdoor cards and selectors with latest-valid timestamps, time-weighted period statistics, coverage, quality, yesterday comparisons and gap-preserving timelines.
+- Expanded History with bounded date filtering, pagination, period presets and CSV export.
+- Corrected missing-energy semantics: complete measured zero, complete totals, known partial subtotals and unavailable totals are now distinct in Overview, History, device tables, charts and CSV.
+- Added exact expected-hour coverage with internal-gap detection, 23/25-hour DST handling and controlled idempotent repair of delayed partial intervals.
+- Added all requested Home Assistant-timezone calendar presets, configurable July–June energy seasons and authoritative whole-period summaries independent of detail pagination.
+- Added complete dynamic device heating/cooling evidence, including confirmed/selected/estimated AC cooling, and preserved signed negative reconciliation discrepancies.
+- Added measured PV/import/export/on-site-use/household history with guarded self-sufficiency and PV self-consumption rates.
+- Made CSV export honor the actual selected range beyond 366 days and preserve History filters during automatic refresh.
+- Preserved the approved six-tab design and kept COP, thermal modelling and forecasts explicitly deferred.
+- Made History → Today use the same completed-hour cutoff as Overview without creating a finalized daily row; Today CSV uses the same in-memory partial record.
+- Added a separately reconciled Other HVAC category for fan/dry operation across split charts, device tables and CSV, while keeping unallocated energy and signed discrepancy distinct.
+- Split period quality into date availability, household-meter, HVAC-allocation and per-source temperature coverage so unrelated temperature gaps no longer erase valid meter totals.
+- Counted absent local dates, including 23/25-hour days, in period temperature coverage while retaining duration-weighted valid means and validated min/max.
+- Added the shared Home Assistant-timezone period selector to Overview and made representative-source charts honor only the configured stable source ID.
+
 ## V0.1.0 — draft
 
 ### Corrected after review

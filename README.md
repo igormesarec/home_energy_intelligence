@@ -4,7 +4,19 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 
 ![Approved dashboard design](docs/design/home_energy_intelligence_dashboard.png)
 
-## V0.1 features
+## V0.1.1 features
+
+- Overview defaults to today's actuals through the latest completed hour, with a same-cutoff yesterday comparison, full-yesterday reference, explicit partial/stale state and manual refresh. Its shared period selector updates KPIs, split, equipment and temperature views together.
+- A single backend energy contract drives Overview, History and authenticated CSV export, including confirmed, assumed, selected, estimated, unknown, residual and discrepancy evidence.
+- Compact idempotent hourly rows survive restarts and complement—not replace—the six-hour classification checkpoints and 05:00 authoritative daily close.
+- History supports Home Assistant-timezone presets for Today, Yesterday, −2 through −7 days, Monday–Sunday weeks, seven completed days, calendar months/years, configurable energy seasons and custom ranges. Today is assembled from validated completed-hour rows at Overview's cutoff and is never written as a finalized daily record. Its authoritative summary covers the entire range independently of paginated detail rows, and CSV exports the entire selected range.
+- Expected completed hours are checked individually, so internal gaps are visible and late Recorder data can safely replace poor-quality hourly rows without duplicating energy.
+- Missing allocations expose known partial subtotals separately and never become complete zero heating, DHW or cooling totals. Device-level heating/cooling evidence and signed reconciliation discrepancies remain visible.
+- PV, grid and household history uses measured, physically valid balances and reports self-sufficiency/self-consumption only when its required inputs are available.
+- Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
+- Period status reports date, meter, allocation and temperature coverage separately. Missing temperature dates reduce temperature coverage without invalidating otherwise valid electricity counters.
+
+## V0.1 foundation
 
 - Guided General, Heat pumps, Air conditioners, Solar/grid, Temperatures, Weather, Data sources, and Data quality UI sections. Every source entity and operating-state mapping is configurable.
 - Options Flow edits, disables or removes individual devices while preserving stable IDs, unrelated mappings and historical records.
@@ -17,7 +29,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Idempotent 05:00 daily close and correction-safe catch-up in a dedicated compact SQLite database.
 - Optional read-only InfluxDB 1.x backfill for explicitly mapped sources.
 - Responsive Overview, History, and Settings panel with six-tab navigation. Deferred tabs never display invented measurements.
-- Dashboard equipment is loaded dynamically. Authenticated users can view Overview and History; source mappings, database details and exports remain administrator-only.
+- Dashboard equipment is loaded dynamically. Authenticated users can view Overview, History and export their selected history range; source mappings and database details remain administrator-only. Database backup remains an administrator-only service.
 - Sidebar registration is idempotent across config-entry reloads: one static route and one panel are maintained, and the panel is removed on final unload.
 - Daily summary and quality sensors only; no duplicate high-frequency entities.
 
@@ -32,7 +44,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
    Energy counters must use the `energy` device class, Wh/kWh/MWh and `total` or `total_increasing`; power sources must use the `power` device class and W/kW.
 5. Add optional PV/grid, temperature and weather sources. Temperature sources accept °C or °F and each has its own physical limits, invalid sentinels, spike limit, point-sample freshness and missing-data thresholds.
 6. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
-7. Confirm the Home Assistant time zone and wait for the first completed six-hour checkpoint. The previous calendar day is finalized at 05:00 local time.
+7. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 

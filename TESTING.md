@@ -14,7 +14,7 @@ Covered acceptance cases include:
 - Multiple heat-pump transitions inside one six-hour interval.
 - Unknown operation assigned to assumed heating and explicit idle kept separate.
 - Counter reconciliation, reset, spike rejection, missing power, and visible residual.
-- Correct 5 °C for 60 minutes plus 6 °C for 5 minutes result: 5.076923 °C.
+- Correct 5 °C for 55 minutes plus 10 °C for 5 minutes result: 5.4167 °C, unaffected by frequent unchanged updates.
 - Rejection of a 155 °C outdoor spike.
 - Rejection of −55 °C sentinels, temporal jumps, and audited invalid durations without rejecting legitimate winter temperatures.
 - Explicit unavailable spans and freshness-limited coverage.
@@ -29,8 +29,19 @@ Covered acceptance cases include:
 - Per-equipment checkpoint completeness, including one valid device beside independently missing devices.
 - Stable equipment/source IDs and temperature filters surviving unrelated Options Flow changes.
 - Equipment-neutral dashboard source checks and authenticated-user/admin authorization boundaries.
+- Canonical Overview/History/export energy fields, missing-equipment behavior and residual reconciliation.
+- Idempotent hourly persistence, bounded history pagination and all 25 elapsed hours on the October DST fallback day.
+- Internal missing-hour detection even when the latest hour exists, explicit coverage percentages, controlled late-reading repair and exact 23/25-hour expected interval counts.
+- Complete-zero versus known-partial versus unavailable energy semantics at totals and device level.
+- Monday–Sunday weeks, calendar months rather than rolling 30 days, previous years, configurable current/previous energy seasons and browser-timezone-independent cutoffs.
+- Authoritative full-year summaries across multiple 90-row detail pages and selected-range CSV without a 366-day truncation.
+- Confirmed/selected/estimated device cooling, signed negative discrepancies and gap-preserving duration-weighted period temperatures.
+- Python compilation and frontend JavaScript syntax validation for every release candidate.
 - Unchanged Recorder temperatures remaining valid independently of their last value-change time.
 - Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
+- History Today replacement from completed hourly rows without daily writes, shared cutoff propagation and Home Assistant-timezone labelling.
+- Separate date/meter/allocation/temperature period quality, missing-date temperature denominators and preservation of valid meter totals when temperature coverage is partial.
+- Nonzero Other HVAC fan/dry allocation with zero discrepancy, plus configured representative-source enforcement in frontend charts.
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
 - Current Home Assistant read-only Options Flow `config_entry` lifecycle.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.

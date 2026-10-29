@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .allocation import allocate_interval, configurable_classifier, counter_delta
@@ -60,6 +60,18 @@ class DailyAggregator:
     def aggregate(self, day: date, source: DailyInput) -> DailyRecord:
         start, end = local_day_bounds(day, self.timezone)
         boundaries = cycle_boundaries(day, self.timezone, self.cycle_hours)
+        return self._aggregate(day, start, end, boundaries, source)
+
+    def aggregate_range(
+        self, local_date: date, start: datetime, end: datetime, source: DailyInput,
+    ) -> DailyRecord:
+        """Aggregate an arbitrary completed interval using the daily contract."""
+        return self._aggregate(local_date, start, end, [start, end], source)
+
+    def _aggregate(
+        self, day: date, start: datetime, end: datetime,
+        boundaries: list[datetime], source: DailyInput,
+    ) -> DailyRecord:
         allocations: dict[str, dict[str, Any]] = {}
         meter_totals: list[float | None] = []
 
@@ -152,6 +164,8 @@ class DailyAggregator:
                 "categories": categories,
                 "residual_kwh": residual if residual_known else None,
                 "coverage_percent": 100 * covered / elapsed_seconds(start, end),
+                "covered_seconds": covered,
+                "period_seconds": elapsed_seconds(start, end),
                 "quality": "good" if qualities and all(q == "good" for q in qualities) else "partial",
                 "reset_count": resets + daily_resets,
                 "rejected_count": rejected + daily_rejected,

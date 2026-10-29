@@ -1,5 +1,7 @@
 # Data quality and provenance
 
+Representative indoor and outdoor cards both use `time_weighted_temperature()`. Each accepted state is weighted by actual elapsed seconds until the next state transition, an explicit unavailable state, or an allowed point-sample freshness boundary. Longer-period summaries sum `temperature × valid seconds` and divide by total valid seconds; they never average daily means. Sentinel/spike intervals are excluded from mean/min/max and reduce coverage. An unchanged Recorder state remains valid until explicit contrary evidence because Recorder stores state changes rather than polling samples.
+
 ## Energy
 
 - Power uses a previous-value hold only until the configured maximum gap.

@@ -134,3 +134,39 @@ def test_temperature_weighting_uses_elapsed_time_on_dst_days(day, hours):
     assert result.period_seconds == hours * 3600
     assert result.coverage_seconds == hours * 3600
     assert result.mean == -2
+
+
+def test_five_degrees_for_55_minutes_then_ten_for_five():
+    result = time_weighted_temperature(
+        [NumericSample(dt(), 5), NumericSample(dt(0, 55), 10)],
+        dt(), dt(1), minimum_valid=-50, maximum_valid=60,
+    )
+    assert result.mean == pytest.approx(5.4166667)
+    assert result.latest_value == 10
+    assert result.latest_timestamp == dt(0, 55).isoformat()
+
+
+def test_frequent_unchanged_updates_cannot_bias_temperature_mean():
+    sparse = time_weighted_temperature(
+        [NumericSample(dt(), 5), NumericSample(dt(0, 55), 10)],
+        dt(), dt(1), minimum_valid=-50, maximum_valid=60,
+    )
+    frequent = time_weighted_temperature(
+        [NumericSample(dt(), 5), *[NumericSample(dt(0, minute), 5)
+                                  for minute in range(1, 55)],
+         NumericSample(dt(0, 55), 10)],
+        dt(), dt(1), minimum_valid=-50, maximum_valid=60,
+    )
+    assert frequent.mean == pytest.approx(sparse.mean)
+
+
+def test_single_sentinel_does_not_distort_mean_minimum_or_maximum():
+    result = time_weighted_temperature(
+        [NumericSample(dt(), 5), NumericSample(dt(0, 20), -55),
+         NumericSample(dt(0, 25), 7)],
+        dt(), dt(1), minimum_valid=-60, maximum_valid=60,
+    )
+    assert result.mean == pytest.approx((5 * 20 + 7 * 35) / 55)
+    assert result.minimum == 5
+    assert result.maximum == 7
+    assert result.coverage_seconds == 55 * 60
