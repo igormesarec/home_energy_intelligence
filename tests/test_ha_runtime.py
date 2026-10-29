@@ -135,7 +135,7 @@ async def test_temperature_fallback_uses_validated_coverage_not_row_count(hass):
         } for source_id in source_ids]),
         "influx_enabled": True, "influx_host": "localhost",
         "influx_database": "homeassistant",
-        "influx_mapping": json.dumps({
+        "influx_mapping_json": json.dumps({
             "temperature.influx": {"measurement": "°C", "field": "value", "unit": "°C"},
         }),
     }, options={})
