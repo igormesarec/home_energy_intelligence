@@ -110,10 +110,10 @@ async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
     from custom_components.home_energy_intelligence.database import EnergyDatabase
     from custom_components.home_energy_intelligence.models import DailyRecord
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
     target = date(2026, 10, 29)
-    start = datetime(2026, 10, 29, tzinfo=UTC)
-    end = start + timedelta(days=1)
+    start, end = local_day_bounds(target, hass.config.time_zone)
     database = EnergyDatabase(tmp_path / "energy.sqlite3")
     database.initialize()
     database.upsert_daily(DailyRecord(
