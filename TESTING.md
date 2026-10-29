@@ -48,6 +48,22 @@ Covered acceptance cases include:
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
 - Current Home Assistant read-only Options Flow `config_entry` lifecycle.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.
+- Transactional Options Flow with one heat pump, three AC units, three temperature mappings and representative selections: unchanged save, skip, disable, explicit remove and failed validation.
+- Legacy allocations without coverage metadata remaining unknown while preserving the meter and known subtotals; explicit 100% compatibility metadata remains complete.
+- DST-duration date coverage for complete 23/25-hour dates and partial current dates, independently from completed-hour meter coverage.
+- Electrical-response admission and exclusions for low outdoor coverage, incomplete AC classification, missing representative source and −55 °C contamination; frontend guards require 10 dates, 8 °C span and R² ≥ 0.5.
+- Partial equipment rows retained in evidence but excluded from confirmed comparison bars rather than rendered as zero.
+- October 29 blank representative-temperature symptom: Recorder samples retain source/entity/unit/range provenance, missing persisted summaries receive temperature-only repair, stronger existing values and all energy/allocation fields remain unchanged, and retries are idempotent.
+- Temperature diagnostic and repair WebSockets are administrator-only, bounded to 31 days and expose live/Recorder/rejection/hourly/daily/missing-interval stages.
+- Daily Energy Split uses independent incomplete-period, missing-meter, incomplete-classification, estimated-allocation and missing-temperature labels; a current partial day is not also called missing merely because it is partial.
+
+## Responsive layout evidence
+
+The release-candidate panel bundle is rendered with mocked WebSocket responses in
+installed Chrome at 360, 390, 430, 768 and 1440 CSS pixels. The automated evidence
+checks page/period-control overflow, scrollable wide evidence tables and disabled
+first/last-page controls. This supplements, but does not replace, a live Home
+Assistant test on physical Android hardware.
 
 ## Home Assistant runtime suite
 

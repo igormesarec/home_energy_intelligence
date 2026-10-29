@@ -15,7 +15,8 @@ from .configuration import (
     equipment_from_config, equipment_temperature_mappings, temperatures_from_config,
 )
 from .analytics import (
-    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records, daily_coverage,
+    attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
+    heating_response_profile,
     interval_coverage, replace_with_partial_day,
 )
 from .const import DOMAIN
@@ -29,6 +30,8 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_settings)
     websocket_api.async_register_command(hass, ws_refresh)
     websocket_api.async_register_command(hass, ws_csv)
+    websocket_api.async_register_command(hass, ws_temperature_diagnostics)
+    websocket_api.async_register_command(hass, ws_reprocess_temperature_history)
 
 
 def _coordinator(hass):
@@ -112,9 +115,50 @@ async def ws_overview(hass, connection, msg):
             "display_name": item.display_name,
             "role": item.role,
             "enabled": item.enabled,
+            "entity_id": item.entity_id,
+            "attribute": item.attribute,
         }
         for item in _temperatures(coordinator)
     ]
+    current_temperatures = (current or {}).get("temperatures", {})
+    temperature_pipeline = []
+    for item in _temperatures(coordinator):
+        state = hass.states.get(item.entity_id)
+        summary = current_temperatures.get(item.source_id)
+        if not item.enabled:
+            stage = "disabled"
+        elif state is None:
+            stage = "live_entity_unavailable"
+        elif not today_hours:
+            stage = "hourly_processing_missing"
+        elif not isinstance(summary, dict):
+            stage = "temperature_summary_not_persisted"
+        elif summary.get("mean") is None:
+            stage = "temperature_rejected_or_uncovered"
+        else:
+            stage = "available"
+        temperature_pipeline.append({
+            "source_id": item.source_id, "entity_id": item.entity_id,
+            "configured": True, "enabled": item.enabled, "attribute": item.attribute,
+            "pipeline_stage": stage,
+            "live_state": ((state.attributes.get(item.attribute) if item.attribute else state.state)
+                           if state is not None else None),
+            "live_last_updated": state.last_updated.isoformat() if state is not None else None,
+            "live_unit": ((state.attributes.get("unit_of_measurement")
+                           or state.attributes.get("temperature_unit"))
+                          if state is not None else None),
+            "persisted_hourly_summaries": sum(
+                1 for row in today_hours
+                if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+            ),
+            "latest_quality": summary.get("quality") if isinstance(summary, dict) else None,
+            "latest_coverage_percent": (
+                summary.get("coverage_percent") if isinstance(summary, dict) else None
+            ),
+            "rejected_samples": (
+                summary.get("rejections", []) if isinstance(summary, dict) else []
+            ),
+        })
     connection.send_result(msg["id"], {
         "configured": True,
         "latest": attach_canonical(current, equipment) if current else None,
@@ -145,6 +189,7 @@ async def ws_overview(hass, connection, msg):
              "temperatures": row.get("temperatures", {})}
             for row in today_hours
         ],
+        "temperature_pipeline": temperature_pipeline,
     })
 
 
@@ -257,36 +302,14 @@ async def ws_history(hass, connection, msg):
     representative_outdoor_id = coordinator.config.get(
         "representative_outdoor_source_id"
     )
-    response_points = []
-    if representative_outdoor_id:
-        for record in period_records:
-            if record.get("partial") is True or record.get("finalized") is False:
-                continue
-            temperature = (record.get("temperatures") or {}).get(
-                representative_outdoor_id
-            ) or {}
-            energy = canonical_energy(record, equipment)
-            if temperature.get("mean") is None or energy.get("space_heating_kwh") is None:
-                continue
-            devices = energy.get("equipment") or []
-            response_points.append({
-                "local_date": record.get("local_date"),
-                "outdoor_mean_c": temperature.get("mean"),
-                "temperature_coverage_percent": temperature.get("coverage_percent"),
-                "space_heating_kwh": energy.get("space_heating_kwh"),
-                "heat_pump_heating_kwh": sum(
-                    float(item.get("confirmed_heating_kwh", 0) or 0)
-                    + float(item.get("assumed_heating_kwh", 0) or 0)
-                    for item in devices if item.get("kind") == "heat_pump"
-                ),
-                "ac_heating_kwh": sum(
-                    float(item.get("confirmed_heating_kwh", 0) or 0)
-                    + float(item.get("selected_heating_kwh", 0) or 0)
-                    + float(item.get("estimated_heating_kwh", 0) or 0)
-                    for item in devices if item.get("kind") == "air_conditioner"
-                ),
-                "quality": energy.get("quality"),
-            })
+    response_profile = heating_response_profile(
+        period_records, equipment,
+        outdoor_source_id=representative_outdoor_id,
+        floor_area_m2=coordinator.config.get("floor_area_m2"),
+        minimum_temperature_coverage=float(coordinator.config.get(
+            "response_temperature_coverage_minimum", 95
+        )),
+    )
     connection.send_result(msg["id"], {
         "records": [attach_canonical(record, equipment) for record in records],
         "summary": attach_canonical(combined, equipment) if combined else None,
@@ -300,10 +323,7 @@ async def ws_history(hass, connection, msg):
         "cutoff_local": (history_cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat()
                          if history_cutoff else None),
         "timezone": coordinator.timezone,
-        "response_profile": {
-            "outdoor_source_id": representative_outdoor_id,
-            "points": response_points,
-        },
+        "response_profile": response_profile,
     })
 
 
@@ -316,6 +336,60 @@ async def ws_refresh(hass, connection, msg):
         return
     changed = await coordinator.async_refresh_hourly(reprocess_poor=True)
     connection.send_result(msg["id"], {"changed_intervals": changed})
+
+
+def _diagnostic_dates(coordinator, msg):
+    today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    try:
+        start = datetime.fromisoformat(msg.get("start_date") or (
+            today - timedelta(days=30)
+        ).isoformat()).date()
+        end = datetime.fromisoformat(msg.get("end_date") or today.isoformat()).date()
+    except ValueError as error:
+        raise ValueError("Dates must use YYYY-MM-DD") from error
+    if end < start or (end - start).days > 30:
+        raise ValueError("Range must be ordered and at most 31 days")
+    return start, end
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_diagnostics",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_diagnostics(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_temperature_diagnostics(start, end)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/reprocess_temperature_history",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_reprocess_temperature_history(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_reprocess_temperature_history(start, end)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.websocket_command({
@@ -365,14 +439,32 @@ async def ws_csv(hass, connection, msg):
               "unallocated_discrepancy_kwh", "known_space_heating_kwh", "known_dhw_kwh",
               "known_cooling_kwh", "known_idle_kwh", "known_other_hvac_kwh",
               "pv_kwh", "import_kwh", "export_kwh",
-              "complete", "quality"]
+              "complete", "quality", "partial", "finalized", "cutoff_utc",
+              "date_coverage_percent", "meter_coverage_percent",
+              "allocation_coverage_percent", "allocation_coverage_known"]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for record in reversed(records):
         energy = attach_canonical(record, equipment)["energy"] or {}
+        row_coverage = daily_coverage(
+            [record], record["local_date"], record["local_date"],
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            timezone=coordinator.timezone,
+        )
+        allocation_coverage = row_coverage["allocation_coverage"]
         writer.writerow({"date": record["local_date"], **{
-            key: energy.get(key) for key in fields if key not in {"date", "quality"}
-        }, "quality": record.get("quality")})
+            key: energy.get(key) for key in fields if key not in {
+                "date", "quality", "partial", "finalized", "cutoff_utc",
+                "date_coverage_percent", "meter_coverage_percent",
+                "allocation_coverage_percent", "allocation_coverage_known",
+            }
+        }, "quality": record.get("quality"), "partial": record.get("partial", False),
+           "finalized": record.get("finalized", True),
+           "cutoff_utc": record.get("period_end_utc"),
+           "date_coverage_percent": row_coverage["date_coverage"]["coverage_percent"],
+           "meter_coverage_percent": row_coverage["meter_coverage"]["coverage_percent"],
+           "allocation_coverage_percent": allocation_coverage["coverage_percent"],
+           "allocation_coverage_known": allocation_coverage["coverage_known"]})
     connection.send_result(msg["id"], {
         "filename": "home-energy-intelligence.csv", "csv": output.getvalue(),
         "record_count": len(records), "start_date": start_date, "end_date": end_date,

@@ -4,7 +4,7 @@ import pytest
 
 from custom_components.home_energy_intelligence.analytics import (
     attach_canonical, canonical_energy, combine_daily_records, combine_interval_records,
-    daily_coverage, interval_coverage, replace_with_partial_day,
+    daily_coverage, heating_response_profile, interval_coverage, replace_with_partial_day,
 )
 
 
@@ -23,25 +23,28 @@ def test_canonical_contract_preserves_uncertain_categories_and_reconciles():
                 "meter_kwh": 7.0,
                 "categories": {"confirmed_heating": 3.0, "dhw": 1.0, "idle": 0.5},
                 "reported_assumed_heating_kwh": 2.5, "residual_kwh": 2.5,
-                "quality": "partial",
+                "coverage_percent": 80, "quality": "partial",
             },
             "ac-a": {
                 "meter_kwh": 3.0,
                 "categories": {"heating": 1.0, "heating_selected": 1.0,
                                "standby": 0.5, "unknown": 0.5},
-                "residual_kwh": 0.0, "quality": "uncertain",
+                "residual_kwh": 0.0, "coverage_percent": 100,
+                "quality": "uncertain",
             },
         },
     }
     energy = canonical_energy(record, EQUIPMENT)
-    assert energy["confirmed_heat_pump_heating_kwh"] == 3
-    assert energy["assumed_heat_pump_heating_kwh"] == 2.5
+    assert energy["confirmed_heat_pump_heating_kwh"] is None
+    assert energy["known_confirmed_heat_pump_heating_kwh"] == 3
+    assert energy["known_assumed_heat_pump_heating_kwh"] == 2.5
     assert energy["selected_ac_heating_kwh"] == 1
-    assert energy["space_heating_kwh"] == 7.5
-    assert energy["dhw_kwh"] == 1
-    assert energy["idle_kwh"] == 1
+    assert energy["space_heating_kwh"] is None
+    assert energy["known_space_heating_kwh"] == 7.5
+    assert energy["dhw_kwh"] is None
+    assert energy["known_idle_kwh"] == 1
     assert energy["unknown_kwh"] == .5
-    assert energy["unallocated_discrepancy_kwh"] == 0
+    assert energy["unallocated_discrepancy_kwh"] is None
     assert energy["pv_consumed_on_site_kwh"] == 5
     assert energy["pv_self_consumption_percent"] == 62.5
 
@@ -57,13 +60,40 @@ def test_missing_equipment_never_becomes_false_zero():
     assert all(item["available"] is False for item in energy["equipment"])
 
 
+def test_legacy_allocation_without_coverage_keeps_meter_and_known_categories_unknown():
+    record = {"allocations": {"hp-a": {
+        "meter_kwh": 4, "categories": {"confirmed_heating": 3},
+        "residual_kwh": 1, "quality": "good",
+    }}}
+    energy = canonical_energy(record, EQUIPMENT[:1])
+    device = energy["equipment"][0]
+    assert device["meter_kwh"] == 4
+    assert device["coverage_percent"] is None
+    assert device["coverage_known"] is False
+    assert device["classification_complete"] is False
+    assert device["confirmed_heating_kwh"] is None
+    assert device["known_confirmed_heating_kwh"] == 3
+    assert energy["space_heating_kwh"] is None
+
+
+def test_legacy_percentage_is_reconstructed_only_when_explicitly_present():
+    record = {"allocations": {"hp-a": {
+        "meter_kwh": 4, "categories": {"confirmed_heating": 4},
+        "coverage_percent": 100, "quality": "good",
+    }}}
+    energy = canonical_energy(record, EQUIPMENT[:1])
+    assert energy["equipment"][0]["classification_complete"] is True
+    assert energy["space_heating_kwh"] == 4
+
+
 def test_missing_ac_preserves_known_hp_subtotal_but_total_is_unavailable():
     record = {"allocations": {"hp-a": {"meter_kwh": 2, "categories": {
         "confirmed_heating": 2}, "residual_kwh": 0}}, "quality": "partial"}
     energy = canonical_energy(record, EQUIPMENT)
     assert energy["known_space_heating_kwh"] == 2
     assert energy["space_heating_kwh"] is None
-    assert energy["confirmed_heat_pump_heating_kwh"] == 2
+    assert energy["confirmed_heat_pump_heating_kwh"] is None
+    assert energy["known_confirmed_heat_pump_heating_kwh"] == 2
     assert energy["confirmed_ac_heating_kwh"] is None
 
 
@@ -81,10 +111,11 @@ def test_missing_device_meter_does_not_render_false_device_zeroes():
 
 def test_device_level_selected_and_estimated_cooling_are_explicit():
     record = {"allocations": {
-        "hp-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0},
+        "hp-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0,
+                 "coverage_percent": 100},
         "ac-a": {"meter_kwh": 3, "categories": {
             "cooling": 1, "cooling_selected": .75, "cooling_estimated": .25,
-            "standby": 1}, "residual_kwh": 0},
+            "standby": 1}, "residual_kwh": 0, "coverage_percent": 100},
     }}
     energy = canonical_energy(record, EQUIPMENT)
     ac = next(item for item in energy["equipment"] if item["equipment_id"] == "ac-a")
@@ -97,16 +128,19 @@ def test_device_level_selected_and_estimated_cooling_are_explicit():
 def test_negative_discrepancy_is_preserved_with_its_sign():
     record = {"allocations": {
         "hp-a": {"meter_kwh": 1, "categories": {"confirmed_heating": 2},
-                 "residual_kwh": -1},
-        "ac-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0},
+                 "residual_kwh": -1, "coverage_percent": 100},
+        "ac-a": {"meter_kwh": 0, "categories": {}, "residual_kwh": 0,
+                 "coverage_percent": 100},
     }}
     assert canonical_energy(record, EQUIPMENT)["unallocated_discrepancy_kwh"] == -1
 
 
 def test_other_hvac_fan_dry_reconciles_without_discrepancy():
     record = {"household_kwh": 2, "allocations": {
-        "hp-a": {"meter_kwh": 0, "categories": {}, "quality": "good"},
-        "ac-a": {"meter_kwh": 2, "categories": {"dry_fan": 2}, "quality": "good"},
+        "hp-a": {"meter_kwh": 0, "categories": {}, "coverage_percent": 100,
+                 "quality": "good"},
+        "ac-a": {"meter_kwh": 2, "categories": {"dry_fan": 2},
+                 "coverage_percent": 100, "quality": "good"},
     }}
     energy = canonical_energy(record, EQUIPMENT)
     assert energy["other_hvac_kwh"] == 2
@@ -223,11 +257,15 @@ def test_period_quality_layers_do_not_invalidate_unrelated_meter_totals():
     energy = canonical_energy(record, EQUIPMENT[:1])
     assert energy["household_kwh"] == 2
     assert energy["space_heating_kwh"] == 2
+    assert energy["quality"] == "good"
 
 
 def test_uncertain_but_fully_classified_allocation_is_complete_with_uncertainty():
     record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
-    record.update({"local_date": "2026-01-01", "day_seconds": 86400})
+    record.update({
+        "local_date": "2026-01-01", "day_seconds": 86400,
+        "quality": "uncertain",
+    })
     record["allocations"]["hp-a"].update({
         "covered_seconds": 86400, "period_seconds": 86400,
         "coverage_percent": 100, "quality": "uncertain",
@@ -239,6 +277,9 @@ def test_uncertain_but_fully_classified_allocation_is_complete_with_uncertainty(
     assert coverage["allocation_coverage"]["complete"] is True
     assert coverage["allocation_coverage"]["quality"] == "uncertain"
     assert coverage["allocation_coverage"]["uncertain_dates"] == ["2026-01-01"]
+    assert coverage["complete"] is True
+    assert coverage["quality"] == "uncertain"
+    assert coverage["uncertain_quality_dates"] == ["2026-01-01"]
 
 
 def test_allocation_coverage_is_elapsed_time_not_good_day_count():
@@ -264,6 +305,53 @@ def test_no_configured_equipment_is_unavailable_not_false_full_coverage():
     assert coverage["allocation_coverage"]["complete"] is False
 
 
+def test_unknown_legacy_coverage_makes_period_percentage_unknown_not_zero_or_full():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "day_seconds": 86400})
+    allocation = record["allocations"]["hp-a"]
+    allocation.pop("covered_seconds")
+    allocation.pop("period_seconds")
+    allocation.pop("coverage_percent", None)
+    coverage = daily_coverage(
+        [record], "2026-01-01", "2026-01-01",
+        equipment_ids=["hp-a"], timezone="UTC",
+    )
+    layer = coverage["allocation_coverage"]
+    assert layer["coverage_percent"] is None
+    assert layer["coverage_known"] is False
+    assert layer["complete"] is False
+    assert layer["unknown_coverage_equipment"] == [{
+        "date": "2026-01-01", "equipment_id": "hp-a",
+    }]
+
+
+def test_date_coverage_is_dst_duration_weighted_and_partial_today_is_not_full_day():
+    spring = _hour(datetime(2026, 3, 28, 23, tzinfo=UTC), 2)
+    spring.update({"local_date": "2026-03-29", "day_seconds": 23 * 3600})
+    autumn = _hour(datetime(2026, 10, 24, 22, tzinfo=UTC), 2)
+    autumn.update({"local_date": "2026-10-25", "day_seconds": 25 * 3600})
+    spring_coverage = daily_coverage(
+        [spring], "2026-03-29", "2026-03-29", timezone="Europe/Ljubljana",
+    )
+    autumn_coverage = daily_coverage(
+        [autumn], "2026-10-25", "2026-10-25", timezone="Europe/Ljubljana",
+    )
+    assert spring_coverage["date_coverage"]["expected_seconds"] == 23 * 3600
+    assert autumn_coverage["date_coverage"]["expected_seconds"] == 25 * 3600
+
+    partial = _hour(datetime(2026, 10, 29, tzinfo=UTC), 2)
+    partial.update({
+        "local_date": "2026-10-29", "day_seconds": 6 * 3600,
+        "partial": True, "finalized": False,
+    })
+    current = daily_coverage(
+        [partial], "2026-10-29", "2026-10-29", timezone="Europe/Ljubljana",
+    )
+    assert current["date_coverage"]["coverage_percent"] == 25
+    assert current["date_coverage"]["complete"] is False
+    assert current["meter_coverage"]["coverage_percent"] == 100
+
+
 def test_site_baseline_equations_preserve_physical_balance_and_rounding_evidence():
     record = {
         "household_kwh": 45.0, "pv_kwh": 28.5, "import_kwh": 28.9,
@@ -273,6 +361,30 @@ def test_site_baseline_equations_preserve_physical_balance_and_rounding_evidence
     assert energy["pv_consumed_on_site_kwh"] == 16.2
     assert energy["calculated_household_kwh"] == pytest.approx(45.1)
     assert abs(energy["household_balance_discrepancy_kwh"]) <= 0.11
+
+
+@pytest.mark.parametrize(
+    ("record", "consumed", "self_consumption", "calculated"),
+    [
+        ({"household_kwh": 5, "pv_kwh": 0, "import_kwh": 5, "export_kwh": 0},
+         0, None, 5),
+        ({"household_kwh": 5, "pv_kwh": None, "import_kwh": 5, "export_kwh": 0},
+         None, None, None),
+        ({"household_kwh": 5, "pv_kwh": 2, "import_kwh": None, "export_kwh": 1},
+         1, 50, None),
+        ({"household_kwh": 5, "pv_kwh": 2, "import_kwh": 5, "export_kwh": 3},
+         None, None, None),
+        ({"household_kwh": 5, "pv_kwh": -1, "import_kwh": 5, "export_kwh": 0},
+         None, None, None),
+    ],
+)
+def test_pv_balance_distinguishes_zero_missing_and_physically_invalid(
+    record, consumed, self_consumption, calculated,
+):
+    energy = canonical_energy({**record, "allocations": {}}, [])
+    assert energy["pv_consumed_on_site_kwh"] == consumed
+    assert energy["pv_self_consumption_percent"] == self_consumption
+    assert energy["calculated_household_kwh"] == calculated
 
 
 def test_supplied_equipment_baseline_preserves_partial_ac_as_evidence_not_complete_heat():
@@ -301,6 +413,49 @@ def test_supplied_equipment_baseline_preserves_partial_ac_as_evidence_not_comple
     assert ac["unknown_kwh"] == 2.8
     assert ac["coverage_percent"] == 44
     assert ac["classification_source"] == "configured-state-and-power-history"
+
+
+def test_heating_response_retains_validated_and_excluded_daily_evidence():
+    valid = _hour(datetime(2026, 1, 1, tzinfo=UTC), 4)
+    valid.update({"local_date": "2026-01-01", "finalized": True})
+    valid["temperatures"] = {"outdoor": {
+        "mean": 5, "minimum": 3, "maximum": 7, "coverage_percent": 98,
+        "coverage_seconds": 84672, "period_seconds": 86400, "quality": "good",
+    }}
+    low_coverage = _hour(datetime(2026, 1, 2, tzinfo=UTC), 4)
+    low_coverage.update({"local_date": "2026-01-02", "finalized": True})
+    low_coverage["temperatures"] = {"outdoor": {
+        "mean": 6, "minimum": 4, "maximum": 8, "coverage_percent": 90,
+        "quality": "partial",
+    }}
+    profile = heating_response_profile(
+        [valid, low_coverage], EQUIPMENT[:1], outdoor_source_id="outdoor",
+        floor_area_m2=180, minimum_temperature_coverage=95,
+    )
+    assert profile["minimum_regression_points"] == 10
+    assert profile["minimum_outdoor_span_c"] == 8
+    assert profile["points"][0]["status"] == "validated"
+    assert profile["points"][0]["normalized_heating_kwh_m2_day"] == pytest.approx(4 / 180)
+    assert profile["points"][0]["confirmed_heating_kwh"] == 4
+    assert profile["points"][1]["status"] == "excluded"
+    assert "insufficient_outdoor_coverage" in profile["points"][1]["exclusion_reasons"]
+
+
+def test_heating_response_excludes_missing_source_invalid_temperature_and_incomplete_ac():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 4)
+    record.update({"local_date": "2026-01-01", "finalized": True})
+    record["temperatures"] = {"outdoor": {
+        "mean": -55, "coverage_percent": 100, "quality": "good",
+    }}
+    invalid = heating_response_profile(
+        [record], EQUIPMENT, outdoor_source_id="outdoor", floor_area_m2=180,
+    )["points"][0]
+    assert "invalid_outdoor_temperature" in invalid["exclusion_reasons"]
+    assert "incomplete_heating_classification" in invalid["exclusion_reasons"]
+    missing_source = heating_response_profile(
+        [record], EQUIPMENT[:1], outdoor_source_id=None, floor_area_m2=180,
+    )["points"][0]
+    assert "representative_outdoor_not_configured" in missing_source["exclusion_reasons"]
 
 
 def test_absent_daily_record_counts_in_temperature_period_denominator():

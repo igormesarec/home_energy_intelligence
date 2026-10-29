@@ -107,6 +107,40 @@ def _checksum(payload: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _temperature_coverage(value: dict[str, Any] | None) -> float:
+    if not isinstance(value, dict):
+        return -1.0
+    coverage = value.get("coverage_seconds")
+    if isinstance(coverage, (int, float)):
+        return float(coverage)
+    percent = value.get("coverage_percent")
+    period = value.get("period_seconds")
+    if isinstance(percent, (int, float)) and isinstance(period, (int, float)):
+        return float(percent) * float(period) / 100
+    return 0.0
+
+
+def _merge_temperature_maps(
+    existing: dict[str, Any], recovered: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Add better recovered summaries without replacing valid measurements."""
+    merged = dict(existing or {})
+    changed = False
+    for source_id, candidate in (recovered or {}).items():
+        current = merged.get(source_id)
+        current_valid = isinstance(current, dict) and current.get("mean") is not None
+        candidate_valid = isinstance(candidate, dict) and candidate.get("mean") is not None
+        if current_valid and (
+            not candidate_valid
+            or _temperature_coverage(current) >= _temperature_coverage(candidate)
+        ):
+            continue
+        if candidate_valid or current is None:
+            merged[source_id] = candidate
+            changed = changed or current != candidate
+    return merged, changed
+
+
 def protected_export_path(config_path: str | Path, stamp: str) -> Path:
     """Return a non-web-served backup path owned by the integration."""
     if not stamp or any(char not in "0123456789-" for char in stamp):
@@ -427,6 +461,52 @@ class EnergyDatabase:
                  checksum, payload.get("quality", "missing"), now),
             )
         return True
+
+    def merge_daily_temperatures(
+        self, local_date: str, temperatures: dict[str, Any],
+        provenance: dict[str, Any] | None = None,
+    ) -> bool:
+        """Backfill only missing/better temperature evidence in an existing day."""
+        payload = self.daily(local_date)
+        if payload is None:
+            return False
+        merged, changed = _merge_temperature_maps(
+            payload.get("temperatures", {}), temperatures,
+        )
+        if not changed:
+            return False
+        payload["temperatures"] = merged
+        payload.setdefault("provenance", {})["temperature_reprocessing"] = provenance or {}
+        record = DailyRecord(**{
+            key: payload[key] for key in (
+                "local_date", "timezone", "period_start_utc", "period_end_utc",
+                "day_seconds", "household_kwh", "pv_kwh", "import_kwh",
+                "export_kwh", "non_hvac_kwh", "quality", "temperatures",
+                "allocations", "provenance",
+            )
+        })
+        return self.upsert_daily(record, reason="temperature_history_repair")
+
+    def merge_hourly_temperatures(
+        self, start: datetime, end: datetime, temperatures: dict[str, Any],
+        provenance: dict[str, Any] | None = None,
+    ) -> bool:
+        """Backfill an existing hour without changing its energy/allocation values."""
+        rows = self.hourly_range(start, end)
+        payload = next((item for item in rows if (
+            item.get("period_start_utc") == start.isoformat()
+            and item.get("period_end_utc") == end.isoformat()
+        )), None)
+        if payload is None:
+            return False
+        merged, changed = _merge_temperature_maps(
+            payload.get("temperatures", {}), temperatures,
+        )
+        if not changed:
+            return False
+        payload["temperatures"] = merged
+        payload.setdefault("provenance", {})["temperature_reprocessing"] = provenance or {}
+        return self.upsert_hourly(payload)
 
     def hourly_range(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
         """Load only intervals overlapping a bounded UTC range."""

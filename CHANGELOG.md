@@ -25,6 +25,15 @@
 - Added an evidence-bound whole-house **electrical** heating-response profile normalized by floor area while explicitly withholding unmeasured thermal output, COP and design-day claims.
 - Added mobile period-control disclosure, bounded pager state, compact empty states, touch-sized controls and horizontally scrollable evidence tables for 360–430 px layouts.
 - Added explicit PV/grid balance evidence (`PV − export`, `self-use + import`) without overwriting measured household electricity.
+- Made Options Flow transactional: skip preserves queued mappings, disable retains the complete stable-ID record, remove is explicit and failed validation restores the draft unchanged.
+- Made absent legacy allocation-coverage metadata unknown rather than complete; independent meter totals and known partial subtotals remain visible without exposing complete categories.
+- Replaced calendar-row date coverage with DST-aware elapsed local-day seconds, including partial current-day date availability and completed-hour processing coverage.
+- Qualified the electrical heating-response profile with configurable representative-outdoor coverage (95% default), complete enabled-device classification, reconciliation, 10 days, 8 °C observed span and R² ≥ 0.5; excluded dates and reasons remain visible.
+- Prevented partial equipment allocations from rendering as zero-height confirmed comparison bars and added 360/390/430 px responsive layout evidence.
+- Added end-to-end representative-temperature pipeline diagnostics (mapping/live state/unit/Recorder range/rejections/hourly and daily persistence/missing intervals) and administrator-only bounded repair.
+- Added idempotent temperature-only recovery for the latest two local days at startup and up to 31 selected days on demand; valid energy, allocation and stronger temperature summaries are preserved.
+- Replaced the Daily Energy Split's ambiguous simultaneous `missing`/`partial` labels with independent incomplete-period, missing-meter, incomplete-classification, estimated-allocation and missing-temperature-evidence indicators.
+- Separated canonical electricity quality from temperature quality so missing temperature evidence cannot downgrade a complete metered and classified energy result.
 
 ## V0.1.0 — draft
 

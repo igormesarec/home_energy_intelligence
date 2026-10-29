@@ -37,6 +37,42 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - **Date availability** is elapsed local-date duration present in the compact archive; DST days contribute their actual 23-, 24- or 25-hour duration.
 - **Meter coverage** is elapsed duration with each required authoritative counter available. It does not depend on a temperature sensor.
 - **Allocation coverage** is classified elapsed duration across every enabled equipment ID. A device with 18 classified hours in a 24-hour day contributes 75%, not 0% or 100%; no configured equipment is reported as unavailable rather than full coverage.
+- Missing allocation-coverage metadata is **unknown**, never a compatibility alias for 100%. Legacy meter totals and known subtotals remain visible, while complete category values remain unavailable until explicit evidence exists.
 - **Temperature coverage** is valid elapsed duration for each source independently. A representative card with no explicit selection says **Not configured** and never reports 100%.
 
 These layers are intentionally independent. A complete household meter can remain complete when an indoor sensor is missing, while a partial HVAC classifier keeps its meter total and raw residual evidence without promoting missing categories to confirmed zero.
+
+Canonical electricity quality uses meter, classification and reconciliation
+evidence only. Overall record quality may still be partial because a temperature
+source is missing; the Energy Split displays that as separate temperature
+evidence rather than calling the electricity missing.
+
+## Temperature pipeline recovery
+
+The administrator diagnostic reads at most 31 local days and reports the first
+observable missing stage: disabled/unavailable live entity, Recorder history
+unavailable, incompatible/invalid samples, missing hourly processing, absent
+temperature payload, or rejected/uncovered persisted payload. It includes raw
+availability bounds, units, rejection reasons and caused missing intervals.
+
+Repair re-runs the canonical time-weighted calculation from bounded Recorder (or
+configured read-only InfluxDB fallback) evidence. It adds a source only when no
+summary exists or replaces it only when the recovered valid duration is greater.
+It never fills a gap, overwrites a stronger valid measurement, creates a finalized
+day, or changes electricity/allocation fields.
+
+For an in-progress local date, date availability uses completed elapsed seconds
+against that date's full 23/24/25-hour duration. Meter and allocation coverage use
+the completed-hour processing scope, so a fully processed six-hour cutoff can have
+100% meter coverage while the date is correctly only 25% available.
+
+## Electrical heating-response qualification
+
+Every candidate date is retained as validated or excluded. The default admission
+policy requires 95% representative-outdoor valid duration, complete classification
+for each enabled heat pump and heating-capable AC, known reconciliation within the
+configured tolerance, a finalized valid date and configured floor area. The
+frontend requires at least 10 admitted dates, an observed outdoor span of 8 °C and
+R² ≥ 0.5 before showing a conservative electrical fit. These are evidence-quality
+gates, not a claim of thermal output, COP, physical balance point or design-day
+capacity.

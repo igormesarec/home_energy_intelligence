@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import inspect
 import importlib.util
+import json
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -14,6 +16,53 @@ pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("homeassistant") is None,
     reason="current Home Assistant test harness is installed in CI",
 )
+
+
+@pytest.mark.asyncio
+async def test_temperature_pipeline_preserves_recorder_rows_and_collection_evidence(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    hass.states.async_set("sensor.representative_indoor", "22", {
+        "device_class": "temperature", "unit_of_measurement": "°C",
+    })
+    rows = [
+        SimpleNamespace(last_updated=start, state="21", attributes={
+            "unit_of_measurement": "°C",
+        }),
+        SimpleNamespace(last_updated=start + timedelta(minutes=30), state="22", attributes={
+            "unit_of_measurement": "°C",
+        }),
+    ]
+    database = SimpleNamespace(store_mapping_revision=lambda _revision: True)
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": "indoor", "display_name": "Indoor", "role": "indoor",
+            "entity_id": "sensor.representative_indoor", "enabled": True,
+            "quality": {"minimum": -10, "maximum": 60,
+                        "invalid_values": [-55, 155],
+                        "maximum_change_per_minute": 8,
+                        "freshness_minutes": 360, "missing_after_minutes": 360},
+        }]),
+    }, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.representative_indoor": rows}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    collected = await coordinator._async_collect_range(start, end)
+    evidence = collected.provenance["temperature_collection"]["indoor"]
+    assert evidence["entity_id"] == "sensor.representative_indoor"
+    assert evidence["recorder_state_rows"] == 2
+    assert evidence["valid_samples"] == 2
+    assert evidence["source_units"] == ["°C"]
+    record = coordinator._aggregator().aggregate_range(
+        start.date(), start, end, collected
+    )
+    assert record.temperatures["indoor"]["mean"] == pytest.approx(21.5)
+    assert record.temperatures["indoor"]["coverage_percent"] == 100
 
 
 def test_current_recorder_read_api_contract():
@@ -159,6 +208,7 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert representative_field.default() == "__none__"
     result = await hass.config_entries.options.async_configure(result["flow_id"], {
         "maximum_power_gap_minutes": 30, "counter_jump_limit_kwh": 500,
+        "response_temperature_coverage_minimum": 95,
         "assumed_heating_reporting": "separate",
         "representative_outdoor_source_id": "stable-outdoor",
         "test_representative_sources": True,
@@ -168,6 +218,7 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert "5.00 °C" in result["description_placeholders"]["representative_preview"]
     result = await hass.config_entries.options.async_configure(result["flow_id"], {
         "maximum_power_gap_minutes": 30, "counter_jump_limit_kwh": 500,
+        "response_temperature_coverage_minimum": 95,
         "assumed_heating_reporting": "separate",
         "representative_outdoor_source_id": "__none__",
         "test_representative_sources": False,
@@ -179,6 +230,107 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert saved_temperatures[0]["source_id"] == "stable-outdoor"
     assert saved_temperatures[0]["quality"]["invalid_values"] == [-55.0, 155.0]
     assert "representative_outdoor_source_id" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_options_draft_skip_disable_remove_and_validation_are_transactional(hass):
+    from custom_components.home_energy_intelligence.config_wizard import OptionsFlow
+
+    hass.states.async_set("sensor.energy", "10", {
+        "device_class": "energy", "state_class": "total_increasing",
+        "unit_of_measurement": "kWh",
+    })
+    hass.states.async_set("sensor.mode", "off")
+    for entity_id in ("sensor.indoor", "sensor.outdoor", "sensor.supply"):
+        hass.states.async_set(entity_id, "20", {
+            "device_class": "temperature", "unit_of_measurement": "°C",
+        })
+    equipment = [{
+        "equipment_id": "ecodan", "display_name": "Ecodan", "kind": "heat_pump",
+        "enabled": True, "energy_entity": "sensor.energy",
+        "state_entity": "sensor.mode", "state_map": {"off": "idle"},
+    }, *[{
+        "equipment_id": equipment_id, "display_name": name,
+        "kind": "air_conditioner", "enabled": True,
+        "energy_entity": "sensor.energy", "state_entity": "sensor.mode",
+        "state_map": {"off": "standby"},
+    } for equipment_id, name in (
+        ("kuhinja", "Kuhinja"), ("aurora", "Aurora"), ("dnevna", "Dnevna"),
+    )]]
+    temperatures = [{
+        "source_id": source_id, "display_name": name, "role": role,
+        "entity_id": entity_id, "enabled": True,
+        "quality": {"minimum": -40, "maximum": 90,
+                    "invalid_values": [-55, 155]},
+    } for source_id, name, role, entity_id in (
+        ("indoor", "Indoor", "indoor", "sensor.indoor"),
+        ("outdoor", "Outdoor", "outdoor", "sensor.outdoor"),
+        ("supply", "Centrometal supply", "supply", "sensor.supply"),
+    )]
+    original = {
+        "locale": "en", "floor_area_m2": 180,
+        "equipment": json.dumps(equipment),
+        "temperature_sources": json.dumps(temperatures),
+        "representative_indoor_source_id": "indoor",
+        "representative_outdoor_source_id": "outdoor",
+        "site_sources": {"pv": "sensor.pv", "import": "sensor.import",
+                         "export": "sensor.export"},
+        "historical_source": "recorder", "mapping_effective_at": "2026-01-01T00:00:00Z",
+    }
+
+    skipped = OptionsFlow(); skipped.hass = hass
+    skipped._load(deepcopy(original)); skipped._editing = True
+    await skipped.async_step_heat_pumps(None)
+    await skipped.async_step_heat_pumps({"configure": False})
+    await skipped.async_step_air_conditioners({"configure": False})
+    assert skipped.equipment == equipment
+    await skipped.async_step_temperatures(None)
+    await skipped.async_step_temperatures({"configure": False})
+    assert skipped.temperatures == temperatures
+    assert skipped.result["representative_indoor_source_id"] == "indoor"
+    assert skipped.result["representative_outdoor_source_id"] == "outdoor"
+    assert skipped.result["site_sources"] == original["site_sources"]
+
+    disabled = OptionsFlow(); disabled.hass = hass
+    disabled._load(deepcopy(original)); disabled._editing = True
+    await disabled.async_step_air_conditioners(None)
+    await disabled.async_step_air_conditioners({
+        "configure": True, "action": "disable", "add_another": False,
+    })
+    await disabled.async_step_air_conditioners({"configure": False})
+    disabled_ac = next(item for item in disabled.equipment
+                       if item["equipment_id"] == "kuhinja")
+    assert disabled_ac["enabled"] is False
+    assert disabled_ac["state_map"] == {"off": "standby"}
+    assert {item["equipment_id"] for item in disabled.equipment} == {
+        "ecodan", "kuhinja", "aurora", "dnevna",
+    }
+
+    removed = OptionsFlow(); removed.hass = hass
+    removed._load(deepcopy(original)); removed._editing = True
+    await removed.async_step_air_conditioners(None)
+    await removed.async_step_air_conditioners({
+        "configure": True, "action": "remove", "add_another": False,
+    })
+    await removed.async_step_air_conditioners({"configure": False})
+    assert {item["equipment_id"] for item in removed.equipment} == {
+        "ecodan", "aurora", "dnevna",
+    }
+
+    invalid = OptionsFlow(); invalid.hass = hass
+    invalid._load(deepcopy(original)); invalid._editing = True
+    await invalid.async_step_temperatures(None)
+    result = await invalid.async_step_temperatures({
+        "configure": True, "action": "update", "add_another": False,
+        "source_id": "changed", "display_name": "Indoor", "role": "indoor",
+        "entity_id": "sensor.indoor", "enabled": True,
+        "minimum": 30, "maximum": 20, "invalid_values": "-55,155",
+        "maximum_change_per_minute": 8, "freshness_minutes": 360,
+        "missing_after_minutes": 360,
+    })
+    assert result["errors"]["base"] == "invalid_temperature_limits"
+    assert invalid._temperature_pending[0]["source_id"] == "indoor"
+    assert invalid.temperatures == []
 
 
 @pytest.mark.asyncio

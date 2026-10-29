@@ -11,16 +11,18 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Compact idempotent hourly rows survive restarts and complement—not replace—the six-hour classification checkpoints and 05:00 authoritative daily close.
 - History supports Home Assistant-timezone presets for Today, Yesterday, −2 through −7 days, Monday–Sunday weeks, seven completed days, calendar months/years, configurable energy seasons and custom ranges. Today is assembled from validated completed-hour rows at Overview's cutoff and is never written as a finalized daily record. Its authoritative summary covers the entire range independently of paginated detail rows, and CSV exports the entire selected range.
 - Expected completed hours are checked individually, so internal gaps are visible and late Recorder data can safely replace poor-quality hourly rows without duplicating energy.
+- Administrator diagnostics trace each representative temperature from stable source/entity mapping through live state, unit/attribute validation, bounded Recorder rows/statistics, rejection reasons and persisted hourly/daily coverage. A temperature-only repair can recover up to 31 days without replacing valid energy or stronger temperature evidence.
 - Missing allocations expose known partial subtotals separately and never become complete zero heating, DHW or cooling totals. Device-level heating/cooling evidence and signed reconciliation discrepancies remain visible.
 - PV, grid and household history uses measured, physically valid balances and reports self-sufficiency/self-consumption only when its required inputs are available.
 - Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
 - Period status reports date, meter, allocation and temperature coverage separately. Missing temperature dates reduce temperature coverage without invalidating otherwise valid electricity counters.
-- The House Thermal Profile tab provides an evidence-bound **electrical** space-heating response curve normalized by configured floor area. It combines dynamically configured heat-pump and AC heating only for complete daily classifications. Measured thermal output, COP, design-day output and annualization remain unavailable unless their required evidence and complete period exist.
+- The House Thermal Profile tab provides an evidence-bound **electrical** space-heating response curve normalized by configured floor area. It combines dynamically configured heat-pump and AC heating only for complete daily classifications. By default, a day also needs at least 95% representative-outdoor coverage and known reconciliation; the UI fits only after 10 validated days spanning at least 8 °C and reports R². Excluded dates and reasons remain visible. Measured thermal output, COP, design-day output and annualization remain unavailable unless their required evidence and complete period exist.
 
 ## V0.1 foundation
 
 - Guided General, Heat pumps, Air conditioners, Solar/grid, Temperatures, Weather, Data sources, and Data quality UI sections. Every source entity and operating-state mapping is configurable.
 - Options Flow edits, disables or removes individual devices while preserving stable IDs, unrelated mappings and historical records.
+- Options changes are transactional: skipping a section preserves all queued records, disabling retains the complete mapping, and only an explicit remove action deletes an item.
 - Source values are normalized before calculation: Wh/kWh/MWh to kWh, W/kW to W, and °F to °C. Original source units remain in provenance.
 - Recorder-first raw history and long-term-statistics reads, always off the event loop.
 - Persisted six-hour, transition-aware allocations for any configured heat pumps and zero or more AC units; checkpoints are the primary daily classification evidence.
@@ -44,9 +46,10 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 4. Add each heat pump and optional AC with a display name, electrical counter, power and operating-state entity. Map the installation's state strings to the documented categories.
    Energy counters must use the `energy` device class, Wh/kWh/MWh and `total` or `total_increasing`; power sources must use the `power` device class and W/kW.
 5. Add optional PV/grid, temperature and weather sources. Temperature sources accept °C or °F and each has its own physical limits, invalid sentinels, spike limit, point-sample freshness and missing-data thresholds.
-6. In **Data quality**, explicitly choose one representative indoor source and one representative measured outdoor-air source, or leave either as **Not configured**. Use **Test representative sources** to preview the current normalized value, unit validation, quality and last update before saving. A weather entity, supply-water sensor or return-water sensor is never silently selected as outdoor air.
+6. In **Data quality**, explicitly choose one representative indoor source and one representative measured outdoor-air source, or leave either as **Not configured**. Use **Test representative sources** to preview the current normalized value, unit validation, quality and last update before saving. A weather entity, supply-water sensor or return-water sensor is never silently selected as outdoor air. The same section configures the minimum outdoor-temperature coverage used by the electrical response profile (95% by default).
 7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
+9. If a previously mapped representative sensor has blank historical cards, open the dashboard **Settings**, load **Temperature pipeline diagnostics**, then run the bounded repair after confirming Recorder still has valid history. Missing Recorder intervals remain gaps.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
@@ -77,6 +80,8 @@ node --check custom_components/home_energy_intelligence/frontend/hei-panel.js
 ```
 
 See [testing](TESTING.md), [data quality](DATA_QUALITY.md), [schema](DATA_SCHEMA.md), [entity mapping](ENTITY_MAPPING.md), and [InfluxDB backfill](INFLUXDB_BACKFILL.md).
+
+The [V0.1.1 post-merge correction report](docs/V0.1.1_POST_MERGE_CORRECTION_REPORT.md) records the audited root causes, compatibility assessment, responsive layout evidence and manual backed-up Home Assistant checklist.
 
 ## Scope
 

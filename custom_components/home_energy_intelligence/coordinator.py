@@ -137,6 +137,205 @@ class HomeEnergyCoordinator:
             cursor = end
         return changed
 
+    async def async_reprocess_temperature_history(
+        self, start_date: date, end_date: date,
+    ) -> dict[str, int]:
+        """Recover temperature summaries only, preserving valid energy evidence."""
+        if end_date < start_date or (end_date - start_date).days > 30:
+            raise ValueError("Temperature repair range must be ordered and at most 31 days")
+        changed_daily = changed_hourly = processed_days = 0
+        day = start_date
+        while day <= end_date:
+            start, end = local_day_bounds(day, self.timezone)
+            daily = await self.hass.async_add_executor_job(
+                self.database.daily, day.isoformat()
+            )
+            hours = await self.hass.async_add_executor_job(
+                self.database.hourly_range, start, end
+            )
+            if daily is None and not hours:
+                day += timedelta(days=1)
+                continue
+            source = await self._async_collect_range(
+                start, end, store_mapping_revision=False,
+            )
+            aggregator = self._aggregator()
+            provenance = {
+                "source": "bounded_recorder_temperature_repair",
+                "processed_at": datetime.now(UTC).isoformat(),
+                "collection": source.provenance.get("temperature_collection", {}),
+            }
+            if daily is not None:
+                recovered = await self.hass.async_add_executor_job(
+                    aggregator.aggregate_range, day, start, end, source
+                )
+                changed_daily += int(await self.hass.async_add_executor_job(
+                    self.database.merge_daily_temperatures, day.isoformat(),
+                    recovered.temperatures, provenance,
+                ))
+            for hour in hours:
+                hour_start = datetime.fromisoformat(hour["period_start_utc"])
+                hour_end = datetime.fromisoformat(hour["period_end_utc"])
+                recovered = await self.hass.async_add_executor_job(
+                    aggregator.aggregate_range, day, hour_start, hour_end, source
+                )
+                changed_hourly += int(await self.hass.async_add_executor_job(
+                    self.database.merge_hourly_temperatures, hour_start, hour_end,
+                    recovered.temperatures, provenance,
+                ))
+            processed_days += 1
+            day += timedelta(days=1)
+        if changed_daily or changed_hourly:
+            async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
+        return {
+            "processed_days": processed_days,
+            "changed_daily_records": changed_daily,
+            "changed_hourly_records": changed_hourly,
+        }
+
+    async def async_temperature_diagnostics(
+        self, start_date: date, end_date: date,
+    ) -> dict[str, Any]:
+        """Trace configured temperatures through bounded Recorder and storage reads."""
+        if end_date < start_date or (end_date - start_date).days > 30:
+            raise ValueError("Diagnostic range must be ordered and at most 31 days")
+        start, _ = local_day_bounds(start_date, self.timezone)
+        _, requested_end = local_day_bounds(end_date, self.timezone)
+        end = min(
+            requested_end,
+            datetime.now(UTC).replace(minute=0, second=0, microsecond=0),
+        )
+        source = await self._async_collect_range(
+            start, end, store_mapping_revision=False,
+        )
+        hourly = await self.hass.async_add_executor_job(
+            self.database.hourly_range, start, end
+        )
+        daily = await self.hass.async_add_executor_job(
+            self.database.history_period, start_date.isoformat(), end_date.isoformat()
+        )
+        configured = list(temperatures_from_config(self.config))
+        explicit = {(item.entity_id, item.role) for item in configured}
+        configured.extend(
+            item for item in equipment_temperature_mappings(
+                [item for item in equipment_from_config(self.config) if item.enabled]
+            ) if (item.entity_id, item.role) not in explicit
+        )
+        collection = source.provenance.get("temperature_collection", {})
+        expected_hours = []
+        cursor = start
+        while cursor + timedelta(hours=1) <= end:
+            expected_hours.append((cursor, cursor + timedelta(hours=1)))
+            cursor += timedelta(hours=1)
+        hourly_by_start = {
+            item.get("period_start_utc"): item for item in hourly
+        }
+        sources = []
+        for item in configured:
+            live = self.hass.states.get(item.entity_id)
+            raw = collection.get(item.source_id, {})
+            persisted_hourly = [
+                row.get("temperatures", {}).get(item.source_id)
+                for row in hourly
+                if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+            ]
+            persisted_daily = [
+                row.get("temperatures", {}).get(item.source_id)
+                for row in daily
+                if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+            ]
+            missing_intervals = []
+            for interval_start, _interval_end in expected_hours:
+                row = hourly_by_start.get(interval_start.isoformat())
+                summary = (row.get("temperatures", {}).get(item.source_id)
+                           if row else None)
+                if row is None:
+                    reason = "hourly_record_not_processed"
+                elif not isinstance(summary, dict):
+                    reason = "temperature_summary_not_persisted"
+                elif not summary.get("coverage_seconds"):
+                    reasons = [
+                        rejection.get("reason", "rejected")
+                        for rejection in summary.get("rejections", [])
+                    ]
+                    reason = ",".join(sorted(set(reasons))) or "no_valid_coverage"
+                else:
+                    continue
+                if len(missing_intervals) < 200:
+                    missing_intervals.append({
+                        "start": interval_start.isoformat(), "reason": reason,
+                    })
+            rejections = []
+            for summary in [*persisted_hourly, *persisted_daily]:
+                rejections.extend(summary.get("rejections", []))
+            valid_hourly = sum(
+                1 for summary in persisted_hourly
+                if summary.get("mean") is not None
+                and float(summary.get("coverage_seconds", 0) or 0) > 0
+            )
+            valid_daily = sum(
+                1 for summary in persisted_daily
+                if summary.get("mean") is not None
+                and float(summary.get("coverage_seconds", 0) or 0) > 0
+            )
+            if not item.enabled:
+                stage = "disabled"
+            elif not raw.get("normalized_samples"):
+                stage = "recorder_history_unavailable"
+            elif not raw.get("valid_samples"):
+                stage = "recorder_samples_invalid"
+            elif not hourly:
+                stage = "hourly_processing_missing"
+            elif not persisted_hourly:
+                stage = "hourly_temperature_not_persisted"
+            elif not valid_hourly:
+                stage = "hourly_temperature_rejected_or_uncovered"
+            else:
+                stage = "available"
+            live_value = None
+            if live is not None:
+                live_value = (
+                    live.attributes.get(item.attribute) if item.attribute else live.state
+                )
+            sources.append({
+                **raw,
+                "configured": True,
+                "enabled": item.enabled,
+                "display_name": item.display_name,
+                "role": item.role,
+                "selected_representative": item.source_id in {
+                    self.config.get("representative_indoor_source_id"),
+                    self.config.get("representative_outdoor_source_id"),
+                },
+                "live_state": live_value,
+                "live_last_updated": (
+                    live.last_updated.isoformat() if live is not None else None
+                ),
+                "live_unit": (None if live is None else (
+                    live.attributes.get("unit_of_measurement")
+                    or live.attributes.get("temperature_unit")
+                )),
+                "attribute_available": bool(
+                    live is not None and (
+                        not item.attribute or item.attribute in live.attributes
+                    )
+                ),
+                "persisted_hourly_summaries": len(persisted_hourly),
+                "persisted_valid_hourly_summaries": valid_hourly,
+                "persisted_daily_summaries": len(persisted_daily),
+                "persisted_valid_daily_summaries": valid_daily,
+                "rejected_samples": rejections[-100:],
+                "missing_interval_count": len(expected_hours) - valid_hourly,
+                "missing_intervals": missing_intervals,
+                "pipeline_stage": stage,
+            })
+        return {
+            "start_utc": start.isoformat(), "end_utc": end.isoformat(),
+            "bounded_days": (end_date - start_date).days + 1,
+            "expected_hourly_intervals": len(expected_hours),
+            "sources": sources,
+        }
+
     async def async_process_checkpoint(
         self, scheduled_at: datetime, equipment_ids: set[str] | None = None
     ) -> int:
@@ -185,8 +384,15 @@ class HomeEnergyCoordinator:
 
     async def async_catch_up(self) -> None:
         await self.async_refresh_hourly()
-        await self.async_recover_checkpoints()
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
+        # A mapping may have been corrected after otherwise valid hourly rows
+        # were persisted. Repair only temperature evidence and never rewrite
+        # valid energy/allocation values. Older archives remain an explicit,
+        # administrator-triggered bounded operation.
+        await self.async_reprocess_temperature_history(
+            local_today - timedelta(days=1), local_today,
+        )
+        await self.async_recover_checkpoints()
         yesterday = local_today - timedelta(days=1)
         latest = await self.hass.async_add_executor_job(self.database.latest)
         next_day = yesterday if latest is None else date.fromisoformat(latest["local_date"]) + timedelta(days=1)
@@ -221,7 +427,8 @@ class HomeEnergyCoordinator:
         return await self._async_collect_range(start, end)
 
     async def _async_collect_range(
-        self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None
+        self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None,
+        store_mapping_revision: bool = True,
     ) -> DailyInput:
         equipment = [item for item in equipment_from_config(self.config) if item.enabled]
         if equipment_ids is not None:
@@ -339,16 +546,47 @@ class HomeEnergyCoordinator:
         temperatures = {}
         temperature_quality = {}
         temperature_roles = {}
+        temperature_collection = {}
         for item in temperature_sources:
-            temperatures[item.source_id] = await numeric(
+            samples = await numeric(
                 f"temperature.{item.source_id}", item.entity_id,
                 statistics_type="mean" if item.attribute is None else None,
                 attribute=item.attribute, dimension="temperature",
             )
+            temperatures[item.source_id] = samples
             temperature_quality[item.source_id] = item.quality
             temperature_roles[item.source_id] = item.role
+            valid = [sample for sample in samples if sample.value is not None]
+            temperature_collection[item.source_id] = {
+                "source_id": item.source_id,
+                "entity_id": item.entity_id,
+                "attribute": item.attribute,
+                "configured": True,
+                "enabled": item.enabled,
+                "recorder_state_rows": len(history.get(item.entity_id, [])),
+                "recorder_statistics_rows": len(statistics.get(item.entity_id, [])),
+                "normalized_samples": len(samples),
+                "valid_samples": len(valid),
+                "available_start": min(
+                    (sample.timestamp for sample in valid), default=None
+                ).isoformat() if valid else None,
+                "available_end": max(
+                    (sample.timestamp for sample in valid), default=None
+                ).isoformat() if valid else None,
+                "invalid_reasons": sorted({
+                    str(sample.reason) for sample in samples
+                    if sample.value is None and sample.reason
+                }),
+                "source_units": sorted({
+                    str(sample.source_unit) for sample in samples if sample.source_unit
+                }),
+                "normalized_unit": "°C",
+            }
         revision = mapping_revision(self.config)
-        await self.hass.async_add_executor_job(self.database.store_mapping_revision, revision)
+        if store_mapping_revision:
+            await self.hass.async_add_executor_job(
+                self.database.store_mapping_revision, revision
+            )
         return DailyInput(devices, site_counters, temperatures, provenance={
             "primary_source": "home_assistant_recorder",
             "raw_history_includes_preceding_state": True,
@@ -356,5 +594,6 @@ class HomeEnergyCoordinator:
             "influx_backfill_keys": used_influx,
             "collected_at": datetime.now(UTC).isoformat(),
             "mapping_effective_at": revision["effective_at"],
+            "temperature_collection": temperature_collection,
         }, temperature_quality=temperature_quality, temperature_roles=temperature_roles,
             site_configured={key for key, entity in site_sources.items() if entity})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 import uuid
@@ -157,7 +158,10 @@ def _circuit_2k(hass, entity_id):
 
 class _Wizard:
     def _load(self, values):
-        self.result = dict(values)
+        # Options Flow edits an isolated draft. Home Assistant receives no
+        # mutation until _finish() creates the validated options entry.
+        self._original = deepcopy(dict(values))
+        self.result = deepcopy(dict(values))
         self.equipment = parse_json_records(self.result.get("equipment"))
         self.temperatures = parse_json_records(self.result.get("temperature_sources"))
         self._editing = False
@@ -204,6 +208,15 @@ class _Wizard:
             pending = self._equipment_pending[kind]
             current = pending[0] if pending else None
             if user_input is not None:
+                if not user_input.get("configure"):
+                    # Skipping means "leave this section unchanged". Deletion
+                    # is only the explicit remove action.
+                    self.equipment.extend(deepcopy(pending))
+                    pending.clear()
+                    return await (
+                        self.async_step_air_conditioners()
+                        if kind == "heat_pump" else self.async_step_solar_grid()
+                    )
                 action = user_input.pop("action", "update")
                 add_another = bool(user_input.get("add_another"))
                 if current is not None:
@@ -211,8 +224,13 @@ class _Wizard:
                     user_input["equipment_id"] = current["equipment_id"]
                 if action != "remove":
                     if action == "disable":
-                        user_input["enabled"] = False
-                    errors = self._accept_equipment(kind, user_input)
+                        disabled = deepcopy(current or user_input)
+                        disabled["enabled"] = False
+                        disabled["kind"] = kind
+                        self.equipment.append(disabled)
+                        errors = {}
+                    else:
+                        errors = self._accept_equipment(kind, user_input)
                     if errors:
                         if current is not None:
                             pending.insert(0, current)
@@ -263,6 +281,11 @@ class _Wizard:
             if user_input is None and current is not None:
                 return self.async_show_form(step_id="temperatures", data_schema=_temperature(current))
             if user_input is not None:
+                if not user_input.get("configure"):
+                    # Preserve every queued mapping on a skipped page.
+                    self.temperatures.extend(deepcopy(self._temperature_pending))
+                    self._temperature_pending.clear()
+                    return await self.async_step_weather()
                 action = user_input.pop("action", "update")
                 add_another = bool(user_input.get("add_another"))
                 if current is not None:
@@ -275,7 +298,18 @@ class _Wizard:
                         )
                     return await (self.async_step_temperatures() if add_another else self.async_step_weather())
                 if action == "disable":
-                    user_input["enabled"] = False
+                    disabled = deepcopy(current or user_input)
+                    disabled["enabled"] = False
+                    self.temperatures.append(disabled)
+                    if self._temperature_pending:
+                        return self.async_show_form(
+                            step_id="temperatures",
+                            data_schema=_temperature(self._temperature_pending[0]),
+                        )
+                    return await (
+                        self.async_step_temperatures() if add_another
+                        else self.async_step_weather()
+                    )
         if user_input is not None:
             if not user_input.get("configure"): return await self.async_step_weather()
             errors = {}
@@ -425,6 +459,10 @@ class _Wizard:
         schema = {
             vol.Required("maximum_power_gap_minutes", default=values.get("maximum_power_gap_minutes", 30)): vol.Coerce(int),
             vol.Required("counter_jump_limit_kwh", default=values.get("counter_jump_limit_kwh", 500)): vol.Coerce(float),
+            vol.Required(
+                "response_temperature_coverage_minimum",
+                default=values.get("response_temperature_coverage_minimum", 95),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
             vol.Required("assumed_heating_reporting", default=values.get("assumed_heating_reporting", "separate")): selector.SelectSelector(selector.SelectSelectorConfig(options=["separate", "include_in_heating_total"])),
             vol.Required("test_representative_sources", default=False): selector.BooleanSelector(),
         }
@@ -478,5 +516,26 @@ class OptionsFlow(_Wizard, config_entries.OptionsFlow):
         return await self.async_step_general(user_input)
     def _finish(self, data):
         current = {**self.config_entry.data, **self.config_entry.options}
-        if current.get("influx_password") and not data.get("influx_password"): data["influx_password"] = current["influx_password"]
-        return self.async_create_entry(title="", data=data)
+        committed = deepcopy(data)
+        mapping_keys = (
+            "equipment", "temperature_sources", "site_sources",
+            "representative_indoor_source_id", "representative_outdoor_source_id",
+        )
+        def comparable(key, value):
+            # JSON whitespace/key formatting is not a mapping revision.
+            if key in {"equipment", "temperature_sources"}:
+                return parse_json_records(value)
+            return value
+
+        if all(
+            comparable(key, committed.get(key))
+            == comparable(key, self._original.get(key))
+            for key in mapping_keys
+        ):
+            if "mapping_effective_at" in self._original:
+                committed["mapping_effective_at"] = self._original["mapping_effective_at"]
+            else:
+                committed.pop("mapping_effective_at", None)
+        if current.get("influx_password") and not committed.get("influx_password"):
+            committed["influx_password"] = current["influx_password"]
+        return self.async_create_entry(title="", data=committed)

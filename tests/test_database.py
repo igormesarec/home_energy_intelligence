@@ -198,6 +198,56 @@ def test_poor_hour_can_be_reprocessed_after_late_recorder_data(tmp_path):
     assert db.hourly_range(start, end)[0]["household_kwh"] == 2.5
 
 
+def test_temperature_history_repair_is_idempotent_and_preserves_energy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {
+        "indoor": {"mean": 21.2, "coverage_seconds": 90000, "quality": "good"},
+    }
+    assert db.upsert_daily(item)
+    start = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    hourly = {
+        "local_date": "2026-10-25", "timezone": "Europe/Ljubljana",
+        "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+        "day_seconds": 3600, "household_kwh": 1.2, "quality": "partial",
+        "temperatures": {}, "allocations": {}, "provenance": {},
+    }
+    assert db.upsert_hourly(hourly)
+    recovered = {
+        "indoor": {"mean": 99, "coverage_seconds": 100, "quality": "partial"},
+        "outdoor": {
+            "mean": 8.2, "minimum": 7.8, "maximum": 8.7,
+            "coverage_seconds": 90000, "period_seconds": 90000,
+            "coverage_percent": 100, "latest_value": 8.4,
+            "latest_timestamp": "2026-10-25T22:00:00+00:00", "quality": "good",
+            "rejections": [],
+        },
+    }
+    assert db.merge_daily_temperatures("2026-10-25", recovered, {"source": "test"})
+    repaired = db.daily("2026-10-25")
+    assert repaired["household_kwh"] == 42.631
+    assert repaired["allocations"]["ecodan"]["categories"]["confirmed_heating"] == 4
+    assert repaired["temperatures"]["indoor"]["mean"] == 21.2
+    assert repaired["temperatures"]["outdoor"]["mean"] == 8.2
+    assert not db.merge_daily_temperatures("2026-10-25", recovered, {"source": "test"})
+
+    hourly_temperature = {
+        "mean": 8.1, "coverage_seconds": 3600, "period_seconds": 3600,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+    }
+    assert db.merge_hourly_temperatures(
+        start, end, {"outdoor": hourly_temperature}, {"source": "test"}
+    )
+    repaired_hour = db.hourly_range(start, end)[0]
+    assert repaired_hour["household_kwh"] == 1.2
+    assert repaired_hour["temperatures"]["outdoor"]["mean"] == 8.1
+    assert not db.merge_hourly_temperatures(
+        start, end, {"outdoor": hourly_temperature}, {"source": "test"}
+    )
+
+
 def test_authoritative_full_year_is_not_limited_by_history_page(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
