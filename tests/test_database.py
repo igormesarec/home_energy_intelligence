@@ -1,14 +1,42 @@
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import sqlite3
 from threading import Barrier
 import time
 
 import pytest
 
+from custom_components.home_energy_intelligence.analytics import heating_response_profile
 from custom_components.home_energy_intelligence.database import EnergyDatabase, protected_export_path
 from custom_components.home_energy_intelligence.models import DailyRecord
+
+
+def logical_daily_checksum(db, local_date):
+    payload = db.daily(local_date)
+    payload.pop("revision", None)
+    payload.pop("updated_at", None)
+    serialized = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def make_v3_inline_database(db, daily_payload):
+    """Convert a test v4 database to the inline temperature shape used by v3."""
+    serialized = json.dumps(
+        daily_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    checksum = hashlib.sha256(serialized.encode()).hexdigest()
+    with db.connect() as connection:
+        connection.execute("DELETE FROM temperature_summaries")
+        connection.execute("DELETE FROM hourly_temperature_rejections")
+        connection.execute(
+            "UPDATE daily_records SET payload_json=?,checksum=? WHERE local_date=?",
+            (serialized, checksum, daily_payload["local_date"]),
+        )
+        connection.execute("UPDATE schema_version SET version=3")
 
 
 def record(value=10.0):
@@ -39,6 +67,129 @@ def test_corrupt_database_is_preserved_and_recovered(tmp_path):
     assert recovered is not None and recovered.exists()
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    large_value = "x" * 1_000_000
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "minimum": -2.0, "maximum": 9.0,
+        "coverage_seconds": 89900, "period_seconds": 90000,
+        "coverage_percent": 99.888, "quality": "filtered", "rejected_count": 1,
+        "rejections": [{
+            "timestamp": "2026-10-25T01:00:00+00:00", "value": large_value,
+            "reason": "invalid_sentinel", "duration_seconds": 100,
+            "source": "recorder",
+        }],
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }}
+    assert db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    with db.connect() as connection:
+        revision_rows = connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]
+        rejection_rows = connection.execute(
+            "SELECT COUNT(*) FROM rejected_readings"
+        ).fetchone()[0]
+    make_v3_inline_database(db, logical)
+
+    db.initialize()
+    migrated = db.daily(item.local_date)
+    migrated.pop("revision")
+    migrated.pop("updated_at")
+    assert migrated == logical
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        raw = connection.execute("SELECT payload_json FROM daily_records").fetchone()[0]
+        assert "temperatures" not in json.loads(raw)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == revision_rows
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rejected_readings"
+        ).fetchone()[0] == rejection_rows
+    logical_bytes = len(json.dumps(logical, separators=(",", ":")).encode())
+    assert db.size_bytes() < logical_bytes * 2
+    before = db.size_bytes()
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"] == logical["temperatures"]
+    assert db.size_bytes() == before
+
+
+def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_v4 BEFORE INSERT ON temperature_summaries
+            BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="injected migration failure"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        raw = json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+        assert raw["temperatures"]["outdoor"]["mean"] == 5.0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 0
+
+
+def test_temperature_repair_immediately_qualifies_response_without_energy_rebuild(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.quality = "partial"
+    item.allocations = {"hp": {
+        "meter_kwh": 4.0, "categories": {"confirmed_heating": 4.0},
+        "covered_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good",
+    }}
+    db.upsert_daily(item)
+    equipment = [{
+        "equipment_id": "hp", "display_name": "Heat pump",
+        "kind": "heat_pump", "enabled": True,
+    }]
+    before = heating_response_profile(
+        [db.daily(item.local_date)], equipment, outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+    )["points"][0]
+    assert before["status"] == "excluded"
+    assert "outdoor_temperature_unavailable" in before["exclusion_reasons"]
+    summary = {
+        "mean": 5.0, "minimum": 2.0, "maximum": 8.0,
+        "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    assert db.merge_daily_temperatures(
+        item.local_date, {"outdoor": summary}, {"source": "test"}
+    )
+    after = heating_response_profile(
+        [db.daily(item.local_date)], equipment, outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+    )["points"][0]
+    assert after["status"] == "validated"
+    assert after["heating_electricity_kwh"] == 4.0
 
 
 def test_compact_growth_for_ten_years(tmp_path):
@@ -165,7 +316,7 @@ def test_hourly_records_are_idempotent_bounded_and_dst_safe(tmp_path):
     rows = db.hourly_range(start, start + timedelta(hours=25))
     assert len(rows) == 25
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_bounded_history_pagination(tmp_path):
@@ -346,7 +497,7 @@ def test_atomic_temperature_repair_preserves_checksum_revision_and_mapping_meani
             "SELECT revision,updated_at,checksum,payload_json FROM daily_records"
         ).fetchone()
     assert tuple(after) == tuple(before)
-    assert after["checksum"] == hashlib.sha256(after["payload_json"].encode()).hexdigest()
+    assert after["checksum"] == logical_daily_checksum(db, item.local_date)
 
 
 def test_temperature_repair_replaces_only_changed_source_rejections_without_duplicates(tmp_path):
@@ -456,7 +607,7 @@ def test_competing_temperature_repairs_serialize_and_best_evidence_wins(tmp_path
         row = connection.execute(
             "SELECT payload_json,checksum FROM daily_records WHERE local_date='2026-10-25'"
         ).fetchone()
-    assert row["checksum"] == hashlib.sha256(row["payload_json"].encode()).hexdigest()
+    assert row["checksum"] == logical_daily_checksum(db, "2026-10-25")
 
 
 def test_temperature_repair_and_normal_daily_hourly_writers_do_not_lose_evidence(tmp_path):

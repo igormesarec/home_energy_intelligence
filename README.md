@@ -55,6 +55,12 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
+Before updating an existing installation, create the administrator-only protected
+database backup. Startup integrity-checks the database and transactionally
+migrates V1–V3 storage to schema V4, which normalizes temperature audit data.
+Do not downgrade an already migrated database to a V3 writer; restore the backup
+if rollback is required.
+
 ## Safety and privacy
 
 The integration never writes to Recorder or InfluxDB, changes retention, or modifies source entities. It stores only compact derived checkpoints and daily records under:

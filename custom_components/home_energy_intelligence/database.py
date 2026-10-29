@@ -16,7 +16,7 @@ from typing import Any
 
 from .models import DailyRecord
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -80,6 +80,19 @@ CREATE INDEX IF NOT EXISTS idx_daily_records_date ON daily_records(local_date DE
 CREATE INDEX IF NOT EXISTS idx_checkpoints_date ON checkpoints(local_date);
 CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hourly_local_date ON hourly_records(local_date, interval_start_utc);
+CREATE TABLE IF NOT EXISTS temperature_summaries (
+  record_kind TEXT NOT NULL, record_key TEXT NOT NULL, source_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL, checksum TEXT NOT NULL,
+  PRIMARY KEY (record_kind, record_key, source_id)
+);
+CREATE TABLE IF NOT EXISTS hourly_temperature_rejections (
+  record_key TEXT NOT NULL, source_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+  value_json TEXT NOT NULL, reason TEXT NOT NULL, duration_seconds REAL NOT NULL,
+  source TEXT NOT NULL,
+  PRIMARY KEY (record_key,source_id,observed_at,value_json,reason,duration_seconds,source)
+);
+CREATE INDEX IF NOT EXISTS idx_temperature_summary_record
+  ON temperature_summaries(record_kind, record_key);
 """
 MIGRATION_2 = """
 ALTER TABLE rejected_readings ADD COLUMN duration_seconds REAL;
@@ -99,6 +112,27 @@ CREATE TABLE IF NOT EXISTS hourly_records (
 );
 CREATE INDEX IF NOT EXISTS idx_hourly_local_date ON hourly_records(local_date, interval_start_utc);
 """
+MIGRATION_4 = """
+CREATE TABLE IF NOT EXISTS temperature_summaries (
+  record_kind TEXT NOT NULL, record_key TEXT NOT NULL, source_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL, checksum TEXT NOT NULL,
+  PRIMARY KEY (record_kind, record_key, source_id)
+);
+CREATE TABLE IF NOT EXISTS hourly_temperature_rejections (
+  record_key TEXT NOT NULL, source_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+  value_json TEXT NOT NULL, reason TEXT NOT NULL, duration_seconds REAL NOT NULL,
+  source TEXT NOT NULL,
+  PRIMARY KEY (record_key,source_id,observed_at,value_json,reason,duration_seconds,source)
+);
+CREATE INDEX IF NOT EXISTS idx_temperature_summary_record
+  ON temperature_summaries(record_kind, record_key);
+"""
+
+_TEMPERATURE_REJECTION_REASONS = (
+    "invalid_sentinel", "out_of_range", "temporal_spike",
+    "contaminated_statistics_bounds", "invalid_statistics_bounds",
+    "incompatible_temperature_unit", "non_numeric",
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -107,6 +141,208 @@ def _canonical_json(value: Any) -> str:
 
 def _checksum(payload: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _compact_temperature_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Keep interval statistics separate from potentially large audit arrays."""
+    compact = {
+        key: value for key, value in summary.items()
+        if key != "rejections"
+    }
+    compact["_normalized_audit_fields"] = [
+        key for key in ("rejections",) if key in summary
+    ]
+    return compact
+
+
+def _normalized_rejections(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    result = [dict(item) for item in summary.get("rejections", []) if isinstance(item, dict)]
+    if not result:
+        for item in summary.get("rejected_reasons", []):
+            reason, _, value = str(item).partition(":")
+            result.append({"timestamp": None, "value": value or None, "reason": reason})
+    return result
+
+
+def _store_normalized_temperatures(
+    connection: sqlite3.Connection, record_kind: str, record_key: str,
+    temperatures: dict[str, Any],
+) -> None:
+    """Replace normalized temperature evidence inside the caller transaction."""
+    connection.execute(
+        "DELETE FROM temperature_summaries WHERE record_kind=? AND record_key=?",
+        (record_kind, record_key),
+    )
+    if record_kind == "hourly":
+        connection.execute(
+            "DELETE FROM hourly_temperature_rejections WHERE record_key=?", (record_key,)
+        )
+    for source_id, summary in (temperatures or {}).items():
+        if not isinstance(summary, dict):
+            continue
+        compact = _canonical_json(_compact_temperature_summary(summary))
+        connection.execute(
+            "INSERT INTO temperature_summaries VALUES (?,?,?,?,?)",
+            (record_kind, record_key, source_id, compact, _checksum(compact)),
+        )
+        if record_kind != "hourly":
+            continue
+        seen: set[tuple[Any, ...]] = set()
+        for rejection in _normalized_rejections(summary):
+            values = (
+                str(rejection.get("timestamp") or ""),
+                _canonical_json(rejection.get("value")),
+                str(rejection.get("reason") or "invalid"),
+                float(rejection.get("duration_seconds")
+                      if rejection.get("duration_seconds") is not None else -1),
+                str(rejection.get("source") or ""),
+            )
+            if values in seen:
+                continue
+            seen.add(values)
+            connection.execute(
+                "INSERT OR IGNORE INTO hourly_temperature_rejections VALUES (?,?,?,?,?,?,?)",
+                (record_key, source_id, *values),
+            )
+
+
+def _daily_rejections(
+    connection: sqlite3.Connection, local_date: str, source_id: str,
+) -> list[dict[str, Any]]:
+    reason_clauses = " OR ".join(
+        "reason LIKE ?" for _ in _TEMPERATURE_REJECTION_REASONS
+    )
+    rows = connection.execute(
+        f"""SELECT observed_at,value,reason,duration_seconds,source
+        FROM rejected_readings WHERE local_date=? AND entity_key=?
+        AND ({reason_clauses}) ORDER BY id""",
+        (local_date, source_id,
+         *(f"{reason}%" for reason in _TEMPERATURE_REJECTION_REASONS)),
+    ).fetchall()
+    result = []
+    for row in rows:
+        raw_value = row["value"]
+        try:
+            value = json.loads(raw_value) if raw_value is not None else None
+        except (TypeError, json.JSONDecodeError):
+            value = raw_value
+        result.append({
+            "timestamp": row["observed_at"], "value": value,
+            "reason": row["reason"], "duration_seconds": row["duration_seconds"],
+            "source": row["source"],
+        })
+    return result
+
+
+def _hydrate_payload(
+    connection: sqlite3.Connection, payload_json: str, record_kind: str,
+    record_key: str,
+) -> dict[str, Any]:
+    payload = json.loads(payload_json)
+    rows = connection.execute(
+        """SELECT source_id,payload_json FROM temperature_summaries
+        WHERE record_kind=? AND record_key=? ORDER BY source_id""",
+        (record_kind, record_key),
+    ).fetchall()
+    if not rows:
+        return payload
+    temperatures: dict[str, Any] = {}
+    for row in rows:
+        summary = json.loads(row["payload_json"])
+        audit_fields = summary.pop("_normalized_audit_fields", [])
+        if record_kind == "daily":
+            rejections = _daily_rejections(connection, record_key, row["source_id"])
+        else:
+            rejection_rows = connection.execute(
+                """SELECT observed_at,value_json,reason,duration_seconds,source
+                FROM hourly_temperature_rejections
+                WHERE record_key=? AND source_id=? ORDER BY observed_at,reason""",
+                (record_key, row["source_id"]),
+            ).fetchall()
+            rejections = [{
+                "timestamp": item["observed_at"] or None,
+                "value": json.loads(item["value_json"]),
+                "reason": item["reason"],
+                "duration_seconds": (None if item["duration_seconds"] < 0
+                                     else item["duration_seconds"]),
+                "source": item["source"] or None,
+            } for item in rejection_rows]
+        if rejections or "rejections" in audit_fields:
+            summary["rejections"] = rejections
+        temperatures[row["source_id"]] = summary
+    payload["temperatures"] = temperatures
+    return payload
+
+
+def _core_payload(payload: dict[str, Any]) -> str:
+    core = dict(payload)
+    core.pop("temperatures", None)
+    return _canonical_json(core)
+
+
+def _migrate_temperature_storage_v4(connection: sqlite3.Connection) -> None:
+    """Normalize existing temperature evidence without changing logical checksums."""
+    daily_rows = connection.execute(
+        "SELECT local_date,payload_json FROM daily_records"
+    ).fetchall()
+    for row in daily_rows:
+        payload = json.loads(row["payload_json"])
+        temperatures = payload.get("temperatures") or {}
+        if not temperatures:
+            continue
+        for source_id, summary in temperatures.items():
+            if not isinstance(summary, dict):
+                continue
+            for rejection in _normalized_rejections(summary):
+                observed = rejection.get("timestamp")
+                value = rejection.get("value")
+                value_text = None if value is None else str(value)
+                reason = str(rejection.get("reason") or "invalid")
+                duration = rejection.get("duration_seconds")
+                source = rejection.get("source")
+                exists = connection.execute(
+                    """SELECT 1 FROM rejected_readings
+                    WHERE local_date=? AND entity_key=?
+                    AND COALESCE(observed_at,'')=COALESCE(?,'')
+                    AND COALESCE(value,'')=COALESCE(?,'')
+                    AND reason=?
+                    AND COALESCE(duration_seconds,-1)=COALESCE(?,-1)
+                    AND COALESCE(source,'')=COALESCE(?,'') LIMIT 1""",
+                    (row["local_date"], source_id, observed, value_text, reason,
+                     duration, source),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        """INSERT INTO rejected_readings
+                        (local_date,entity_key,observed_at,value,reason,duration_seconds,source)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (row["local_date"], source_id, observed, value_text, reason,
+                         duration, source),
+                    )
+        _store_normalized_temperatures(
+            connection, "daily", row["local_date"], temperatures
+        )
+        connection.execute(
+            "UPDATE daily_records SET payload_json=? WHERE local_date=?",
+            (_core_payload(payload), row["local_date"]),
+        )
+
+    hourly_rows = connection.execute(
+        "SELECT interval_start_utc,payload_json FROM hourly_records"
+    ).fetchall()
+    for row in hourly_rows:
+        payload = json.loads(row["payload_json"])
+        temperatures = payload.get("temperatures") or {}
+        if not temperatures:
+            continue
+        _store_normalized_temperatures(
+            connection, "hourly", row["interval_start_utc"], temperatures
+        )
+        connection.execute(
+            """UPDATE hourly_records SET payload_json=?
+            WHERE interval_start_utc=?""",
+            (_core_payload(payload), row["interval_start_utc"]),
+        )
 
 
 def _temperature_coverage(value: dict[str, Any] | None) -> float:
@@ -215,6 +451,7 @@ class EnergyDatabase:
 
     def initialize(self, *, recover_corrupt: bool = True) -> Path | None:
         recovered = None
+        compact_after_migration = False
         if self.path.exists():
             try:
                 with self.connect() as connection:
@@ -238,12 +475,29 @@ class EnergyDatabase:
             elif row[0] == 1:
                 connection.executescript(MIGRATION_2)
                 connection.executescript(MIGRATION_3)
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
+                _migrate_temperature_storage_v4(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+                compact_after_migration = True
             elif row[0] == 2:
                 connection.executescript(MIGRATION_3)
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
+                _migrate_temperature_storage_v4(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+                compact_after_migration = True
+            elif row[0] == 3:
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
+                _migrate_temperature_storage_v4(connection)
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+                compact_after_migration = True
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
+        if compact_after_migration:
+            # The transaction above is the safety boundary.  VACUUM runs only
+            # after it commits, reclaiming pages formerly occupied by repeated
+            # inline audit arrays without risking the logical migration.
+            with self.connect() as connection:
+                connection.execute("VACUUM")
         return recovered
 
     def upsert_daily(self, record: DailyRecord, *, reason: str = "daily_close") -> bool:
@@ -256,7 +510,9 @@ class EnergyDatabase:
             ).fetchone()
             payload_data = record.as_dict()
             if prior:
-                prior_payload = json.loads(prior["payload_json"])
+                prior_payload = _hydrate_payload(
+                    connection, prior["payload_json"], "daily", record.local_date
+                )
                 eligible_prior = _eligible_temperature_repair(
                     prior_payload.get("temperatures", {}),
                     payload_data["period_start_utc"], payload_data["period_end_utc"],
@@ -271,8 +527,9 @@ class EnergyDatabase:
                         "temperature_reprocessing",
                         prior_payload["provenance"]["temperature_reprocessing"],
                     )
-            payload = _canonical_json(payload_data)
-            checksum = _checksum(payload)
+            logical_payload = _canonical_json(payload_data)
+            payload = _core_payload(payload_data)
+            checksum = _checksum(logical_payload)
             if prior and prior["checksum"] == checksum:
                 return False
             revision = 1 if prior is None else prior["revision"] + 1
@@ -289,6 +546,10 @@ class EnergyDatabase:
                  record.period_end_utc, record.day_seconds, record.household_kwh,
                  record.pv_kwh, record.import_kwh, record.export_kwh,
                  record.non_hvac_kwh, record.quality, payload, checksum, revision, now),
+            )
+            _store_normalized_temperatures(
+                connection, "daily", record.local_date,
+                payload_data.get("temperatures", {}),
             )
             connection.execute(
                 "INSERT INTO revisions(local_date,revision,prior_checksum,new_checksum,reason,created_at) VALUES (?,?,?,?,?,?)",
@@ -428,7 +689,7 @@ class EnergyDatabase:
 
     def history(self, *, limit: int = 90, before: str | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 3660))
-        sql = "SELECT payload_json,revision,updated_at FROM daily_records"
+        sql = "SELECT local_date,payload_json,revision,updated_at FROM daily_records"
         args: list[Any] = []
         if before:
             sql += " WHERE local_date < ?"
@@ -437,11 +698,13 @@ class EnergyDatabase:
         args.append(limit)
         with self.connect() as connection:
             rows = connection.execute(sql, args).fetchall()
-        result = []
-        for row in rows:
-            item = json.loads(row["payload_json"])
-            item.update(revision=row["revision"], updated_at=row["updated_at"])
-            result.append(item)
+            result = []
+            for row in rows:
+                item = _hydrate_payload(
+                    connection, row["payload_json"], "daily", row["local_date"]
+                )
+                item.update(revision=row["revision"], updated_at=row["updated_at"])
+                result.append(item)
         return result
 
     def history_range(
@@ -464,14 +727,16 @@ class EnergyDatabase:
                 f"SELECT COUNT(*) FROM daily_records{where}", args
             ).fetchone()[0])
             rows = connection.execute(
-                f"SELECT payload_json,revision,updated_at FROM daily_records{where} "
+                f"SELECT local_date,payload_json,revision,updated_at FROM daily_records{where} "
                 "ORDER BY local_date DESC LIMIT ? OFFSET ?", [*args, limit, offset],
             ).fetchall()
-        result = []
-        for row in rows:
-            item = json.loads(row["payload_json"])
-            item.update(revision=row["revision"], updated_at=row["updated_at"])
-            result.append(item)
+            result = []
+            for row in rows:
+                item = _hydrate_payload(
+                    connection, row["payload_json"], "daily", row["local_date"]
+                )
+                item.update(revision=row["revision"], updated_at=row["updated_at"])
+                result.append(item)
         return result, total
 
     def history_period(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
@@ -484,15 +749,17 @@ class EnergyDatabase:
             raise ValueError("history period must be ordered and no longer than ten years")
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT payload_json,revision,updated_at FROM daily_records
+                """SELECT local_date,payload_json,revision,updated_at FROM daily_records
                 WHERE local_date>=? AND local_date<=? ORDER BY local_date""",
                 (start_date, end_date),
             ).fetchall()
-        result = []
-        for row in rows:
-            item = json.loads(row["payload_json"])
-            item.update(revision=row["revision"], updated_at=row["updated_at"])
-            result.append(item)
+            result = []
+            for row in rows:
+                item = _hydrate_payload(
+                    connection, row["payload_json"], "daily", row["local_date"]
+                )
+                item.update(revision=row["revision"], updated_at=row["updated_at"])
+                result.append(item)
         return result
 
     def upsert_hourly(self, payload: dict[str, Any]) -> bool:
@@ -509,7 +776,9 @@ class EnergyDatabase:
             ).fetchone()
             payload_data = dict(payload)
             if prior:
-                prior_payload = json.loads(prior["payload_json"])
+                prior_payload = _hydrate_payload(
+                    connection, prior["payload_json"], "hourly", start
+                )
                 eligible_prior = _eligible_temperature_repair(
                     prior_payload.get("temperatures", {}), start, end,
                 )
@@ -525,8 +794,9 @@ class EnergyDatabase:
                         "temperature_reprocessing",
                         prior_payload["provenance"]["temperature_reprocessing"],
                     )
-            serialized = _canonical_json(payload_data)
-            checksum = _checksum(serialized)
+            logical_payload = _canonical_json(payload_data)
+            serialized = _core_payload(payload_data)
+            checksum = _checksum(logical_payload)
             if prior and prior["checksum"] == checksum:
                 return False
             connection.execute(
@@ -537,6 +807,9 @@ class EnergyDatabase:
                 quality=excluded.quality,updated_at=excluded.updated_at""",
                 (start, end, payload_data["local_date"], payload_data["timezone"], serialized,
                  checksum, payload_data.get("quality", "missing"), now),
+            )
+            _store_normalized_temperatures(
+                connection, "hourly", start, payload_data.get("temperatures", {})
             )
         return True
 
@@ -556,7 +829,9 @@ class EnergyDatabase:
                     ).fetchone()
                     if row is None:
                         return False
-                    payload = json.loads(row["payload_json"])
+                    payload = _hydrate_payload(
+                        connection, row["payload_json"], "daily", local_date
+                    )
                     eligible = _eligible_temperature_repair(
                         temperatures, payload.get("period_start_utc"),
                         payload.get("period_end_utc"),
@@ -574,8 +849,9 @@ class EnergyDatabase:
                     payload.setdefault("provenance", {})["temperature_reprocessing"] = {
                         **(provenance or {}), "source_ids": changed_sources,
                     }
-                    serialized = _canonical_json(payload)
-                    checksum = _checksum(serialized)
+                    logical_payload = _canonical_json(payload)
+                    serialized = _core_payload(payload)
+                    checksum = _checksum(logical_payload)
                     now = datetime.now(UTC).isoformat()
                     revision = int(row["revision"]) + 1
                     updated = connection.execute(
@@ -585,6 +861,9 @@ class EnergyDatabase:
                     )
                     if updated.rowcount != 1:
                         raise sqlite3.OperationalError("daily record changed during repair")
+                    _store_normalized_temperatures(
+                        connection, "daily", local_date, payload.get("temperatures", {})
+                    )
                     connection.execute(
                         """INSERT INTO revisions
                         (local_date,revision,prior_checksum,new_checksum,reason,created_at)
@@ -592,20 +871,15 @@ class EnergyDatabase:
                         (local_date, revision, row["checksum"], checksum,
                          "temperature_history_repair", now),
                     )
-                    temperature_reasons = (
-                        "invalid_sentinel", "out_of_range", "temporal_spike",
-                        "contaminated_statistics_bounds", "invalid_statistics_bounds",
-                        "incompatible_temperature_unit", "non_numeric",
-                    )
                     for source_id in changed_sources:
                         reason_clauses = " OR ".join(
-                            "reason LIKE ?" for _ in temperature_reasons
+                            "reason LIKE ?" for _ in _TEMPERATURE_REJECTION_REASONS
                         )
                         connection.execute(
                             f"""DELETE FROM rejected_readings WHERE local_date=? AND entity_key=?
-                            AND (source IS NOT NULL OR {reason_clauses})""",
+                            AND ({reason_clauses})""",
                             (local_date, source_id,
-                             *(f"{reason}%" for reason in temperature_reasons)),
+                             *(f"{reason}%" for reason in _TEMPERATURE_REJECTION_REASONS)),
                         )
                         inserted_rejections: set[tuple[Any, ...]] = set()
                         for rejection in (merged[source_id].get("rejections") or []):
@@ -647,7 +921,9 @@ class EnergyDatabase:
                     ).fetchone()
                     if row is None:
                         return False
-                    payload = json.loads(row["payload_json"])
+                    payload = _hydrate_payload(
+                        connection, row["payload_json"], "hourly", start.isoformat()
+                    )
                     eligible = _eligible_temperature_repair(
                         temperatures, payload.get("period_start_utc"),
                         payload.get("period_end_utc"),
@@ -665,8 +941,9 @@ class EnergyDatabase:
                     payload.setdefault("provenance", {})["temperature_reprocessing"] = {
                         **(provenance or {}), "source_ids": changed_sources,
                     }
-                    serialized = _canonical_json(payload)
-                    checksum = _checksum(serialized)
+                    logical_payload = _canonical_json(payload)
+                    serialized = _core_payload(payload)
+                    checksum = _checksum(logical_payload)
                     updated = connection.execute(
                         """UPDATE hourly_records SET payload_json=?,checksum=?,updated_at=?
                         WHERE interval_start_utc=? AND interval_end_utc=? AND checksum=?""",
@@ -675,6 +952,10 @@ class EnergyDatabase:
                     )
                     if updated.rowcount != 1:
                         raise sqlite3.OperationalError("hourly record changed during repair")
+                    _store_normalized_temperatures(
+                        connection, "hourly", start.isoformat(),
+                        payload.get("temperatures", {}),
+                    )
                 return True
             except sqlite3.OperationalError as error:
                 if attempt == 2 or "locked" not in str(error).lower():
@@ -686,15 +967,18 @@ class EnergyDatabase:
         """Load only intervals overlapping a bounded UTC range."""
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT payload_json,updated_at FROM hourly_records
+                """SELECT interval_start_utc,payload_json,updated_at FROM hourly_records
                 WHERE interval_start_utc>=? AND interval_end_utc<=?
                 ORDER BY interval_start_utc""", (start.isoformat(), end.isoformat()),
             ).fetchall()
-        result = []
-        for row in rows:
-            item = json.loads(row["payload_json"])
-            item["updated_at"] = row["updated_at"]
-            result.append(item)
+            result = []
+            for row in rows:
+                item = _hydrate_payload(
+                    connection, row["payload_json"], "hourly",
+                    row["interval_start_utc"],
+                )
+                item["updated_at"] = row["updated_at"]
+                result.append(item)
         return result
 
     def hourly_exists(self, start: datetime, end: datetime) -> bool:
@@ -733,10 +1017,12 @@ class EnergyDatabase:
                 "SELECT payload_json,revision,updated_at FROM daily_records WHERE local_date=?",
                 (local_date,),
             ).fetchone()
-        if row is None:
-            return None
-        item = json.loads(row["payload_json"])
-        item.update(revision=row["revision"], updated_at=row["updated_at"])
+            if row is None:
+                return None
+            item = _hydrate_payload(
+                connection, row["payload_json"], "daily", local_date
+            )
+            item.update(revision=row["revision"], updated_at=row["updated_at"])
         return item
 
     def daily_bounds(self) -> tuple[str | None, str | None]:

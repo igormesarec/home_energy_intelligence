@@ -172,6 +172,8 @@ class HomeEnergyCoordinator:
         changed_daily = changed_hourly = processed_days = 0
         sources_inspected = skipped_complete = sources_with_history = 0
         missing_recorder_data = 0
+        recorder_query_count = influx_query_count = 0
+        peak_normalized_samples_per_day = 0
         errors: list[dict[str, str]] = []
         configured = {item.source_id: item for item in self._temperature_sources()}
 
@@ -219,6 +221,13 @@ class HomeEnergyCoordinator:
                         continue
                     sources_inspected += len(needed)
                     source = await self._async_collect_temperatures(start, end, needed)
+                    metrics = source.provenance.get("collection_metrics", {})
+                    recorder_query_count += int(metrics.get("recorder_query_count", 0))
+                    influx_query_count += int(metrics.get("influx_query_count", 0))
+                    peak_normalized_samples_per_day = max(
+                        peak_normalized_samples_per_day,
+                        int(metrics.get("normalized_samples", 0)),
+                    )
                     if source.provenance.get("query_errors"):
                         errors.extend({
                             "date": day.isoformat(), **error,
@@ -278,6 +287,9 @@ class HomeEnergyCoordinator:
             "sources_skipped_complete": skipped_complete,
             "sources_with_available_history": sources_with_history,
             "missing_recorder_data": missing_recorder_data,
+            "recorder_query_count": recorder_query_count,
+            "influx_query_count": influx_query_count,
+            "peak_normalized_samples_per_day": peak_normalized_samples_per_day,
             "error_count": len(errors),
             "errors": errors,
             "elapsed_seconds": round(monotonic() - started, 3),
@@ -452,6 +464,7 @@ class HomeEnergyCoordinator:
             "bounded_days": (end_date - start_date).days + 1,
             "expected_hourly_intervals": len(expected_hours),
             "query_errors": source.provenance.get("query_errors", []),
+            "collection_metrics": source.provenance.get("collection_metrics", {}),
             "configuration_status": "configured" if configured else "not_configured",
             "representative_sources": {
                 "indoor": self.config.get("representative_indoor_source_id"),
@@ -702,6 +715,18 @@ class HomeEnergyCoordinator:
             "long_term_statistics_fallback": True,
             "influx_backfill_keys": used_influx,
             "query_errors": query_errors,
+            "collection_metrics": {
+                "requested_source_count": len(sources),
+                "requested_entity_count": len(entity_ids),
+                "recorder_query_count": int(bool(entity_ids))
+                + int(bool(statistic_entities)),
+                "influx_query_count": len(used_influx),
+                "history_rows": sum(len(rows) for rows in history.values()),
+                "statistics_rows": sum(len(rows) for rows in statistics.values()),
+                "normalized_samples": sum(
+                    int(item["normalized_samples"]) for item in collection.values()
+                ),
+            },
             "temperature_collection": collection,
         }, temperature_quality=quality, temperature_roles=roles)
 

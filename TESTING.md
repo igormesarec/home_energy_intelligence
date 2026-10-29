@@ -60,6 +60,9 @@ Covered acceptance cases include:
 - Atomic temperature repair rejects mismatched UTC intervals/entity provenance and quality downgrades, preserves allocations/unrelated rejection audits, keeps checksums valid, is idempotent and rolls back payload/revision changes on a simulated write failure.
 - The lean temperature collector's Recorder entity sets exclude HVAC energy/power/mode, PV and grid sources; a successful retry performs one bounded history and one statistics query per queried day, while a complete source performs zero queries.
 - Energy Split frontend contracts preserve unavailable category nulls and label them unavailable rather than converting them to confirmed zero segments.
+- Read-time quality recomputation: stored-partial plus complete repaired required layers becomes good; missing representative outdoor evidence remains partial; legacy unknown classification coverage remains unknown; optional unrelated sources do not erase complete meter evidence.
+- Schema V4 migration preserves hydrated daily values, revision history and rejection audits, is idempotent on reopen, rolls back on an injected trigger failure without a version bump, and keeps an approximately 1 MB temperature-audit payload below 2× logical size after compaction.
+- Temperature-only repair benchmarks exercise 2 and 31 inclusive local days, assert exactly two bounded Recorder calls per queried day, zero non-temperature entities/Influx calls, bounded peak normalized samples and a 64 MiB runtime allocation ceiling in the HA test harness.
 
 ## Responsive layout evidence
 

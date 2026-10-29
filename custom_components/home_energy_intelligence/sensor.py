@@ -6,6 +6,11 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import UnitOfEnergy
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
+from .analytics import derive_record_quality
+from .configuration import (
+    equipment_from_config, equipment_temperature_mappings, temperatures_from_config,
+)
+
 
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[entry.domain][entry.entry_id]
@@ -29,6 +34,32 @@ class _BaseSensor(SensorEntity):
 
     async def async_update(self) -> None:
         self.record = await self.hass.async_add_executor_job(self.coordinator.database.latest)
+        if self.record:
+            equipment_ids = [
+                item.equipment_id for item in equipment_from_config(self.coordinator.config)
+                if item.enabled
+            ]
+            explicit = temperatures_from_config(self.coordinator.config)
+            seen = {(item.entity_id, item.role) for item in explicit}
+            generated = [
+                item for item in equipment_temperature_mappings(
+                    equipment_from_config(self.coordinator.config)
+                ) if (item.entity_id, item.role) not in seen
+            ]
+            sources = {item.source_id: item for item in [*explicit, *generated]}
+            representative_ids = [
+                source_id for role, source_id in (
+                    ("indoor", self.coordinator.config.get("representative_indoor_source_id")),
+                    ("outdoor", self.coordinator.config.get("representative_outdoor_source_id")),
+                )
+                if source_id and source_id in sources and sources[source_id].enabled
+                and sources[source_id].role == role
+            ]
+            self.record = derive_record_quality(
+                self.record, equipment_ids=equipment_ids,
+                temperature_source_ids=representative_ids,
+                timezone=self.coordinator.timezone,
+            )
 
 
 class LatestDailyEnergySensor(_BaseSensor):

@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import importlib.util
 import json
+import tracemalloc
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -555,3 +556,67 @@ async def test_current_day_snapshot_uses_completed_hourly_rows_without_daily_wri
     assert cutoff == datetime(2026, 1, 1, tzinfo=UTC)
     assert local_day.isoformat() == "2026-01-01"
     assert database.daily_writes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day_count", [2, 31])
+async def test_temperature_repair_query_and_memory_bounds_scale_by_day(
+    hass, tmp_path, day_count,
+):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+    from custom_components.home_energy_intelligence.models import DailyRecord
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+
+    database = EnergyDatabase(tmp_path / f"repair-{day_count}.sqlite3")
+    database.initialize()
+    first = date(2026, 9, 25)
+    for offset in range(day_count):
+        day = first + timedelta(days=offset)
+        start, end = local_day_bounds(day, hass.config.time_zone)
+        database.upsert_daily(DailyRecord(
+            day.isoformat(), hass.config.time_zone, start.isoformat(), end.isoformat(),
+            int((end - start).total_seconds()), 1.0, None, None, None, None,
+            "partial", temperatures={}, allocations={},
+        ))
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.outdoor", "enabled": True,
+        }]),
+    }, options={})
+    hass.states.async_set("sensor.outdoor", "5", {
+        "device_class": "temperature", "unit_of_measurement": "°C",
+    })
+
+    async def history(entity_ids, start, end):
+        assert entity_ids == ["sensor.outdoor"]
+        return {"sensor.outdoor": [
+            SimpleNamespace(last_updated=start, state="5", attributes={
+                "unit_of_measurement": "°C",
+            }),
+            SimpleNamespace(last_updated=end, state="6", attributes={
+                "unit_of_measurement": "°C",
+            }),
+        ]}
+
+    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(side_effect=history),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    tracemalloc.start()
+    result = await coordinator.async_reprocess_temperature_history(
+        first, first + timedelta(days=day_count - 1)
+    )
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert result["processed_days"] == day_count
+    assert result["changed_daily_records"] == day_count
+    assert result["recorder_query_count"] == day_count * 2
+    assert result["influx_query_count"] == 0
+    assert result["peak_normalized_samples_per_day"] == 2
+    assert coordinator.reader.async_history.await_count == day_count
+    assert coordinator.reader.async_statistics.await_count == day_count
+    assert peak < 64 * 1024 * 1024

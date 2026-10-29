@@ -31,6 +31,7 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - `poor`: less than half of the period classified.
 - `missing`: no defensible value.
 - `unreconciled`: derived totals contradict source totals.
+- `unknown`: legacy evidence exists, but its coverage metadata is insufficient to prove completeness.
 
 ## Coverage layers
 
@@ -41,6 +42,15 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - **Temperature coverage** is valid elapsed duration for each source independently. A representative card with no explicit selection says **Not configured** and never reports 100%.
 
 These layers are intentionally independent. A complete household meter can remain complete when an indoor sensor is missing, while a partial HVAC classifier keeps its meter total and raw residual evidence without promoting missing categories to confirmed zero.
+
+Public daily/period quality is recalculated from these layers on every read; the
+old stored row label is retained only as `stored_quality` provenance. Required
+temperature quality includes only the explicitly selected, enabled,
+role-compatible representative indoor/outdoor sources. Optional equipment or
+temperature mappings cannot silently downgrade unrelated meter evidence. A
+temperature-only repair can therefore turn a formerly stored `partial` label
+into derived `good` when date, household meter, every enabled-device allocation
+and every selected representative source are all demonstrably complete.
 
 Canonical electricity quality uses meter, classification and reconciliation
 evidence only. Overall record quality may still be partial because a temperature

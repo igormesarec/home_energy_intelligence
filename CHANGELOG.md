@@ -2,6 +2,11 @@
 
 ## V0.1.1 — draft
 
+- Replaced legacy stored row-quality trust with one read-time derivation shared by History, Overview completed days, sensors and CSV; date, household meter, equipment allocation and selected representative-temperature layers remain independently inspectable, while the old label is provenance only.
+- Added explicit `unknown` quality for legacy classification rows whose elapsed coverage cannot be proven, and allowed a fully evidenced temperature repair to promote derived period quality without rebuilding energy.
+- Added SQLite schema V4 normalization for temperature summaries and rejection audits, including atomic forward migration, injected-failure rollback, idempotent reopen and an approximately 1 MB storage-amplification bound.
+- Added repair query/sample metrics and 2-/31-day bounded HA runtime benchmarks; the collector remains temperature-only and skips complete sources before Recorder reads.
+- Exposed each derived quality layer and the disclosed electrical-response admission thresholds in the dashboard without adding thermal/COP/forecast claims.
 - Made the backend `heating_response_profile()` the single qualification source for both Overview and House Thermal Profile; the frontend no longer derives a second point set from History rows.
 - Replaced temperature repair's read/rebuild/generic-upsert sequence with interval-checked `BEGIN IMMEDIATE` merges that update only temperature payload evidence, checksum/revision metadata and affected-source rejection audits.
 - Added a temperature-only bounded Recorder collector. It never requests equipment energy, power, modes, PV or grid entities; complete sources are skipped before any Recorder query, repairs are serialized and startup failures cannot block hourly/checkpoint/daily recovery.

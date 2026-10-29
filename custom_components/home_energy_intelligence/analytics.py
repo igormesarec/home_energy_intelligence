@@ -722,9 +722,17 @@ def combine_interval_records(
 
 def daily_coverage(
     records: list[dict[str, Any]], start_date: str, end_date: str,
-    *, equipment_ids: Iterable[str] = (), timezone: str | None = None,
+    *, equipment_ids: Iterable[str] = (), temperature_source_ids: Iterable[str] = (),
+    timezone: str | None = None,
 ) -> dict[str, Any]:
-    """Return explicit complete/missing daily coverage for a local-date range."""
+    """Derive independent quality layers for a local-date range.
+
+    The persisted ``quality`` column is deliberately not authoritative here.
+    Older rows may predate a repair that added valid temperature evidence, or
+    may have been labelled partial because an unrelated optional sensor was
+    absent.  Public quality is therefore rebuilt from present-day evidence;
+    the legacy label is returned only as provenance.
+    """
     start = datetime.fromisoformat(start_date).date()
     end = datetime.fromisoformat(end_date).date()
     expected: list[str] = []
@@ -735,16 +743,10 @@ def daily_coverage(
     by_date = {str(item.get("local_date")): item for item in records}
     present = set(by_date)
     missing = [day for day in expected if day not in present]
-    incomplete_quality = [
-        day for day, item in by_date.items()
-        if item.get("quality", "missing") in {
-            "partial", "poor", "missing", "unreconciled", "missing_counter",
-        }
-    ]
-    uncertain_quality = [
-        day for day, item in by_date.items()
-        if item.get("quality") in {"uncertain", "filtered", "estimated"}
-    ]
+    stored_quality = {
+        day: str(item.get("stored_quality", item.get("quality", "unknown")))
+        for day, item in by_date.items()
+    }
     temporal_partial = [
         day for day, item in by_date.items()
         if item.get("partial") is True or item.get("finalized") is False
@@ -889,28 +891,111 @@ def daily_coverage(
              ("good" if not allocation_missing and not allocation_partial else "partial"))
         ),
     }
+    required_temperature_sources = tuple(dict.fromkeys(
+        str(source_id) for source_id in temperature_source_ids if source_id
+    ))
+    temperature_layers: dict[str, dict[str, Any]] = {}
+    for source_id in required_temperature_sources:
+        valid_seconds = 0.0
+        rejected_count = 0
+        source_missing_dates: list[str] = []
+        source_partial_dates: list[str] = []
+        source_filtered_dates: list[str] = []
+        for day in expected:
+            summary = (by_date.get(day, {}).get("temperatures") or {}).get(source_id)
+            if not isinstance(summary, dict) or _number(summary.get("mean")) is None:
+                source_missing_dates.append(day)
+                continue
+            day_expected = expected_seconds(day)
+            covered = max(0.0, min(
+                day_expected, float(summary.get("coverage_seconds", 0) or 0)
+            ))
+            valid_seconds += covered
+            rejected_count += int(summary.get("rejected_count", 0) or 0)
+            percent = 100 * covered / day_expected if day_expected else 0.0
+            if percent < 95 or summary.get("quality") in {
+                "missing", "poor", "rejected", "unreconciled",
+            }:
+                source_partial_dates.append(day)
+            elif summary.get("quality") == "filtered" or int(
+                summary.get("rejected_count", 0) or 0
+            ):
+                source_filtered_dates.append(day)
+        source_expected_seconds = sum(expected_seconds(day) for day in expected)
+        percent = (
+            100 * valid_seconds / source_expected_seconds
+            if source_expected_seconds else None
+        )
+        complete = bool(
+            source_expected_seconds and not source_missing_dates
+            and not source_partial_dates and percent is not None and percent >= 95
+        )
+        quality = (
+            "missing" if not valid_seconds else
+            ("partial" if not complete else
+             ("filtered" if source_filtered_dates else "good"))
+        )
+        temperature_layers[source_id] = {
+            "valid_seconds": valid_seconds,
+            "expected_seconds": source_expected_seconds,
+            "coverage_percent": percent,
+            "missing_dates": source_missing_dates,
+            "partial_dates": source_partial_dates,
+            "filtered_dates": source_filtered_dates,
+            "rejected_count": rejected_count,
+            "complete": complete,
+            "quality": quality,
+        }
+
+    date_complete = bool(date_layer["complete"])
+    household_complete = bool(meter_fields["household_kwh"]["complete"])
+    allocation_complete = bool(allocation_layer["complete"])
+    temperature_complete = all(
+        item["complete"] for item in temperature_layers.values()
+    ) if temperature_layers else True
+    quality_unknown = bool(
+        configured_equipment and allocation_layer["unknown_coverage_equipment"]
+    )
+    required_layers_complete = (
+        date_complete and household_complete and allocation_complete
+        and temperature_complete
+    )
+    uncertain = bool(allocation_layer["uncertain_dates"])
+    derived_quality = (
+        "missing" if len(missing) == len(expected) and expected else
+        ("unknown" if quality_unknown else
+         ("partial" if not required_layers_complete else
+          ("uncertain" if uncertain else "good")))
+    )
+    derived_incomplete_dates = sorted(set(
+        missing + temporal_partial + meter_fields["household_kwh"]["unavailable_dates"]
+        + allocation_missing + allocation_partial
+        + [day for item in temperature_layers.values()
+           for day in item["missing_dates"] + item["partial_dates"]]
+    ))
     return {
         "expected_days": len(expected), "present_days": len(expected) - len(missing),
-        "missing_dates": missing, "poor_quality_dates": incomplete_quality,
-        "uncertain_quality_dates": uncertain_quality,
+        "missing_dates": missing, "poor_quality_dates": derived_incomplete_dates,
+        "uncertain_quality_dates": sorted(set(allocation_uncertain)),
         "partial_dates": temporal_partial,
         "coverage_percent": date_layer["coverage_percent"],
         "date_coverage": date_layer,
         "meter_coverage": {"fields": meter_fields, **meter_fields["household_kwh"]},
         "allocation_coverage": allocation_layer,
-        "temperature_coverage": {},
-        "complete": not missing and not incomplete_quality and not temporal_partial,
-        "quality": (
-            "missing" if len(missing) == len(expected) and expected
-            else ("partial" if missing or incomplete_quality or temporal_partial
-                  else ("uncertain" if uncertain_quality else "good"))
-        ),
+        "temperature_coverage": temperature_layers,
+        "energy_complete": date_complete and household_complete and allocation_complete,
+        "temperature_complete": temperature_complete,
+        "complete": required_layers_complete,
+        "quality": derived_quality,
+        "quality_basis": "derived_from_independent_coverage_layers_v1",
+        "stored_quality_provenance": stored_quality,
     }
 
 
 def combine_daily_records(
     records: list[dict[str, Any]], start_date: str, end_date: str,
     *, temperature_source_ids: Iterable[str] = (), equipment_ids: Iterable[str] = (),
+    required_temperature_source_ids: Iterable[str] | None = None,
     timezone: str | None = None,
 ) -> dict[str, Any] | None:
     """Combine the full requested daily range with explicit missing dates."""
@@ -920,7 +1005,12 @@ def combine_daily_records(
     assert combined is not None
     coverage = daily_coverage(
         records, start_date, end_date,
-        equipment_ids=equipment_ids, timezone=timezone,
+        equipment_ids=equipment_ids,
+        temperature_source_ids=(
+            temperature_source_ids if required_temperature_source_ids is None
+            else required_temperature_source_ids
+        ),
+        timezone=timezone,
     )
     combined["period_coverage"] = coverage
     meter_fields = coverage["meter_coverage"]["fields"]
@@ -962,20 +1052,47 @@ def combine_daily_records(
             else ("good" if valid_seconds >= expected_seconds and item.get("quality") == "good"
                   else "partial")
         )
-        coverage["temperature_coverage"][source_id] = {
+        source_coverage = {
             "valid_seconds": valid_seconds, "expected_seconds": expected_seconds,
             "coverage_percent": item["coverage_percent"],
             "complete": bool(expected_seconds and valid_seconds >= expected_seconds
                              and item["quality"] == "good"),
             "quality": item["quality"],
         }
-    if coverage["temperature_coverage"] and not all(
-        item["complete"] for item in coverage["temperature_coverage"].values()
-    ):
-        coverage["complete"] = False
-        coverage["quality"] = "partial"
+        if source_id not in coverage["temperature_coverage"]:
+            coverage.setdefault("optional_temperature_coverage", {})[source_id] = source_coverage
+    combined["stored_quality"] = combined.get("quality")
     combined["quality"] = coverage["quality"]
+    combined["quality_layers"] = {
+        key: coverage[key] for key in (
+            "date_coverage", "meter_coverage", "allocation_coverage",
+            "temperature_coverage",
+        )
+    }
     return combined
+
+
+def derive_record_quality(
+    record: dict[str, Any], *, equipment_ids: Iterable[str] = (),
+    temperature_source_ids: Iterable[str] = (), timezone: str | None = None,
+) -> dict[str, Any]:
+    """Return one record with read-time, evidence-derived quality metadata."""
+    local_date = str(record["local_date"])
+    coverage = daily_coverage(
+        [record], local_date, local_date, equipment_ids=equipment_ids,
+        temperature_source_ids=temperature_source_ids, timezone=timezone,
+    )
+    result = dict(record)
+    result["stored_quality"] = record.get("stored_quality", record.get("quality"))
+    result["quality"] = coverage["quality"]
+    result["quality_layers"] = {
+        key: coverage[key] for key in (
+            "date_coverage", "meter_coverage", "allocation_coverage",
+            "temperature_coverage",
+        )
+    }
+    result["quality_basis"] = coverage["quality_basis"]
+    return result
 
 
 def replace_with_partial_day(

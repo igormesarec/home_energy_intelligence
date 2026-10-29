@@ -16,7 +16,7 @@ from .configuration import (
 )
 from .analytics import (
     attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
-    heating_response_profile,
+    derive_record_quality, heating_response_profile,
     interval_coverage, replace_with_partial_day,
 )
 from .const import DOMAIN
@@ -57,6 +57,20 @@ def _temperatures(coordinator):
         if (item.entity_id, item.role) not in seen
     ]
     return explicit + generated
+
+
+def _representative_temperature_source_ids(coordinator) -> list[str]:
+    """Return only enabled, role-compatible sources that affect overall quality."""
+    configured = {
+        "indoor": coordinator.config.get("representative_indoor_source_id"),
+        "outdoor": coordinator.config.get("representative_outdoor_source_id"),
+    }
+    sources = {item.source_id: item for item in _temperatures(coordinator)}
+    return [
+        source_id for role, source_id in configured.items()
+        if source_id and source_id in sources and sources[source_id].enabled
+        and sources[source_id].role == role
+    ]
 
 
 async def _current_day_snapshot(
@@ -108,6 +122,14 @@ async def ws_overview(hass, connection, msg):
     yesterday_full = await hass.async_add_executor_job(
         coordinator.database.daily, yesterday.isoformat()
     )
+    required_temperature_ids = _representative_temperature_source_ids(coordinator)
+    if yesterday_full:
+        yesterday_full = derive_record_quality(
+            yesterday_full,
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
+        )
     latest_hour_end = today_hours[-1]["period_end_utc"] if today_hours else None
     temperatures = [
         {
@@ -274,15 +296,19 @@ async def ws_history(hass, connection, msg):
         )
         total = len(records)
     temperature_source_ids = [item.source_id for item in _temperatures(coordinator) if item.enabled]
+    required_temperature_ids = _representative_temperature_source_ids(coordinator)
     if start_date and end_date:
         combined = combine_daily_records(
             period_records, start_date, end_date,
             temperature_source_ids=temperature_source_ids,
+            required_temperature_source_ids=required_temperature_ids,
             equipment_ids=equipment_ids, timezone=coordinator.timezone,
         )
         selected_coverage = daily_coverage(
             period_records, start_date, end_date,
-            equipment_ids=equipment_ids, timezone=coordinator.timezone,
+            equipment_ids=equipment_ids,
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
         )
         if combined:
             selected_coverage = combined["period_coverage"]
@@ -292,6 +318,7 @@ async def ws_history(hass, connection, msg):
         combined = combine_daily_records(
             records, min(page_dates), max(page_dates),
             temperature_source_ids=temperature_source_ids,
+            required_temperature_source_ids=required_temperature_ids,
             equipment_ids=equipment_ids, timezone=coordinator.timezone,
         )
         selected_coverage = combined["period_coverage"] if combined else None
@@ -319,7 +346,11 @@ async def ws_history(hass, connection, msg):
         )),
     )
     connection.send_result(msg["id"], {
-        "records": [attach_canonical(record, equipment) for record in records],
+        "records": [attach_canonical(derive_record_quality(
+            record, equipment_ids=equipment_ids,
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
+        ), equipment) for record in records],
         "summary": attach_canonical(combined, equipment) if combined else None,
         "total": total, "offset": msg["offset"], "limit": msg["limit"],
         "summary_record_count": len(period_records),
@@ -453,10 +484,17 @@ async def ws_csv(hass, connection, msg):
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for record in reversed(records):
+        record = derive_record_quality(
+            record,
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=_representative_temperature_source_ids(coordinator),
+            timezone=coordinator.timezone,
+        )
         energy = attach_canonical(record, equipment)["energy"] or {}
         row_coverage = daily_coverage(
             [record], record["local_date"], record["local_date"],
             equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=_representative_temperature_source_ids(coordinator),
             timezone=coordinator.timezone,
         )
         allocation_coverage = row_coverage["allocation_coverage"]

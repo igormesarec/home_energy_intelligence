@@ -249,7 +249,9 @@ def test_period_quality_layers_do_not_invalidate_unrelated_meter_totals():
         "covered_seconds": 86400, "period_seconds": 86400,
     })
     coverage = daily_coverage([record], "2026-01-01", "2026-01-01")
-    assert coverage["complete"] is False
+    assert coverage["complete"] is True
+    assert coverage["quality"] == "good"
+    assert coverage["stored_quality_provenance"] == {"2026-01-01": "partial"}
     assert coverage["date_coverage"]["complete"] is True
     assert coverage["meter_coverage"]["complete"] is True
     assert coverage["allocation_coverage"]["complete"] is True
@@ -258,6 +260,75 @@ def test_period_quality_layers_do_not_invalidate_unrelated_meter_totals():
     assert energy["household_kwh"] == 2
     assert energy["space_heating_kwh"] == 2
     assert energy["quality"] == "good"
+
+
+def test_repaired_representative_temperature_recomputes_overall_quality():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "quality": "partial", "day_seconds": 86400})
+    record["allocations"]["hp-a"].update({
+        "covered_seconds": 86400, "period_seconds": 86400,
+    })
+    missing = daily_coverage(
+        [record], "2026-01-01", "2026-01-01", equipment_ids=["hp-a"],
+        temperature_source_ids=["outdoor"], timezone="UTC",
+    )
+    assert missing["energy_complete"] is True
+    assert missing["temperature_complete"] is False
+    assert missing["temperature_coverage"]["outdoor"]["quality"] == "missing"
+    assert missing["quality"] == "partial"
+
+    record["temperatures"] = {"outdoor": {
+        "mean": 5.0, "minimum": 2.0, "maximum": 7.0,
+        "coverage_seconds": 86400, "period_seconds": 86400,
+        "coverage_percent": 100, "quality": "good",
+    }}
+    repaired = daily_coverage(
+        [record], "2026-01-01", "2026-01-01", equipment_ids=["hp-a"],
+        temperature_source_ids=["outdoor"], timezone="UTC",
+    )
+    assert repaired["quality"] == "good"
+    assert repaired["complete"] is True
+    assert repaired["stored_quality_provenance"]["2026-01-01"] == "partial"
+
+
+def test_legacy_unknown_classification_is_unknown_not_good_or_missing():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "day_seconds": 86400})
+    for key in ("covered_seconds", "period_seconds", "coverage_percent"):
+        record["allocations"]["hp-a"].pop(key, None)
+    coverage = daily_coverage(
+        [record], "2026-01-01", "2026-01-01",
+        equipment_ids=["hp-a"], timezone="UTC",
+    )
+    assert coverage["quality"] == "unknown"
+    assert coverage["allocation_coverage"]["coverage_known"] is False
+    assert coverage["complete"] is False
+
+
+def test_optional_temperature_source_does_not_downgrade_required_quality():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 2)
+    record.update({"local_date": "2026-01-01", "day_seconds": 86400})
+    record["allocations"]["hp-a"].update({
+        "covered_seconds": 86400, "period_seconds": 86400,
+    })
+    record["temperatures"] = {"outdoor": {
+        "mean": 5.0, "minimum": 2.0, "maximum": 7.0,
+        "coverage_seconds": 86400, "period_seconds": 86400,
+        "coverage_percent": 100, "quality": "good",
+    }}
+    combined = combine_daily_records(
+        [record], "2026-01-01", "2026-01-01",
+        temperature_source_ids=["outdoor", "optional-room"],
+        required_temperature_source_ids=["outdoor"],
+        equipment_ids=["hp-a"], timezone="UTC",
+    )
+    assert combined["period_coverage"]["quality"] == "good"
+    assert combined["period_coverage"]["temperature_coverage"]["outdoor"][
+        "complete"
+    ] is True
+    assert combined["period_coverage"]["optional_temperature_coverage"][
+        "optional-room"
+    ]["quality"] == "missing"
 
 
 def test_uncertain_but_fully_classified_allocation_is_complete_with_uncertainty():

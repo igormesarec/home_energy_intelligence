@@ -198,3 +198,17 @@ def test_overview_and_thermal_use_the_same_backend_response_points():
     assert 'status==="validated"' in scatter
     assert "exclusion_reasons" in scatter
     assert "responseProfileData" in thermal
+
+
+def test_quality_ui_exposes_independent_derived_layers_and_legacy_provenance():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    analytics = (INTEGRATION / "analytics.py").read_text(encoding="utf-8")
+    assert "Derived from independent coverage layers" in source
+    assert "stored legacy label" in source
+    assert 'layer("dates"' in source
+    assert 'layer("meter"' in source
+    assert 'layer("allocation"' in source
+    assert 'temperatureLayer("indoor")' in source
+    assert 'temperatureLayer("outdoor")' in source
+    assert "derived_from_independent_coverage_layers_v1" in analytics
+    assert "stored_quality_provenance" in analytics
