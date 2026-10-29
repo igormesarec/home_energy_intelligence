@@ -67,6 +67,12 @@ def canonical_energy(
         return temporal_complete and all(
             isinstance(allocations.get(str(item["equipment_id"])), dict)
             and _number(allocations[str(item["equipment_id"])].get("meter_kwh")) is not None
+            and (
+                _number(allocations[str(item["equipment_id"])].get("coverage_percent"))
+                in (None, 100.0)
+                or _number(allocations[str(item["equipment_id"])].get("coverage_percent"))
+                >= 99.999
+            )
             and allocations[str(item["equipment_id"])].get("quality")
             not in {"missing", "poor", "missing_counter", "unreconciled"}
             for item in items
@@ -142,6 +148,13 @@ def canonical_energy(
             residual = _number(allocation.get("residual_kwh"))
         residual_evidence += residual or 0.0
         device_complete = meter is not None
+        device_coverage = _number(allocation.get("coverage_percent"))
+        classification_complete = (
+            device_complete
+            and (device_coverage is None or device_coverage >= 99.999)
+            and allocation.get("quality")
+            not in {"missing", "poor", "missing_counter", "unreconciled"}
+        )
         breakdown.append({
             **item, "available": device_complete, "meter_kwh": meter,
             "known_confirmed_heating_kwh": confirmed,
@@ -154,24 +167,30 @@ def canonical_energy(
             "known_cooling_kwh": cooling + selected_cooling + estimated_cooling,
             "known_idle_kwh": idle,
             "known_other_hvac_kwh": other,
-            "confirmed_heating_kwh": confirmed if device_complete else None,
+            "classification_complete": classification_complete,
+            "confirmed_heating_kwh": confirmed if classification_complete else None,
             "assumed_heating_kwh": (
-                assumed if kind == "heat_pump" and device_complete else
-                (0.0 if kind != "heat_pump" and device_complete else None)
+                assumed if kind == "heat_pump" and classification_complete else
+                (0.0 if kind != "heat_pump" and classification_complete else None)
             ),
-            "selected_heating_kwh": selected if device_complete else None,
-            "estimated_heating_kwh": estimated if device_complete else None,
-            "dhw_kwh": dhw if device_complete else None,
-            "confirmed_cooling_kwh": cooling if device_complete else None,
-            "selected_cooling_kwh": selected_cooling if device_complete else None,
-            "estimated_cooling_kwh": estimated_cooling if device_complete else None,
+            "selected_heating_kwh": selected if classification_complete else None,
+            "estimated_heating_kwh": estimated if classification_complete else None,
+            "dhw_kwh": dhw if classification_complete else None,
+            "confirmed_cooling_kwh": cooling if classification_complete else None,
+            "selected_cooling_kwh": selected_cooling if classification_complete else None,
+            "estimated_cooling_kwh": estimated_cooling if classification_complete else None,
             "cooling_kwh": (
-                cooling + selected_cooling + estimated_cooling if device_complete else None
+                cooling + selected_cooling + estimated_cooling
+                if classification_complete else None
             ),
-            "idle_kwh": idle if device_complete else None,
-            "other_hvac_kwh": other if device_complete else None,
+            "idle_kwh": idle if classification_complete else None,
+            "other_hvac_kwh": other if classification_complete else None,
             "unknown_kwh": unknown, "residual_kwh": residual,
             "coverage_percent": allocation.get("coverage_percent"),
+            "covered_seconds": allocation.get("covered_seconds"),
+            "expected_seconds": allocation.get("expected_seconds"),
+            "classification_source": allocation.get("classification_source"),
+            "source": allocation.get("source"),
             "quality": allocation.get("quality", "missing"),
         })
 
@@ -243,6 +262,14 @@ def canonical_energy(
         None if household in (None, 0) or consumed_pv is None
         else 100 * consumed_pv / household
     )
+    calculated_household = (
+        None if consumed_pv is None or imported is None or imported < 0
+        else consumed_pv + imported
+    )
+    household_balance_discrepancy = (
+        None if household is None or calculated_household is None
+        else household - calculated_household
+    )
     return {
         **totals,
         "household_kwh": household,
@@ -251,6 +278,8 @@ def canonical_energy(
         "raw_residual_evidence_kwh": residual_evidence,
         "pv_kwh": pv, "import_kwh": imported, "export_kwh": exported,
         "pv_consumed_on_site_kwh": consumed_pv,
+        "calculated_household_kwh": calculated_household,
+        "household_balance_discrepancy_kwh": household_balance_discrepancy,
         "pv_self_consumption_percent": self_consumption,
         "self_sufficiency_percent": self_sufficiency,
         "quality": record.get("quality", "missing") if complete else "partial",
@@ -406,9 +435,26 @@ def combine_interval_records(
     if coverage is not None:
         temporal_complete = bool(coverage["complete"])
         meter_complete = temporal_complete and household is not None
+        allocation_expected = sum(
+            float(item.get("period_seconds", 0) or 0) for item in allocations.values()
+        )
+        allocation_covered = sum(
+            min(float(item.get("covered_seconds", 0) or 0),
+                float(item.get("period_seconds", 0) or 0))
+            for item in allocations.values()
+        )
+        allocation_processing_complete = bool(allocations) and all(
+            item.get("meter_kwh") is not None for item in allocations.values()
+        )
         allocation_complete = temporal_complete and bool(allocations) and all(
             allocation.get("meter_kwh") is not None
-            and allocation.get("quality") == "good"
+            and allocation.get("quality")
+            not in {"partial", "poor", "missing", "missing_counter", "unreconciled"}
+            and float(allocation.get("coverage_percent", 0) or 0) >= 99.999
+            for allocation in allocations.values()
+        )
+        allocation_uncertain = allocation_complete and any(
+            allocation.get("quality") in {"uncertain", "filtered"}
             for allocation in allocations.values()
         )
         coverage.update({
@@ -417,10 +463,21 @@ def combine_interval_records(
             "meter_coverage": {"complete": meter_complete,
                                "coverage_percent": coverage["coverage_percent"]
                                if household is not None else 0.0},
-            "allocation_coverage": {"complete": allocation_complete,
-                                    "coverage_percent": min(
-                                        (float(item.get("coverage_percent", 0) or 0)
-                                         for item in allocations.values()), default=0.0)},
+            "allocation_coverage": {
+                "complete": allocation_complete,
+                "processing_complete": allocation_processing_complete,
+                "classified_seconds": allocation_covered,
+                "expected_seconds": allocation_expected,
+                "coverage_percent": (
+                    100 * allocation_covered / allocation_expected
+                    if allocation_expected else None
+                ),
+                "quality": (
+                    "unavailable" if not allocation_expected else
+                    ("uncertain" if allocation_uncertain else
+                     ("good" if allocation_complete else "partial"))
+                ),
+            },
             "temperature_coverage": {
                 source_id: {
                     "complete": item.get("quality") == "good",
@@ -457,6 +514,7 @@ def combine_interval_records(
 
 def daily_coverage(
     records: list[dict[str, Any]], start_date: str, end_date: str,
+    *, equipment_ids: Iterable[str] = (), timezone: str | None = None,
 ) -> dict[str, Any]:
     """Return explicit complete/missing daily coverage for a local-date range."""
     start = datetime.fromisoformat(start_date).date()
@@ -477,30 +535,84 @@ def daily_coverage(
         if item.get("partial") is True or item.get("finalized") is False
     ]
 
+    zone_name = timezone or next(
+        (str(item.get("timezone")) for item in records if item.get("timezone")), "UTC"
+    )
+
+    def expected_seconds(day: str) -> float:
+        item = by_date.get(day)
+        if item and (item.get("partial") is True or item.get("finalized") is False):
+            return max(0.0, float(item.get("day_seconds", 0) or 0))
+        start_utc, end_utc = local_day_bounds(datetime.fromisoformat(day).date(), zone_name)
+        return (end_utc - start_utc).total_seconds()
+
     def field_coverage(field: str) -> dict[str, Any]:
         unavailable = [day for day in expected if _number(by_date.get(day, {}).get(field)) is None]
+        total_seconds = sum(expected_seconds(day) for day in expected)
+        available_seconds = sum(
+            expected_seconds(day) for day in expected if day not in unavailable
+        )
         return {
             "available_days": len(expected) - len(unavailable),
             "unavailable_dates": unavailable,
-            "coverage_percent": 100 * (len(expected) - len(unavailable)) / len(expected)
-            if expected else 100.0,
+            "available_seconds": available_seconds, "expected_seconds": total_seconds,
+            "coverage_percent": 100 * available_seconds / total_seconds
+            if total_seconds else None,
             "complete": not unavailable,
         }
 
+    configured_equipment = set(str(item) for item in equipment_ids)
+    if not configured_equipment:
+        configured_equipment = set().union(*(
+            set(item.get("allocations", {})) for item in records
+        )) if records else set()
     allocation_missing: list[str] = []
     allocation_partial: list[str] = []
+    allocation_uncertain: list[str] = []
+    allocation_missing_equipment: list[dict[str, str]] = []
+    allocation_expected_seconds = 0.0
+    allocation_classified_seconds = 0.0
     for day in expected:
         item = by_date.get(day)
         allocations = item.get("allocations") if item else None
+        day_seconds = expected_seconds(day)
+        allocation_expected_seconds += day_seconds * len(configured_equipment)
+        if not configured_equipment:
+            continue
         if not isinstance(allocations, dict) or not allocations:
             allocation_missing.append(day)
+            allocation_missing_equipment.extend(
+                {"date": day, "equipment_id": equipment_id}
+                for equipment_id in sorted(configured_equipment)
+            )
             continue
-        if any(
-            not isinstance(value, dict)
-            or _number(value.get("meter_kwh")) is None
-            or value.get("quality") != "good"
-            for value in allocations.values()
-        ):
+        day_partial = False
+        for equipment_id in configured_equipment:
+            value = allocations.get(equipment_id)
+            if not isinstance(value, dict):
+                allocation_missing_equipment.append({
+                    "date": day, "equipment_id": equipment_id,
+                })
+                day_partial = True
+                continue
+            period = float(value.get("period_seconds", day_seconds) or day_seconds)
+            covered_value = value.get("covered_seconds")
+            if covered_value is None and value.get("coverage_percent") is not None:
+                covered_value = period * float(value["coverage_percent"]) / 100
+            covered = min(float(covered_value or 0), period)
+            allocation_classified_seconds += covered
+            quality = value.get("quality")
+            if (
+                _number(value.get("meter_kwh")) is None
+                or covered + 1e-6 < period
+                or quality in {
+                    "partial", "poor", "missing", "missing_counter", "unreconciled",
+                }
+            ):
+                day_partial = True
+            elif quality in {"uncertain", "filtered"}:
+                allocation_uncertain.append(day)
+        if day_partial:
             allocation_partial.append(day)
     meter_fields = {
         field: field_coverage(field)
@@ -515,9 +627,22 @@ def daily_coverage(
     }
     allocation_layer = {
         "missing_dates": allocation_missing, "partial_dates": allocation_partial,
-        "coverage_percent": 100 * (len(expected) - len(set(allocation_missing + allocation_partial)))
-        / len(expected) if expected else 100.0,
-        "complete": not allocation_missing and not allocation_partial,
+        "uncertain_dates": sorted(set(allocation_uncertain)),
+        "missing_equipment": allocation_missing_equipment,
+        "classified_seconds": allocation_classified_seconds,
+        "expected_seconds": allocation_expected_seconds,
+        "coverage_percent": (
+            100 * allocation_classified_seconds / allocation_expected_seconds
+            if allocation_expected_seconds else None
+        ),
+        "processing_complete": bool(configured_equipment) and not allocation_missing_equipment,
+        "complete": bool(configured_equipment) and not allocation_missing and not allocation_partial,
+        "quality": (
+            "unavailable" if not configured_equipment else
+            ("uncertain" if not allocation_missing and not allocation_partial
+             and allocation_uncertain else
+             ("good" if not allocation_missing and not allocation_partial else "partial"))
+        ),
     }
     return {
         "expected_days": len(expected), "present_days": len(expected) - len(missing),
@@ -538,14 +663,18 @@ def daily_coverage(
 
 def combine_daily_records(
     records: list[dict[str, Any]], start_date: str, end_date: str,
-    *, temperature_source_ids: Iterable[str] = (),
+    *, temperature_source_ids: Iterable[str] = (), equipment_ids: Iterable[str] = (),
+    timezone: str | None = None,
 ) -> dict[str, Any] | None:
     """Combine the full requested daily range with explicit missing dates."""
     if not records:
         return None
     combined = combine_interval_records(records)
     assert combined is not None
-    coverage = daily_coverage(records, start_date, end_date)
+    coverage = daily_coverage(
+        records, start_date, end_date,
+        equipment_ids=equipment_ids, timezone=timezone,
+    )
     combined["period_coverage"] = coverage
     meter_fields = coverage["meter_coverage"]["fields"]
     for key in ("household_kwh", "pv_kwh", "import_kwh", "export_kwh"):

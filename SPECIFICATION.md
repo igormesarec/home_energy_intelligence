@@ -65,6 +65,9 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - History Today is an in-memory view of validated completed-hour rows at the same cutoff as Overview. It is explicitly partial and never inserted into finalized daily history.
 - Period quality is layered: date availability, meter coverage, allocation coverage and temperature coverage are reported independently. An unrelated temperature gap cannot invalidate a valid meter total.
 - Missing local dates contribute their full DST-aware duration to temperature coverage denominators; valid observations alone contribute to duration-weighted means and validated min/max.
+- Representative indoor and measured outdoor sources require explicit stable-source selections. The flow provides a current-value/unit/quality/timestamp preview; it never substitutes weather data or a water-circuit sensor, and an unconfigured source has unavailable rather than 100% coverage.
+- Allocation coverage is elapsed classified seconds across each enabled equipment ID. Meter availability, category-classification coverage and temperature coverage remain separate evidence layers.
+- Whole-house electrical heating response may combine complete heat-pump and AC space-heating allocations and normalize them by configured floor area. Thermal output, COP and design-day output require separately measured/configured thermal evidence and cannot be inferred from electricity.
 - Energy Split includes Other HVAC (including fan/dry), other household, unallocated energy and signed reconciliation discrepancy as distinct evidence.
 - Overview and History share one Home Assistant-timezone period selection. Heating-versus-outdoor analytics use only the explicitly selected representative outdoor source.
 - PV, grid and household analytics use measured counters and physically valid balances; unavailable sources never generate a zero or invented rate.

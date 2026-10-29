@@ -15,6 +15,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - PV, grid and household history uses measured, physically valid balances and reports self-sufficiency/self-consumption only when its required inputs are available.
 - Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
 - Period status reports date, meter, allocation and temperature coverage separately. Missing temperature dates reduce temperature coverage without invalidating otherwise valid electricity counters.
+- The House Thermal Profile tab provides an evidence-bound **electrical** space-heating response curve normalized by configured floor area. It combines dynamically configured heat-pump and AC heating only for complete daily classifications. Measured thermal output, COP, design-day output and annualization remain unavailable unless their required evidence and complete period exist.
 
 ## V0.1 foundation
 
@@ -43,8 +44,9 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 4. Add each heat pump and optional AC with a display name, electrical counter, power and operating-state entity. Map the installation's state strings to the documented categories.
    Energy counters must use the `energy` device class, Wh/kWh/MWh and `total` or `total_increasing`; power sources must use the `power` device class and W/kW.
 5. Add optional PV/grid, temperature and weather sources. Temperature sources accept °C or °F and each has its own physical limits, invalid sentinels, spike limit, point-sample freshness and missing-data thresholds.
-6. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
-7. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
+6. In **Data quality**, explicitly choose one representative indoor source and one representative measured outdoor-air source, or leave either as **Not configured**. Use **Test representative sources** to preview the current normalized value, unit validation, quality and last update before saving. A weather entity, supply-water sensor or return-water sensor is never silently selected as outdoor air.
+7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
+8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
@@ -79,7 +81,8 @@ See [testing](TESTING.md), [data quality](DATA_QUALITY.md), [schema](DATA_SCHEMA
 ## Scope
 
 - **V0.1:** validated electricity, temperature, source quality, and basic dashboard/history/settings.
-- **V0.2:** manually or natively sourced thermal energy, whole-house thermal response, and correctly weighted COP.
+- **V0.1.1:** whole-house electrical heating-response evidence; no thermal output is inferred.
+- **V0.2:** manually or natively sourced thermal energy, thermal response, and correctly weighted COP.
 - **V0.3:** weather sources and probabilistic forecasting.
 
 License: MIT.

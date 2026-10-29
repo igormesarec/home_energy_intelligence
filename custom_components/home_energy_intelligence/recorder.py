@@ -53,6 +53,8 @@ def states_to_numeric(
     for row in rows:
         value = row.attributes.get(attribute) if attribute else row.state
         unit = row.attributes.get("unit_of_measurement")
+        if unit is None and dimension == "temperature":
+            unit = row.attributes.get("temperature_unit")
         if value in (None, "unknown", "unavailable", ""):
             result.append(NumericSample(
                 row.last_updated, None, str(value or "unavailable"),

@@ -86,6 +86,8 @@ def temperatures_from_config(config: dict[str, Any]) -> list[TemperatureMapping]
     for source_record in parse_json_records(config.get("temperature_sources")):
         record = dict(source_record)
         quality = TemperatureQuality(**record.pop("quality", {}))
+        if not record.get("attribute") and str(record.get("entity_id", "")).startswith("climate."):
+            record["attribute"] = "current_temperature"
         result.append(TemperatureMapping(**record, quality=quality))
     return result
 
@@ -107,7 +109,11 @@ def equipment_temperature_mappings(equipment: list[EquipmentMapping]) -> list[Te
                 result.append(TemperatureMapping(
                     source_id=f"{item.equipment_id}_{role}",
                     display_name=f"{item.display_name} {role.replace('_', ' ')}",
-                    entity_id=entity_id, role=role, quality=quality,
+                    entity_id=entity_id, role=role,
+                    attribute=("current_temperature"
+                               if role == "equipment_room" and entity_id.startswith("climate.")
+                               else None),
+                    quality=quality,
                 ))
     return result
 
