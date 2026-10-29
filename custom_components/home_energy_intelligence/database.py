@@ -156,12 +156,14 @@ def _compact_temperature_summary(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalized_rejections(summary: dict[str, Any]) -> list[dict[str, Any]]:
-    result = [dict(item) for item in summary.get("rejections", []) if isinstance(item, dict)]
-    if not result:
-        for item in summary.get("rejected_reasons", []):
-            reason, _, value = str(item).partition(":")
-            result.append({"timestamp": None, "value": value or None, "reason": reason})
-    return result
+    # ``rejected_reasons`` remains in the compact summary.  It is not a
+    # substitute for the richer detailed rejection list: synthesizing one
+    # would change the logical payload and turn an unavailable/unit reason into
+    # a fabricated timestamped measurement rejection.
+    return [
+        dict(item) for item in summary.get("rejections", [])
+        if isinstance(item, dict)
+    ]
 
 
 def _store_normalized_temperatures(
@@ -215,7 +217,7 @@ def _daily_rejections(
     rows = connection.execute(
         f"""SELECT observed_at,value,reason,duration_seconds,source
         FROM rejected_readings WHERE local_date=? AND entity_key=?
-        AND ({reason_clauses}) ORDER BY id""",
+        AND source IS NOT NULL AND ({reason_clauses}) ORDER BY id""",
         (local_date, source_id,
          *(f"{reason}%" for reason in _TEMPERATURE_REJECTION_REASONS)),
     ).fetchall()

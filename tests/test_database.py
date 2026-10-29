@@ -84,6 +84,13 @@ def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
             "source": "recorder",
         }],
         "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }, "indoor-unit": {
+        "mean": None, "minimum": None, "maximum": None,
+        "coverage_seconds": 0, "period_seconds": 90000,
+        "coverage_percent": 0, "quality": "missing", "rejected_count": 1,
+        "rejected_reasons": ["incompatible_temperature_unit:72"],
+        "rejections": [],
+        "source_provenance": {"entity_id": "sensor.indoor", "source_id": "indoor-unit"},
     }}
     assert db.upsert_daily(item)
     logical = db.daily(item.local_date)
@@ -107,7 +114,7 @@ def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
         assert "temperatures" not in json.loads(raw)
         assert connection.execute(
             "SELECT COUNT(*) FROM temperature_summaries"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == revision_rows
         assert connection.execute(
             "SELECT COUNT(*) FROM rejected_readings"
