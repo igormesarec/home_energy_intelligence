@@ -5,6 +5,7 @@ import json
 import sqlite3
 from threading import Barrier
 import time
+import tracemalloc
 
 import pytest
 
@@ -120,11 +121,108 @@ def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
             "SELECT COUNT(*) FROM rejected_readings"
         ).fetchone()[0] == rejection_rows
     logical_bytes = len(json.dumps(logical, separators=(",", ":")).encode())
-    assert db.size_bytes() < logical_bytes * 2
+    # Startup intentionally does not VACUUM.  The live DB plus WAL may briefly
+    # retain old pages, but migration remains bounded and does not duplicate the
+    # logical payload without limit.
+    assert db.size_bytes() < logical_bytes * 3
     before = db.size_bytes()
     db.initialize()
     assert db.daily(item.local_date)["temperatures"] == logical["temperatures"]
     assert db.size_bytes() == before
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_every_supported_legacy_schema_upgrades_losslessly_and_idempotently(
+    tmp_path, legacy_version,
+):
+    db = EnergyDatabase(tmp_path / f"v{legacy_version}.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 6.5, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        if legacy_version < 3:
+            connection.execute("DROP TABLE hourly_records")
+        if legacy_version == 1:
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN source")
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN duration_seconds")
+        connection.execute("UPDATE schema_version SET version=?", (legacy_version,))
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 6.5
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+    before = db.size_bytes()
+    db.initialize()
+    assert db.size_bytes() == before
+
+
+def test_v4_migration_streams_thousands_of_daily_and_hourly_rows(tmp_path):
+    db = EnergyDatabase(tmp_path / "large-v3.sqlite3")
+    db.initialize()
+    base = datetime(2020, 1, 1, tzinfo=UTC)
+    with db.connect() as connection:
+        now = datetime.now(UTC).isoformat()
+        for index in range(1200):
+            stamp = base + timedelta(days=index)
+            local_date = stamp.date().isoformat()
+            payload = {
+                "local_date": local_date, "timezone": "UTC",
+                "period_start_utc": stamp.isoformat(),
+                "period_end_utc": (stamp + timedelta(days=1)).isoformat(),
+                "day_seconds": 86400, "household_kwh": 1.0,
+                "temperatures": {"outdoor": {
+                    "mean": 5.0, "coverage_seconds": 86400,
+                    "period_seconds": 86400, "coverage_percent": 100,
+                    "quality": "good", "rejections": [],
+                    "source_provenance": {"entity_id": "sensor.outdoor"},
+                }}, "allocations": {}, "provenance": {}, "quality": "good",
+            }
+            serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            connection.execute(
+                "INSERT INTO daily_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (local_date, "UTC", stamp.isoformat(),
+                 (stamp + timedelta(days=1)).isoformat(), 86400, 1.0,
+                 None, None, None, None, "good", serialized,
+                 hashlib.sha256(serialized.encode()).hexdigest(), 1, now),
+            )
+            hour = stamp + timedelta(hours=1)
+            hour_payload = {
+                **payload, "period_start_utc": hour.isoformat(),
+                "period_end_utc": (hour + timedelta(hours=1)).isoformat(),
+                "day_seconds": 3600,
+            }
+            hour_serialized = json.dumps(
+                hour_payload, separators=(",", ":"), sort_keys=True
+            )
+            connection.execute(
+                "INSERT INTO hourly_records VALUES (?,?,?,?,?,?,?,?)",
+                (hour.isoformat(), (hour + timedelta(hours=1)).isoformat(),
+                 local_date, "UTC", hour_serialized,
+                 hashlib.sha256(hour_serialized.encode()).hexdigest(), "good", now),
+            )
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        connection.execute("UPDATE schema_version SET version=3")
+    tracemalloc.start()
+    db.initialize()
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024
+    with db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 2400
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
@@ -157,6 +255,137 @@ def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM temperature_summaries"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_v4_schema_creation_failure_rolls_back_new_tables_and_version(
+    tmp_path, monkeypatch, legacy_version,
+):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / f"failed-v{legacy_version}.sqlite3")
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        if legacy_version < 3:
+            connection.execute("DROP TABLE hourly_records")
+        if legacy_version == 1:
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN source")
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN duration_seconds")
+        connection.execute("UPDATE schema_version SET version=?", (legacy_version,))
+    monkeypatch.setattr(
+        database_module, "MIGRATION_4",
+        database_module.MIGRATION_4 + "\nCREATE TABL deliberately_invalid;",
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == legacy_version
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('temperature_summaries','hourly_temperature_rejections')"
+        ).fetchone()[0] == 0
+        if legacy_version < 3:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hourly_records'"
+            ).fetchone()[0] == 0
+
+
+def test_v4_failure_before_version_bump_rolls_back_payload_conversion(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_version BEFORE UPDATE OF version ON schema_version
+            BEGIN SELECT RAISE(ABORT, 'version bump failed'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="version bump failed"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert "temperatures" in json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 0
+
+
+def test_v4_disk_full_failure_is_retryable_and_preserves_v3(tmp_path, monkeypatch):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    original = database_module._store_normalized_temperatures
+    monkeypatch.setattr(
+        database_module, "_store_normalized_temperatures",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database or disk is full")
+        ),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert "temperatures" in json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+    monkeypatch.setattr(database_module, "_store_normalized_temperatures", original)
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 5.0
+
+
+def test_locked_database_is_not_renamed_as_corrupt(tmp_path, monkeypatch):
+    path = tmp_path / "energy.sqlite3"
+    db = EnergyDatabase(path)
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("UPDATE schema_version SET version=3")
+    monkeypatch.setattr(EnergyDatabase, "CONNECT_TIMEOUT_SECONDS", 0.01)
+    blocker = sqlite3.connect(path)
+    blocker.execute("PRAGMA journal_mode=WAL")
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db.initialize()
+        assert path.exists()
+        assert not list(tmp_path.glob("*.corrupt-*.sqlite3"))
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_storage_status_discloses_safe_maintenance_policy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    status = db.storage_status()
+    assert status["schema_version"] == 4
+    assert status["migration_required"] is False
+    assert status["startup_vacuum_enabled"] is False
+    assert status["backup_method"] == "protected_sqlite_online_backup"
 
 
 def test_temperature_repair_immediately_qualifies_response_without_energy_rebuild(tmp_path):
@@ -505,6 +734,25 @@ def test_atomic_temperature_repair_preserves_checksum_revision_and_mapping_meani
         ).fetchone()
     assert tuple(after) == tuple(before)
     assert after["checksum"] == logical_daily_checksum(db, item.local_date)
+
+
+def test_legacy_temperature_without_entity_provenance_is_not_rewritten_by_current_mapping(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 4.0, "coverage_seconds": 45000, "period_seconds": 90000,
+        "coverage_percent": 50, "quality": "partial", "rejections": [],
+    }}
+    db.upsert_daily(item)
+    assert not db.merge_daily_temperatures(item.local_date, {"outdoor": {
+        "mean": 9.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.current_outdoor"},
+    }}, {"source": "repair"})
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 4.0
 
 
 def test_temperature_repair_replaces_only_changed_source_rejections_without_duplicates(tmp_path):

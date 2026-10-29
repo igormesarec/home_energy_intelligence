@@ -105,6 +105,131 @@ async def test_temperature_only_collector_never_requests_energy_mode_pv_or_grid(
 
 
 @pytest.mark.asyncio
+async def test_temperature_fallback_uses_validated_coverage_not_row_count(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+
+    def row(stamp, value):
+        return SimpleNamespace(
+            last_updated=stamp, state=str(value),
+            attributes={"unit_of_measurement": "°C"},
+        )
+
+    source_ids = ("carry", "invalid", "partial", "influx")
+    for source_id in source_ids:
+        hass.states.async_set(f"sensor.{source_id}", "5", {
+            "device_class": "temperature", "unit_of_measurement": "°C",
+        })
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": source_id, "display_name": source_id,
+            "role": "outdoor", "entity_id": f"sensor.{source_id}",
+            "enabled": True, "quality": {
+                "minimum": -40, "maximum": 55,
+                "invalid_values": [-55, 155], "freshness_minutes": 120,
+                "missing_after_minutes": 120,
+            },
+        } for source_id in source_ids]),
+        "influx_enabled": True, "influx_host": "localhost",
+        "influx_database": "homeassistant",
+        "influx_mapping": json.dumps({
+            "temperature.influx": {"measurement": "°C", "field": "value", "unit": "°C"},
+        }),
+    }, options={})
+    coordinator = HomeEnergyCoordinator(
+        hass, entry, SimpleNamespace(store_mapping_revision=lambda _revision: True)
+    )
+    histories = {
+        "sensor.carry": [row(start, 5)],
+        "sensor.invalid": [row(start, -55), row(start + timedelta(minutes=30), 155)],
+        "sensor.partial": [row(start, 5), row(start + timedelta(minutes=30), "unavailable")],
+        "sensor.influx": [row(start, "unavailable"), row(start + timedelta(minutes=30), "unknown")],
+    }
+    statistics = {
+        "sensor.carry": [{"start": start, "end": end, "mean": 20, "min": 20, "max": 20}],
+        "sensor.invalid": [{"start": start, "end": end, "mean": 7, "min": 6, "max": 8}],
+        "sensor.partial": [{"start": start, "end": end, "mean": 9, "min": 9, "max": 9}],
+        "sensor.influx": [],
+    }
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value=histories),
+        async_statistics=AsyncMock(return_value=statistics),
+    )
+    fake_influx = SimpleNamespace(query=lambda *_args, **_kwargs: [
+        (start, 11), (start + timedelta(minutes=30), 12),
+    ])
+    with patch(
+        "custom_components.home_energy_intelligence.coordinator.InfluxBackfillClient",
+        return_value=fake_influx,
+    ):
+        collected = await coordinator._async_collect_temperatures(start, end)
+        full_collected = await coordinator._async_collect_range(start, end)
+    summaries = coordinator._aggregator().aggregate_range(
+        start.date(), start, end, collected
+    ).temperatures
+    evidence = collected.provenance["temperature_collection"]
+
+    assert summaries["carry"]["mean"] == 5
+    assert evidence["carry"]["selected_history_source"] == "recorder_states"
+    assert evidence["carry"]["validated_coverage_percent"] == 100
+    assert summaries["invalid"]["mean"] == 7
+    assert evidence["invalid"]["selected_history_source"] == "recorder_statistics"
+    assert evidence["invalid"]["fallback_reason"] == "recorder_states_no_validated_coverage"
+    assert summaries["partial"]["mean"] == 5
+    assert summaries["partial"]["coverage_percent"] == 50
+    assert evidence["partial"]["selected_history_source"] == "recorder_states"
+    assert summaries["influx"]["mean"] == pytest.approx(11.5)
+    assert evidence["influx"]["selected_history_source"] == "influx"
+    assert evidence["influx"]["fallback_reason"] == "recorder_sources_no_validated_coverage"
+    full_summaries = coordinator._aggregator().aggregate_range(
+        start.date(), start, end, full_collected
+    ).temperatures
+    full_evidence = full_collected.provenance["temperature_collection"]
+    assert full_summaries["carry"]["mean"] == 5
+    assert full_summaries["invalid"]["mean"] == 7
+    assert full_summaries["partial"]["coverage_percent"] == 50
+    assert full_summaries["influx"]["mean"] == pytest.approx(11.5)
+    assert full_evidence["invalid"]["selected_history_source"] == "recorder_statistics"
+    assert full_evidence["influx"]["selected_history_source"] == "influx"
+
+
+@pytest.mark.asyncio
+async def test_single_valid_carry_state_does_not_trigger_statistics_fallback(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    hass.states.async_set("sensor.outdoor", "5", {
+        "device_class": "temperature", "unit_of_measurement": "°C",
+    })
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.outdoor", "enabled": True,
+        }]),
+    }, options={})
+    coordinator = HomeEnergyCoordinator(
+        hass, entry, SimpleNamespace(store_mapping_revision=lambda _revision: True)
+    )
+    row = SimpleNamespace(
+        last_updated=start, state="5", attributes={"unit_of_measurement": "°C"},
+    )
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.outdoor": [row]}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    collected = await coordinator._async_collect_temperatures(start, end)
+    coordinator.reader.async_statistics.assert_not_awaited()
+    evidence = collected.provenance["temperature_collection"]["outdoor"]
+    assert evidence["selected_history_source"] == "recorder_states"
+    assert evidence["validated_coverage_percent"] == 100
+
+
+@pytest.mark.asyncio
 async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_sources(
     hass, tmp_path,
 ):
@@ -159,7 +284,7 @@ async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_
     assert result["sources_with_available_history"] == 1
     assert result["error_count"] == 0
     assert coordinator.reader.async_history.await_count == 1
-    assert coordinator.reader.async_statistics.await_count == 1
+    assert coordinator.reader.async_statistics.await_count == 0
     queried = coordinator.reader.async_history.await_args.args[0]
     assert queried == ["sensor.outdoor"]
     assert {"sensor.hp_energy", "sensor.hp_power", "sensor.hp_mode",
@@ -173,7 +298,7 @@ async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_
     assert second["changed_daily_records"] == 0
     assert second["sources_skipped_complete"] == 1
     assert coordinator.reader.async_history.await_count == 1
-    assert coordinator.reader.async_statistics.await_count == 1
+    assert coordinator.reader.async_statistics.await_count == 0
 
     await coordinator._temperature_repair_lock.acquire()
     try:
@@ -614,9 +739,9 @@ async def test_temperature_repair_query_and_memory_bounds_scale_by_day(
     tracemalloc.stop()
     assert result["processed_days"] == day_count
     assert result["changed_daily_records"] == day_count
-    assert result["recorder_query_count"] == day_count * 2
+    assert result["recorder_query_count"] == day_count
     assert result["influx_query_count"] == 0
     assert result["peak_normalized_samples_per_day"] == 2
     assert coordinator.reader.async_history.await_count == day_count
-    assert coordinator.reader.async_statistics.await_count == day_count
+    assert coordinator.reader.async_statistics.await_count == 0
     assert peak < 64 * 1024 * 1024

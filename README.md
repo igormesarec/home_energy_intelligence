@@ -12,7 +12,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - History supports Home Assistant-timezone presets for Today, Yesterday, −2 through −7 days, Monday–Sunday weeks, seven completed days, calendar months/years, configurable energy seasons and custom ranges. Today is assembled from validated completed-hour rows at Overview's cutoff and is never written as a finalized daily record. Its authoritative summary covers the entire range independently of paginated detail rows, and CSV exports the entire selected range.
 - Expected completed hours are checked individually, so internal gaps are visible and late Recorder data can safely replace poor-quality hourly rows without duplicating energy.
 - Administrator diagnostics trace each representative temperature from stable source/entity mapping through live state, unit/attribute validation, bounded Recorder rows/statistics, rejection reasons and persisted hourly/daily coverage. A temperature-only repair can recover up to 31 days without replacing valid energy or stronger temperature evidence.
-- Temperature repair queries only the affected temperature entities, skips complete sources before querying Recorder, uses an atomic source-aware SQLite merge and cannot block normal startup recovery if Recorder is unavailable.
+- Temperature repair queries only the affected temperature entities, skips only 100%-complete sources before querying Recorder, uses an atomic source-aware SQLite merge and cannot block normal startup recovery if Recorder is unavailable. Raw Recorder rows are assessed by validated elapsed coverage, not row count: a single valid carry-in state can be complete, while multiple sentinel/unavailable rows can trigger bounded statistics or read-only InfluxDB fallback. Partial valid Recorder evidence is preserved and its remaining gap is not overwritten by lower-fidelity data.
 - Missing allocations expose known partial subtotals separately and never become complete zero heating, DHW or cooling totals. Device-level heating/cooling evidence and signed reconciliation discrepancies remain visible.
 - PV, grid and household history uses measured, physically valid balances and reports self-sufficiency/self-consumption only when its required inputs are available.
 - Representative indoor and outdoor temperatures are independently selected by stable source ID. Matching cards show the latest validated value/timestamp, elapsed-time-weighted mean, min/max, coverage, quality and yesterday comparison; missing intervals remain timeline gaps.
@@ -58,6 +58,9 @@ For a manual install, copy `custom_components/home_energy_intelligence` into the
 Before updating an existing installation, create the administrator-only protected
 database backup. Startup integrity-checks the database and transactionally
 migrates V1–V3 storage to schema V4, which normalizes temperature audit data.
+Migration is keyset-batched and never runs `VACUUM` during startup. Dashboard
+Settings discloses current/target schema, free space and the protected-backup
+policy; optional compaction is a separate manual offline maintenance action.
 Do not downgrade an already migrated database to a V3 writer; restore the backup
 if rollback is required.
 

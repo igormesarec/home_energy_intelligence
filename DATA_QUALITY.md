@@ -72,7 +72,7 @@ It never fills a gap, overwrites a stronger valid measurement, creates a finaliz
 day, or changes electricity/allocation fields.
 
 The repair collector requests only enabled temperature entities. Before querying
-Recorder it skips source/day combinations that already have at least 95% valid
+Recorder it skips source/day combinations only when they have 100% valid
 coverage and non-partial quality. Every candidate must identify the exact UTC
 period and mapped entity. A dedicated `BEGIN IMMEDIATE` transaction re-reads the
 latest payload under the write lock, compares quality/coverage/provenance, and
@@ -96,6 +96,11 @@ frontend requires at least 10 admitted dates, an observed outdoor span of 8 °C 
 R² ≥ 0.5 before showing a conservative electrical fit. These are evidence-quality
 gates, not a claim of thermal output, COP, physical balance point or design-day
 capacity.
+
+The 95% response-profile threshold is not temporal completeness. Each candidate
+exposes separate response-qualification and 100%-coverage flags; a 95–99.99%
+day may qualify for that statistical use while its missing interval remains
+explicit everywhere else.
 
 Overview and House Thermal Profile consume this same backend candidate list and
 the same `validated` status. The panel does not independently admit dates.

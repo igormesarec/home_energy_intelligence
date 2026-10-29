@@ -423,6 +423,13 @@ def heating_response_profile(
             "outdoor_mean_c": outdoor_mean,
             "outdoor_coverage_percent": outdoor_coverage,
             "outdoor_validated_seconds": outdoor_validated_seconds,
+            "outdoor_full_temporal_coverage": bool(
+                outdoor_coverage is not None and outdoor_coverage >= 100.0
+            ),
+            "outdoor_response_coverage_qualified": bool(
+                outdoor_coverage is not None
+                and outdoor_coverage >= minimum_temperature_coverage
+            ),
             "heating_electricity_kwh": heating,
             "heat_pump_heating_kwh": (
                 None if heating is None else sum(

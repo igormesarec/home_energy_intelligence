@@ -2,6 +2,9 @@
 
 ## V0.1.1 — draft
 
+- Replaced temperature fallback row-count heuristics with canonical validated-duration checks in both normal and repair collectors. A carry-in state can be complete; invalid/unavailable rows can fall back to Recorder statistics and optional read-only InfluxDB; partial valid raw evidence remains authoritative and uncovered time remains missing.
+- Hardened Schema V4 for constrained Home Assistant hosts: V1/V2/V3 upgrades are transactional through the version bump, conversion is keyset-batched, startup `VACUUM` was removed, lock/busy errors are not corruption, disk/schema/version-bump failures roll back and retry safely, and Settings exposes non-secret backup/migration status.
+- Separated configurable 95% electrical-response admission from 100% temporal completeness and prevented current mappings from rewriting legacy temperature summaries whose historical entity identity is unknown.
 - Replaced legacy stored row-quality trust with one read-time derivation shared by History, Overview completed days, sensors and CSV; date, household meter, equipment allocation and selected representative-temperature layers remain independently inspectable, while the old label is provenance only.
 - Added explicit `unknown` quality for legacy classification rows whose elapsed coverage cannot be proven, and allowed a fully evidenced temperature repair to promote derived period quality without rebuilding energy.
 - Added SQLite schema V4 normalization for temperature summaries and rejection audits, including atomic forward migration, injected-failure rollback, idempotent reopen and an approximately 1 MB storage-amplification bound.

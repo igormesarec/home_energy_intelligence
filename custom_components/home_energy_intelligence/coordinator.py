@@ -34,10 +34,34 @@ from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
 )
+from .temperature import DEFAULT_LIMITS, time_weighted_temperature
 from .timeutils import local_day_bounds
 
 LEGACY_SITE_KEYS = {"pv": "pv_energy", "import": "grid_import", "export": "grid_export"}
 _LOGGER = logging.getLogger(__name__)
+
+
+def _validated_temperature_coverage(
+    samples: list[NumericSample], start: datetime, end: datetime, mapping,
+) -> float:
+    kind = (
+        "outdoor" if mapping.role == "outdoor" else
+        "flow" if mapping.role in {"supply", "return"} else
+        "dhw" if mapping.role == "dhw" else "indoor"
+    )
+    configured = mapping.quality
+    minimum, maximum = (
+        (configured.minimum, configured.maximum) if configured else DEFAULT_LIMITS[kind]
+    )
+    return time_weighted_temperature(
+        samples, start, end, minimum_valid=minimum, maximum_valid=maximum,
+        max_carry=(timedelta(minutes=configured.freshness_minutes)
+                   if configured else None),
+        invalid_values=(configured.invalid_values if configured else (-55.0, 155.0)),
+        maximum_change_per_minute=(configured.maximum_change_per_minute
+                                   if configured else None),
+        source=mapping.source_id,
+    ).coverage_seconds
 
 
 class HomeEnergyCoordinator:
@@ -184,7 +208,7 @@ class HomeEnergyCoordinator:
             coverage = float(summary.get("coverage_percent") or 0)
             return (
                 isinstance(mean, (int, float)) and isfinite(float(mean))
-                and coverage >= 95.0
+                and coverage >= 100.0
                 and summary.get("quality") not in {
                     "missing", "poor", "partial", "rejected", "unreconciled",
                 }
@@ -594,9 +618,19 @@ class HomeEnergyCoordinator:
         except Exception as error:  # Recorder may be temporarily unavailable at startup.
             history = {}
             query_errors.append({"query": "history", "error": type(error).__name__})
-        statistic_entities = {
-            item.entity_id for item in sources if item.entity_id and item.attribute is None
-        }
+        statistic_entities = set()
+        for item in sources:
+            if not item.entity_id or item.attribute is not None:
+                continue
+            raw_preview = [
+                NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                              sample.source_unit, sample.normalized_unit)
+                for sample in states_to_numeric(
+                    history.get(item.entity_id, []), dimension="temperature"
+                )
+            ]
+            if _validated_temperature_coverage(raw_preview, start, end, item) <= 0:
+                statistic_entities.add(item.entity_id)
         try:
             statistics = (
                 await self.reader.async_statistics(statistic_entities, start, end)
@@ -645,37 +679,63 @@ class HomeEnergyCoordinator:
                     state_rows, attribute=item.attribute, dimension="temperature",
                 )
             ]
-            if len(samples) < 2 and item.attribute is None:
+            def validated_coverage(candidate: list[NumericSample]) -> float:
+                return _validated_temperature_coverage(candidate, start, end, item)
+
+            candidate_coverage = {"recorder_states": validated_coverage(samples)}
+            selected_source = "recorder_states"
+            fallback_reason = None
+            # Recorder state rows are evidence, not proof of usable coverage.
+            # A single carry-in state may cover the whole interval, while many
+            # invalid/unavailable rows may cover none of it.  Never replace any
+            # valid raw-state segment with a lower-fidelity aggregate source;
+            # when safe segment merging cannot be proven the uncovered remainder
+            # stays missing.
+            if candidate_coverage["recorder_states"] <= 0 and item.attribute is None:
                 statistic_samples = statistics_to_numeric_samples(
                     statistics.get(item.entity_id, []),
                     source_unit=source_unit(item.entity_id) or "°C",
                 )
-                if len(statistic_samples) >= 2:
-                    samples = [
-                        NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
-                                      sample.source_unit, sample.normalized_unit)
-                        for sample in statistic_samples
-                    ]
+                normalized_statistics = [
+                    NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                                  sample.source_unit, sample.normalized_unit)
+                    for sample in statistic_samples
+                ]
+                candidate_coverage["recorder_statistics"] = validated_coverage(
+                    normalized_statistics
+                )
+                if candidate_coverage["recorder_statistics"] > 0:
+                    samples = normalized_statistics
+                    selected_source = "recorder_statistics"
+                    fallback_reason = "recorder_states_no_validated_coverage"
             mapping_key = f"temperature.{item.source_id}"
             mapping = influx_mapping.get(mapping_key) if isinstance(influx_mapping, dict) else None
-            if len(samples) < 2 and influx is not None and isinstance(mapping, dict):
+            if (validated_coverage(samples) <= 0 and influx is not None
+                    and isinstance(mapping, dict)):
                 rows = await self.hass.async_add_executor_job(partial(
                     influx.query, mapping["measurement"], mapping.get("field", "value"),
                     start, end, entity_tag=mapping.get("entity_tag"),
                 ))
                 if rows:
-                    used_influx.append(mapping_key)
                     converted = states_to_numeric([
                         SimpleNamespace(
                             last_updated=timestamp, state=value,
                             attributes={"unit_of_measurement": mapping.get("unit")},
                         ) for timestamp, value in rows
                     ], dimension="temperature")
-                    samples = [
-                        NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                    influx_samples = [
+                        NumericSample(sample.timestamp, sample.value,
+                                      (sample.reason or "point_sample"), item.entity_id,
                                       sample.source_unit, sample.normalized_unit)
                         for sample in converted
                     ]
+                    candidate_coverage["influx"] = validated_coverage(influx_samples)
+                    if candidate_coverage["influx"] > 0:
+                        used_influx.append(mapping_key)
+                        samples = influx_samples
+                        selected_source = "influx"
+                        fallback_reason = "recorder_sources_no_validated_coverage"
+            selected_coverage = validated_coverage(samples)
             temperatures[item.source_id] = samples
             quality[item.source_id] = item.quality
             roles[item.source_id] = item.role
@@ -691,6 +751,13 @@ class HomeEnergyCoordinator:
                 "recorder_statistics_rows": len(statistics.get(item.entity_id, [])),
                 "normalized_samples": len(samples),
                 "valid_samples": len(valid),
+                "selected_history_source": selected_source,
+                "fallback_reason": fallback_reason,
+                "candidate_validated_coverage_seconds": candidate_coverage,
+                "validated_coverage_seconds": selected_coverage,
+                "validated_coverage_percent": (
+                    100 * selected_coverage / max((end - start).total_seconds(), 1)
+                ),
                 "available_start": (
                     min(sample.timestamp for sample in valid).isoformat() if valid else None
                 ),
@@ -750,7 +817,18 @@ class HomeEnergyCoordinator:
 
         statistic_entities = {item.energy_entity for item in equipment if item.energy_entity}
         statistic_entities |= {entity for entity in site_sources.values() if entity}
-        statistic_entities |= {item.entity_id for item in temperature_sources if item.attribute is None}
+        statistic_entities |= {
+            item.entity_id for item in temperature_sources
+            if item.attribute is None and _validated_temperature_coverage(
+                [
+                    NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                                  sample.source_unit, sample.normalized_unit)
+                    for sample in states_to_numeric(
+                        history.get(item.entity_id, []), dimension="temperature"
+                    )
+                ], start, end, item,
+            ) <= 0
+        }
         statistics = await self.reader.async_statistics(statistic_entities, start, end)
         used_influx: list[str] = []
         try:
@@ -772,15 +850,30 @@ class HomeEnergyCoordinator:
             state = self.hass.states.get(entity_id) if entity_id else None
             return state.attributes.get("unit_of_measurement") if state else None
 
+        numeric_evidence: dict[str, dict[str, object]] = {}
+
         async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
-                          attribute: str | None = None, dimension: str | None = None) -> list[NumericSample]:
+                          attribute: str | None = None, dimension: str | None = None,
+                          temperature_mapping=None) -> list[NumericSample]:
             if not entity_id:
                 return []
             raw = [NumericSample(item.timestamp, item.value, item.reason, entity_id,
                                  item.source_unit, item.normalized_unit)
                    for item in states_to_numeric(history.get(entity_id, []), attribute=attribute,
                                                  dimension=dimension)]
-            if len(raw) >= 2:
+            raw_coverage = (
+                _validated_temperature_coverage(raw, start, end, temperature_mapping)
+                if temperature_mapping is not None else None
+            )
+            candidates = ({"recorder_states": raw_coverage}
+                          if raw_coverage is not None else {})
+            if (raw_coverage > 0 if raw_coverage is not None else len(raw) >= 2):
+                if temperature_mapping is not None:
+                    numeric_evidence[source_key] = {
+                        "selected_history_source": "recorder_states",
+                        "fallback_reason": None,
+                        "candidate_validated_coverage_seconds": candidates,
+                    }
                 return raw
             if statistics_type:
                 from_statistics = (
@@ -794,9 +887,26 @@ class HomeEnergyCoordinator:
                     )
                 )
                 if len(from_statistics) >= 2:
-                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id,
-                                          item.source_unit, item.normalized_unit)
-                            for item in from_statistics]
+                    normalized_statistics = [
+                        NumericSample(item.timestamp, item.value, item.reason, entity_id,
+                                      item.source_unit, item.normalized_unit)
+                        for item in from_statistics
+                    ]
+                    statistics_coverage = (
+                        _validated_temperature_coverage(
+                            normalized_statistics, start, end, temperature_mapping
+                        ) if temperature_mapping is not None else None
+                    )
+                    if statistics_coverage is not None:
+                        candidates["recorder_statistics"] = statistics_coverage
+                    if (statistics_coverage > 0 if statistics_coverage is not None else True):
+                        if temperature_mapping is not None:
+                            numeric_evidence[source_key] = {
+                                "selected_history_source": "recorder_statistics",
+                                "fallback_reason": "recorder_states_no_validated_coverage",
+                                "candidate_validated_coverage_seconds": candidates,
+                            }
+                        return normalized_statistics
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
             if influx is not None and isinstance(mapping, dict):
                 rows = await self.hass.async_add_executor_job(partial(
@@ -804,7 +914,6 @@ class HomeEnergyCoordinator:
                     start, end, entity_tag=mapping.get("entity_tag"),
                 ))
                 if rows:
-                    used_influx.append(source_key)
                     influx_unit = mapping.get("unit")
                     converted = states_to_numeric([
                         SimpleNamespace(
@@ -813,9 +922,35 @@ class HomeEnergyCoordinator:
                         )
                         for timestamp, value in rows
                     ], dimension=dimension)
-                    return [NumericSample(item.timestamp, item.value, item.reason, entity_id,
-                                          item.source_unit, item.normalized_unit)
-                            for item in converted]
+                    influx_samples = [
+                        NumericSample(item.timestamp, item.value,
+                                      ((item.reason or "point_sample")
+                                       if temperature_mapping is not None else item.reason),
+                                      entity_id, item.source_unit, item.normalized_unit)
+                        for item in converted
+                    ]
+                    influx_coverage = (
+                        _validated_temperature_coverage(
+                            influx_samples, start, end, temperature_mapping
+                        ) if temperature_mapping is not None else None
+                    )
+                    if influx_coverage is not None:
+                        candidates["influx"] = influx_coverage
+                    if influx_coverage is None or influx_coverage > 0:
+                        used_influx.append(source_key)
+                        if temperature_mapping is not None:
+                            numeric_evidence[source_key] = {
+                                "selected_history_source": "influx",
+                                "fallback_reason": "recorder_sources_no_validated_coverage",
+                                "candidate_validated_coverage_seconds": candidates,
+                            }
+                        return influx_samples
+            if temperature_mapping is not None:
+                numeric_evidence[source_key] = {
+                    "selected_history_source": "recorder_states",
+                    "fallback_reason": "no_candidate_has_validated_coverage",
+                    "candidate_validated_coverage_seconds": candidates,
+                }
             return raw
 
         devices = {}
@@ -851,11 +986,13 @@ class HomeEnergyCoordinator:
                 f"temperature.{item.source_id}", item.entity_id,
                 statistics_type="mean" if item.attribute is None else None,
                 attribute=item.attribute, dimension="temperature",
+                temperature_mapping=item,
             )
             temperatures[item.source_id] = samples
             temperature_quality[item.source_id] = item.quality
             temperature_roles[item.source_id] = item.role
             valid = [sample for sample in samples if sample.value is not None]
+            validated_seconds = _validated_temperature_coverage(samples, start, end, item)
             temperature_collection[item.source_id] = {
                 "source_id": item.source_id,
                 "entity_id": item.entity_id,
@@ -866,6 +1003,10 @@ class HomeEnergyCoordinator:
                 "recorder_statistics_rows": len(statistics.get(item.entity_id, [])),
                 "normalized_samples": len(samples),
                 "valid_samples": len(valid),
+                "validated_coverage_seconds": validated_seconds,
+                "validated_coverage_percent": (
+                    100 * validated_seconds / max((end - start).total_seconds(), 1)
+                ),
                 "available_start": min(
                     (sample.timestamp for sample in valid), default=None
                 ).isoformat() if valid else None,
@@ -880,6 +1021,7 @@ class HomeEnergyCoordinator:
                     str(sample.source_unit) for sample in samples if sample.source_unit
                 }),
                 "normalized_unit": "°C",
+                **numeric_evidence.get(f"temperature.{item.source_id}", {}),
             }
         revision = mapping_revision(self.config)
         if store_mapping_revision:

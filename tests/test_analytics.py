@@ -574,6 +574,8 @@ def test_heating_response_uses_one_exact_coverage_boundary(coverage, expected_st
         minimum_temperature_coverage=95,
     )["points"][0]
     assert point["status"] == expected_status
+    assert point["outdoor_response_coverage_qualified"] is (coverage >= 95)
+    assert point["outdoor_full_temporal_coverage"] is (coverage >= 100)
     assert point["outdoor_validated_seconds"] == pytest.approx(86400 * coverage / 100)
     assert point["reconciliation_discrepancy_kwh"] == 0
     assert point["equipment_heating"][0]["equipment_id"] == "hp-a"

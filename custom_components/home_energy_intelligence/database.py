@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import logging
 from math import isfinite
 from pathlib import Path
 import shutil
@@ -15,6 +16,8 @@ import time
 from typing import Any
 
 from .models import DailyRecord
+
+_LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 MIGRATION_1 = """
@@ -80,19 +83,6 @@ CREATE INDEX IF NOT EXISTS idx_daily_records_date ON daily_records(local_date DE
 CREATE INDEX IF NOT EXISTS idx_checkpoints_date ON checkpoints(local_date);
 CREATE INDEX IF NOT EXISTS idx_mapping_effective ON mapping_revisions(effective_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hourly_local_date ON hourly_records(local_date, interval_start_utc);
-CREATE TABLE IF NOT EXISTS temperature_summaries (
-  record_kind TEXT NOT NULL, record_key TEXT NOT NULL, source_id TEXT NOT NULL,
-  payload_json TEXT NOT NULL, checksum TEXT NOT NULL,
-  PRIMARY KEY (record_kind, record_key, source_id)
-);
-CREATE TABLE IF NOT EXISTS hourly_temperature_rejections (
-  record_key TEXT NOT NULL, source_id TEXT NOT NULL, observed_at TEXT NOT NULL,
-  value_json TEXT NOT NULL, reason TEXT NOT NULL, duration_seconds REAL NOT NULL,
-  source TEXT NOT NULL,
-  PRIMARY KEY (record_key,source_id,observed_at,value_json,reason,duration_seconds,source)
-);
-CREATE INDEX IF NOT EXISTS idx_temperature_summary_record
-  ON temperature_summaries(record_kind, record_key);
 """
 MIGRATION_2 = """
 ALTER TABLE rejected_readings ADD COLUMN duration_seconds REAL;
@@ -284,67 +274,81 @@ def _core_payload(payload: dict[str, Any]) -> str:
 
 def _migrate_temperature_storage_v4(connection: sqlite3.Connection) -> None:
     """Normalize existing temperature evidence without changing logical checksums."""
-    daily_rows = connection.execute(
-        "SELECT local_date,payload_json FROM daily_records"
-    ).fetchall()
-    for row in daily_rows:
-        payload = json.loads(row["payload_json"])
-        temperatures = payload.get("temperatures") or {}
-        if not temperatures:
-            continue
-        for source_id, summary in temperatures.items():
-            if not isinstance(summary, dict):
+    # Keyset pagination keeps peak migration memory bounded by one batch rather
+    # than materialising every historical JSON payload at startup.
+    last_date = ""
+    while True:
+        daily_rows = connection.execute(
+            """SELECT local_date,payload_json FROM daily_records
+            WHERE local_date>? ORDER BY local_date LIMIT 100""", (last_date,)
+        ).fetchall()
+        if not daily_rows:
+            break
+        for row in daily_rows:
+            last_date = row["local_date"]
+            payload = json.loads(row["payload_json"])
+            temperatures = payload.get("temperatures") or {}
+            if not temperatures:
                 continue
-            for rejection in _normalized_rejections(summary):
-                observed = rejection.get("timestamp")
-                value = rejection.get("value")
-                value_text = None if value is None else str(value)
-                reason = str(rejection.get("reason") or "invalid")
-                duration = rejection.get("duration_seconds")
-                source = rejection.get("source")
-                exists = connection.execute(
-                    """SELECT 1 FROM rejected_readings
-                    WHERE local_date=? AND entity_key=?
-                    AND COALESCE(observed_at,'')=COALESCE(?,'')
-                    AND COALESCE(value,'')=COALESCE(?,'')
-                    AND reason=?
-                    AND COALESCE(duration_seconds,-1)=COALESCE(?,-1)
-                    AND COALESCE(source,'')=COALESCE(?,'') LIMIT 1""",
-                    (row["local_date"], source_id, observed, value_text, reason,
-                     duration, source),
-                ).fetchone()
-                if exists is None:
-                    connection.execute(
-                        """INSERT INTO rejected_readings
-                        (local_date,entity_key,observed_at,value,reason,duration_seconds,source)
-                        VALUES (?,?,?,?,?,?,?)""",
+            for source_id, summary in temperatures.items():
+                if not isinstance(summary, dict):
+                    continue
+                for rejection in _normalized_rejections(summary):
+                    observed = rejection.get("timestamp")
+                    value = rejection.get("value")
+                    value_text = None if value is None else str(value)
+                    reason = str(rejection.get("reason") or "invalid")
+                    duration = rejection.get("duration_seconds")
+                    source = rejection.get("source")
+                    exists = connection.execute(
+                        """SELECT 1 FROM rejected_readings
+                        WHERE local_date=? AND entity_key=?
+                        AND COALESCE(observed_at,'')=COALESCE(?,'')
+                        AND COALESCE(value,'')=COALESCE(?,'') AND reason=?
+                        AND COALESCE(duration_seconds,-1)=COALESCE(?,-1)
+                        AND COALESCE(source,'')=COALESCE(?,'') LIMIT 1""",
                         (row["local_date"], source_id, observed, value_text, reason,
                          duration, source),
-                    )
-        _store_normalized_temperatures(
-            connection, "daily", row["local_date"], temperatures
-        )
-        connection.execute(
-            "UPDATE daily_records SET payload_json=? WHERE local_date=?",
-            (_core_payload(payload), row["local_date"]),
-        )
+                    ).fetchone()
+                    if exists is None:
+                        connection.execute(
+                            """INSERT INTO rejected_readings
+                            (local_date,entity_key,observed_at,value,reason,duration_seconds,source)
+                            VALUES (?,?,?,?,?,?,?)""",
+                            (row["local_date"], source_id, observed, value_text, reason,
+                             duration, source),
+                        )
+            _store_normalized_temperatures(
+                connection, "daily", row["local_date"], temperatures
+            )
+            connection.execute(
+                "UPDATE daily_records SET payload_json=? WHERE local_date=?",
+                (_core_payload(payload), row["local_date"]),
+            )
 
-    hourly_rows = connection.execute(
-        "SELECT interval_start_utc,payload_json FROM hourly_records"
-    ).fetchall()
-    for row in hourly_rows:
-        payload = json.loads(row["payload_json"])
-        temperatures = payload.get("temperatures") or {}
-        if not temperatures:
-            continue
-        _store_normalized_temperatures(
-            connection, "hourly", row["interval_start_utc"], temperatures
-        )
-        connection.execute(
-            """UPDATE hourly_records SET payload_json=?
-            WHERE interval_start_utc=?""",
-            (_core_payload(payload), row["interval_start_utc"]),
-        )
+    last_hour = ""
+    while True:
+        hourly_rows = connection.execute(
+            """SELECT interval_start_utc,payload_json FROM hourly_records
+            WHERE interval_start_utc>? ORDER BY interval_start_utc LIMIT 100""",
+            (last_hour,),
+        ).fetchall()
+        if not hourly_rows:
+            break
+        for row in hourly_rows:
+            last_hour = row["interval_start_utc"]
+            payload = json.loads(row["payload_json"])
+            temperatures = payload.get("temperatures") or {}
+            if not temperatures:
+                continue
+            _store_normalized_temperatures(
+                connection, "hourly", row["interval_start_utc"], temperatures
+            )
+            connection.execute(
+                """UPDATE hourly_records SET payload_json=?
+                WHERE interval_start_utc=?""",
+                (_core_payload(payload), row["interval_start_utc"]),
+            )
 
 
 def _temperature_coverage(value: dict[str, Any] | None) -> float:
@@ -382,6 +386,11 @@ def _merge_temperature_maps(
         )
         current_source = (current or {}).get("source_provenance") or {}
         candidate_source = (candidate or {}).get("source_provenance") or {}
+        if current is not None and not current_source.get("entity_id"):
+            # Legacy rows without source identity are intentionally immutable.
+            # A current mapping cannot prove that it represents the same
+            # historical sensor, even when the stable source_id is unchanged.
+            continue
         if (
             current_source.get("entity_id") and candidate_source.get("entity_id")
             and current_source["entity_id"] != candidate_source["entity_id"]
@@ -428,6 +437,8 @@ def protected_export_path(config_path: str | Path, stamp: str) -> Path:
 class EnergyDatabase:
     """Dedicated database; never opens or writes the Recorder database."""
 
+    CONNECT_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
@@ -436,7 +447,9 @@ class EnergyDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection: sqlite3.Connection | None = None
         try:
-            connection = sqlite3.connect(self.path, timeout=30)
+            connection = sqlite3.connect(
+                self.path, timeout=self.CONNECT_TIMEOUT_SECONDS
+            )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA journal_mode=WAL")
@@ -453,13 +466,19 @@ class EnergyDatabase:
 
     def initialize(self, *, recover_corrupt: bool = True) -> Path | None:
         recovered = None
-        compact_after_migration = False
         if self.path.exists():
             try:
                 with self.connect() as connection:
                     if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                         raise sqlite3.DatabaseError("integrity check failed")
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as error:
+                # Lock contention and transient I/O failures are not evidence
+                # of corruption.  Never rename a healthy database merely
+                # because another HA worker currently owns the SQLite lock.
+                if any(token in str(error).lower() for token in (
+                    "locked", "busy", "disk i/o", "readonly", "full",
+                )):
+                    raise
                 if not recover_corrupt:
                     raise
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -470,36 +489,45 @@ class EnergyDatabase:
                     if companion.exists():
                         companion.unlink()
         with self.connect() as connection:
-            connection.executescript(MIGRATION_1)
+            has_schema = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            ).fetchone()
+            if has_schema is None:
+                connection.executescript(MIGRATION_1)
             row = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            if row is not None and row[0] < SCHEMA_VERSION:
+                required = max(8 * 1024 * 1024, self.size_bytes() // 2)
+                free = shutil.disk_usage(self.path.parent).free
+                if free < required:
+                    raise RuntimeError(
+                        "Deferred schema migration: insufficient free space; "
+                        "create a protected SQLite backup and free at least "
+                        f"{required} bytes"
+                    )
+                _LOGGER.warning(
+                    "Home Energy Intelligence schema migration %s -> %s is starting; "
+                    "a protected SQLite backup is recommended. Automatic VACUUM is disabled.",
+                    row[0], SCHEMA_VERSION,
+                )
             if row is None:
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
                 connection.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
             elif row[0] == 1:
-                connection.executescript(MIGRATION_2)
-                connection.executescript(MIGRATION_3)
-                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n" + MIGRATION_2 + MIGRATION_3 + MIGRATION_4
+                )
                 _migrate_temperature_storage_v4(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
-                compact_after_migration = True
             elif row[0] == 2:
-                connection.executescript(MIGRATION_3)
-                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_3 + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
-                compact_after_migration = True
             elif row[0] == 3:
                 connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
-                compact_after_migration = True
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
-        if compact_after_migration:
-            # The transaction above is the safety boundary.  VACUUM runs only
-            # after it commits, reclaiming pages formerly occupied by repeated
-            # inline audit arrays without risking the logical migration.
-            with self.connect() as connection:
-                connection.execute("VACUUM")
         return recovered
 
     def upsert_daily(self, record: DailyRecord, *, reason: str = "daily_close") -> bool:
@@ -1045,3 +1073,21 @@ class EnergyDatabase:
         return sum(path.stat().st_size for path in (
             self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")
         ) if path.exists())
+    def storage_status(self) -> dict[str, Any]:
+        """Return non-secret migration/maintenance diagnostics for Settings."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT version FROM schema_version LIMIT 1"
+            ).fetchone()
+        size = self.size_bytes()
+        return {
+            "schema_version": row[0] if row else None,
+            "target_schema_version": SCHEMA_VERSION,
+            "migration_required": bool(row and row[0] < SCHEMA_VERSION),
+            "database_size_bytes": size,
+            "free_space_bytes": shutil.disk_usage(self.path.parent).free,
+            "startup_vacuum_enabled": False,
+            "backup_recommended_before_migration": True,
+            "backup_method": "protected_sqlite_online_backup",
+            "maintenance_compaction": "manual_offline_only",
+        }

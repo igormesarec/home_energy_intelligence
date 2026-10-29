@@ -537,6 +537,7 @@ async def ws_settings(hass, connection, msg):
     for item in temperatures_from_config(config):
         mapping.append({"key": f"temperature.{item.source_id}", "label": item.display_name,
                         "entity_id": item.entity_id, "enabled": item.enabled})
+    storage = await hass.async_add_executor_job(coordinator.database.storage_status)
     connection.send_result(msg["id"], {
         "configured": True,
         "entry_id": coordinator.entry.entry_id,
@@ -545,5 +546,6 @@ async def ws_settings(hass, connection, msg):
         "cycle_hours": config.get("cycle_hours", 6),
         "influx_enabled": bool(config.get("influx_enabled", False)),
         "mapping": mapping,
-        "database_size_bytes": await hass.async_add_executor_job(coordinator.database.size_bytes),
+        "database_size_bytes": storage["database_size_bytes"],
+        "storage": storage,
     })
