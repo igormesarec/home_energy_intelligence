@@ -415,6 +415,32 @@ def test_supplied_equipment_baseline_preserves_partial_ac_as_evidence_not_comple
     assert ac["classification_source"] == "configured-state-and-power-history"
 
 
+def test_october_29_partial_fixture_keeps_3_6_kwh_as_known_not_confirmed_total():
+    equipment = [
+        {"equipment_id": "hp", "display_name": "Configured heat pump",
+         "kind": "heat_pump", "enabled": True},
+        {"equipment_id": "aurora", "display_name": "Aurora",
+         "kind": "air_conditioner", "enabled": True},
+    ]
+    record = {"local_date": "2026-10-29", "household_kwh": 6.7,
+              "partial": True, "finalized": False, "allocations": {
+        "hp": {"meter_kwh": 2.8, "categories": {"confirmed_heating": 2.8},
+               "coverage_percent": 100, "quality": "good"},
+        "aurora": {"meter_kwh": 0.8, "categories": {"heating_selected": 0.8},
+                   "coverage_percent": 50, "quality": "partial",
+                   "classification_source": "configured-state-and-power-history"},
+    }}
+    energy = canonical_energy(record, equipment)
+    assert energy["space_heating_kwh"] is None
+    assert energy["known_space_heating_kwh"] == pytest.approx(3.6)
+    aurora = next(item for item in energy["equipment"]
+                  if item["equipment_id"] == "aurora")
+    assert aurora["meter_kwh"] == 0.8
+    assert aurora["selected_heating_kwh"] is None
+    assert aurora["known_selected_heating_kwh"] == 0.8
+    assert aurora["classification_complete"] is False
+
+
 def test_heating_response_retains_validated_and_excluded_daily_evidence():
     valid = _hour(datetime(2026, 1, 1, tzinfo=UTC), 4)
     valid.update({"local_date": "2026-01-01", "finalized": True})
@@ -456,6 +482,53 @@ def test_heating_response_excludes_missing_source_invalid_temperature_and_incomp
         [record], EQUIPMENT[:1], outdoor_source_id=None, floor_area_m2=180,
     )["points"][0]
     assert "representative_outdoor_not_configured" in missing_source["exclusion_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("coverage", "expected_status"),
+    [(95.0, "validated"), (94.99, "excluded"), (30.0, "excluded")],
+)
+def test_heating_response_uses_one_exact_coverage_boundary(coverage, expected_status):
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 4)
+    record.update({"local_date": "2026-01-01", "finalized": True})
+    record["temperatures"] = {"outdoor": {
+        "mean": 5, "minimum": 3, "maximum": 7,
+        "coverage_percent": coverage,
+        "coverage_seconds": 86400 * coverage / 100,
+        "period_seconds": 86400, "quality": "good" if coverage >= 95 else "partial",
+    }}
+    point = heating_response_profile(
+        [record], EQUIPMENT[:1], outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+        minimum_temperature_coverage=95,
+    )["points"][0]
+    assert point["status"] == expected_status
+    assert point["outdoor_validated_seconds"] == pytest.approx(86400 * coverage / 100)
+    assert point["reconciliation_discrepancy_kwh"] == 0
+    assert point["equipment_heating"][0]["equipment_id"] == "hp-a"
+
+
+def test_heating_response_rejects_non_outdoor_role_partial_day_and_non_finite_values():
+    record = _hour(datetime(2026, 1, 1, tzinfo=UTC), 4)
+    record.update({"local_date": "2026-01-01", "partial": True, "finalized": False})
+    record["temperatures"] = {"outdoor": {
+        "mean": 5, "coverage_percent": 100, "coverage_seconds": 86400,
+        "period_seconds": 86400, "quality": "good",
+    }}
+    point = heating_response_profile(
+        [record], EQUIPMENT[:1], outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=False, floor_area_m2=180,
+    )["points"][0]
+    assert "partial_day" in point["exclusion_reasons"]
+    assert "representative_source_not_measured_outdoor_air" in point["exclusion_reasons"]
+
+    record.update({"partial": False, "finalized": True})
+    record["temperatures"]["outdoor"]["mean"] = float("inf")
+    point = heating_response_profile(
+        [record], EQUIPMENT[:1], outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+    )["points"][0]
+    assert "invalid_outdoor_temperature" in point["exclusion_reasons"]
 
 
 def test_absent_daily_record_counts_in_temperature_period_denominator():

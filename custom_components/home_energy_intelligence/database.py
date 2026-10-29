@@ -7,9 +7,11 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from math import isfinite
 from pathlib import Path
 import shutil
 import sqlite3
+import time
 from typing import Any
 
 from .models import DailyRecord
@@ -126,10 +128,33 @@ def _merge_temperature_maps(
     """Add better recovered summaries without replacing valid measurements."""
     merged = dict(existing or {})
     changed = False
+    quality_rank = {"missing": 0, "poor": 1, "partial": 2, "filtered": 3, "good": 4}
     for source_id, candidate in (recovered or {}).items():
         current = merged.get(source_id)
-        current_valid = isinstance(current, dict) and current.get("mean") is not None
-        candidate_valid = isinstance(candidate, dict) and candidate.get("mean") is not None
+        candidate_mean = candidate.get("mean") if isinstance(candidate, dict) else None
+        current_mean = current.get("mean") if isinstance(current, dict) else None
+        candidate_valid = (
+            isinstance(candidate_mean, (int, float)) and isfinite(float(candidate_mean))
+            and _temperature_coverage(candidate) > 0
+            and candidate.get("quality") not in {"missing", "poor", "rejected", "unreconciled"}
+        )
+        current_valid = (
+            isinstance(current_mean, (int, float)) and isfinite(float(current_mean))
+            and _temperature_coverage(current) > 0
+        )
+        current_source = (current or {}).get("source_provenance") or {}
+        candidate_source = (candidate or {}).get("source_provenance") or {}
+        if (
+            current_source.get("entity_id") and candidate_source.get("entity_id")
+            and current_source["entity_id"] != candidate_source["entity_id"]
+        ):
+            # A remap is a new historical meaning, not permission to rewrite
+            # an older source under the same stable source ID.
+            continue
+        if current_valid and quality_rank.get(
+            str(candidate.get("quality")), 0
+        ) < quality_rank.get(str(current.get("quality")), 0):
+            continue
         if current_valid and (
             not candidate_valid
             or _temperature_coverage(current) >= _temperature_coverage(candidate)
@@ -139,6 +164,20 @@ def _merge_temperature_maps(
             merged[source_id] = candidate
             changed = changed or current != candidate
     return merged, changed
+
+
+def _eligible_temperature_repair(
+    recovered: dict[str, Any], start: str, end: str,
+) -> dict[str, Any]:
+    """Accept only summaries tied to the exact interval and configured entity."""
+    return {
+        source_id: summary for source_id, summary in (recovered or {}).items()
+        if isinstance(summary, dict)
+        and summary.get("period_start_utc") == start
+        and summary.get("period_end_utc") == end
+        and isinstance(summary.get("source_provenance"), dict)
+        and bool(summary["source_provenance"].get("entity_id"))
+    }
 
 
 def protected_export_path(config_path: str | Path, stamp: str) -> Path:
@@ -208,13 +247,32 @@ class EnergyDatabase:
         return recovered
 
     def upsert_daily(self, record: DailyRecord, *, reason: str = "daily_close") -> bool:
-        payload = _canonical_json(record.as_dict())
-        checksum = _checksum(payload)
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             prior = connection.execute(
-                "SELECT checksum,revision FROM daily_records WHERE local_date=?", (record.local_date,)
+                "SELECT checksum,revision,payload_json FROM daily_records WHERE local_date=?",
+                (record.local_date,),
             ).fetchone()
+            payload_data = record.as_dict()
+            if prior:
+                prior_payload = json.loads(prior["payload_json"])
+                eligible_prior = _eligible_temperature_repair(
+                    prior_payload.get("temperatures", {}),
+                    payload_data["period_start_utc"], payload_data["period_end_utc"],
+                )
+                payload_data["temperatures"], carried_temperature = _merge_temperature_maps(
+                    payload_data.get("temperatures", {}), eligible_prior,
+                )
+                if carried_temperature and prior_payload.get("provenance", {}).get(
+                    "temperature_reprocessing"
+                ):
+                    payload_data.setdefault("provenance", {}).setdefault(
+                        "temperature_reprocessing",
+                        prior_payload["provenance"]["temperature_reprocessing"],
+                    )
+            payload = _canonical_json(payload_data)
+            checksum = _checksum(payload)
             if prior and prior["checksum"] == checksum:
                 return False
             revision = 1 if prior is None else prior["revision"] + 1
@@ -238,7 +296,7 @@ class EnergyDatabase:
             )
             connection.execute("DELETE FROM allocations WHERE local_date=?", (record.local_date,))
             connection.execute("DELETE FROM rejected_readings WHERE local_date=?", (record.local_date,))
-            for device, data in record.allocations.items():
+            for device, data in payload_data.get("allocations", {}).items():
                 for category, kwh in data.get("categories", {}).items():
                     connection.execute(
                         "INSERT INTO allocations VALUES (?,?,?,?,?,?,?)",
@@ -252,7 +310,7 @@ class EnergyDatabase:
                         "INSERT INTO rejected_readings(local_date,entity_key,reason) VALUES (?,?,?)",
                         (record.local_date, device, f"energy_readings_rejected:{count}"),
                     )
-            for entity_key, data in record.temperatures.items():
+            for entity_key, data in payload_data.get("temperatures", {}).items():
                 detailed = data.get("rejections", [])
                 for rejection in detailed:
                     connection.execute(
@@ -439,16 +497,36 @@ class EnergyDatabase:
 
     def upsert_hourly(self, payload: dict[str, Any]) -> bool:
         """Store one completed elapsed-hour interval idempotently."""
-        serialized = _canonical_json(payload)
-        checksum = _checksum(serialized)
         start = str(payload["period_start_utc"])
         end = str(payload["period_end_utc"])
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             prior = connection.execute(
-                "SELECT checksum FROM hourly_records WHERE interval_start_utc=? AND interval_end_utc=?",
+                """SELECT checksum,payload_json FROM hourly_records
+                WHERE interval_start_utc=? AND interval_end_utc=?""",
                 (start, end),
             ).fetchone()
+            payload_data = dict(payload)
+            if prior:
+                prior_payload = json.loads(prior["payload_json"])
+                eligible_prior = _eligible_temperature_repair(
+                    prior_payload.get("temperatures", {}), start, end,
+                )
+                carried_temperature = False
+                if "temperatures" in payload_data or eligible_prior:
+                    payload_data["temperatures"], carried_temperature = _merge_temperature_maps(
+                        payload_data.get("temperatures", {}), eligible_prior,
+                    )
+                if carried_temperature and prior_payload.get("provenance", {}).get(
+                    "temperature_reprocessing"
+                ):
+                    payload_data.setdefault("provenance", {}).setdefault(
+                        "temperature_reprocessing",
+                        prior_payload["provenance"]["temperature_reprocessing"],
+                    )
+            serialized = _canonical_json(payload_data)
+            checksum = _checksum(serialized)
             if prior and prior["checksum"] == checksum:
                 return False
             connection.execute(
@@ -457,8 +535,8 @@ class EnergyDatabase:
                 local_date=excluded.local_date,timezone=excluded.timezone,
                 payload_json=excluded.payload_json,checksum=excluded.checksum,
                 quality=excluded.quality,updated_at=excluded.updated_at""",
-                (start, end, payload["local_date"], payload["timezone"], serialized,
-                 checksum, payload.get("quality", "missing"), now),
+                (start, end, payload_data["local_date"], payload_data["timezone"], serialized,
+                 checksum, payload_data.get("quality", "missing"), now),
             )
         return True
 
@@ -466,47 +544,143 @@ class EnergyDatabase:
         self, local_date: str, temperatures: dict[str, Any],
         provenance: dict[str, Any] | None = None,
     ) -> bool:
-        """Backfill only missing/better temperature evidence in an existing day."""
-        payload = self.daily(local_date)
-        if payload is None:
-            return False
-        merged, changed = _merge_temperature_maps(
-            payload.get("temperatures", {}), temperatures,
-        )
-        if not changed:
-            return False
-        payload["temperatures"] = merged
-        payload.setdefault("provenance", {})["temperature_reprocessing"] = provenance or {}
-        record = DailyRecord(**{
-            key: payload[key] for key in (
-                "local_date", "timezone", "period_start_utc", "period_end_utc",
-                "day_seconds", "household_kwh", "pv_kwh", "import_kwh",
-                "export_kwh", "non_hvac_kwh", "quality", "temperatures",
-                "allocations", "provenance",
-            )
-        })
-        return self.upsert_daily(record, reason="temperature_history_repair")
+        """Atomically merge temperature evidence without rebuilding daily energy."""
+        for attempt in range(3):
+            try:
+                with self.connect() as connection:
+                    connection.execute("PRAGMA busy_timeout=1000")
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT payload_json,checksum,revision FROM daily_records WHERE local_date=?",
+                        (local_date,),
+                    ).fetchone()
+                    if row is None:
+                        return False
+                    payload = json.loads(row["payload_json"])
+                    eligible = _eligible_temperature_repair(
+                        temperatures, payload.get("period_start_utc"),
+                        payload.get("period_end_utc"),
+                    )
+                    merged, changed = _merge_temperature_maps(
+                        payload.get("temperatures", {}), eligible,
+                    )
+                    if not changed:
+                        return False
+                    changed_sources = sorted(
+                        source_id for source_id, value in merged.items()
+                        if payload.get("temperatures", {}).get(source_id) != value
+                    )
+                    payload["temperatures"] = merged
+                    payload.setdefault("provenance", {})["temperature_reprocessing"] = {
+                        **(provenance or {}), "source_ids": changed_sources,
+                    }
+                    serialized = _canonical_json(payload)
+                    checksum = _checksum(serialized)
+                    now = datetime.now(UTC).isoformat()
+                    revision = int(row["revision"]) + 1
+                    updated = connection.execute(
+                        """UPDATE daily_records SET payload_json=?,checksum=?,revision=?,updated_at=?
+                        WHERE local_date=? AND checksum=?""",
+                        (serialized, checksum, revision, now, local_date, row["checksum"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise sqlite3.OperationalError("daily record changed during repair")
+                    connection.execute(
+                        """INSERT INTO revisions
+                        (local_date,revision,prior_checksum,new_checksum,reason,created_at)
+                        VALUES (?,?,?,?,?,?)""",
+                        (local_date, revision, row["checksum"], checksum,
+                         "temperature_history_repair", now),
+                    )
+                    temperature_reasons = (
+                        "invalid_sentinel", "out_of_range", "temporal_spike",
+                        "contaminated_statistics_bounds", "invalid_statistics_bounds",
+                        "incompatible_temperature_unit", "non_numeric",
+                    )
+                    for source_id in changed_sources:
+                        reason_clauses = " OR ".join(
+                            "reason LIKE ?" for _ in temperature_reasons
+                        )
+                        connection.execute(
+                            f"""DELETE FROM rejected_readings WHERE local_date=? AND entity_key=?
+                            AND (source IS NOT NULL OR {reason_clauses})""",
+                            (local_date, source_id,
+                             *(f"{reason}%" for reason in temperature_reasons)),
+                        )
+                        inserted_rejections: set[tuple[Any, ...]] = set()
+                        for rejection in (merged[source_id].get("rejections") or []):
+                            rejection_key = (
+                                rejection.get("timestamp"), rejection.get("value"),
+                                rejection.get("reason", "invalid"),
+                                rejection.get("duration_seconds"), rejection.get("source"),
+                            )
+                            if rejection_key in inserted_rejections:
+                                continue
+                            inserted_rejections.add(rejection_key)
+                            connection.execute(
+                                """INSERT INTO rejected_readings
+                                (local_date,entity_key,observed_at,value,reason,duration_seconds,source)
+                                VALUES (?,?,?,?,?,?,?)""",
+                                (local_date, source_id, *rejection_key),
+                            )
+                return True
+            except sqlite3.OperationalError as error:
+                if attempt == 2 or "locked" not in str(error).lower():
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        return False
 
     def merge_hourly_temperatures(
         self, start: datetime, end: datetime, temperatures: dict[str, Any],
         provenance: dict[str, Any] | None = None,
     ) -> bool:
-        """Backfill an existing hour without changing its energy/allocation values."""
-        rows = self.hourly_range(start, end)
-        payload = next((item for item in rows if (
-            item.get("period_start_utc") == start.isoformat()
-            and item.get("period_end_utc") == end.isoformat()
-        )), None)
-        if payload is None:
-            return False
-        merged, changed = _merge_temperature_maps(
-            payload.get("temperatures", {}), temperatures,
-        )
-        if not changed:
-            return False
-        payload["temperatures"] = merged
-        payload.setdefault("provenance", {})["temperature_reprocessing"] = provenance or {}
-        return self.upsert_hourly(payload)
+        """Atomically merge an existing hour without reconstructing energy values."""
+        for attempt in range(3):
+            try:
+                with self.connect() as connection:
+                    connection.execute("PRAGMA busy_timeout=1000")
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        """SELECT payload_json,checksum FROM hourly_records
+                        WHERE interval_start_utc=? AND interval_end_utc=?""",
+                        (start.isoformat(), end.isoformat()),
+                    ).fetchone()
+                    if row is None:
+                        return False
+                    payload = json.loads(row["payload_json"])
+                    eligible = _eligible_temperature_repair(
+                        temperatures, payload.get("period_start_utc"),
+                        payload.get("period_end_utc"),
+                    )
+                    merged, changed = _merge_temperature_maps(
+                        payload.get("temperatures", {}), eligible,
+                    )
+                    if not changed:
+                        return False
+                    changed_sources = sorted(
+                        source_id for source_id, value in merged.items()
+                        if payload.get("temperatures", {}).get(source_id) != value
+                    )
+                    payload["temperatures"] = merged
+                    payload.setdefault("provenance", {})["temperature_reprocessing"] = {
+                        **(provenance or {}), "source_ids": changed_sources,
+                    }
+                    serialized = _canonical_json(payload)
+                    checksum = _checksum(serialized)
+                    updated = connection.execute(
+                        """UPDATE hourly_records SET payload_json=?,checksum=?,updated_at=?
+                        WHERE interval_start_utc=? AND interval_end_utc=? AND checksum=?""",
+                        (serialized, checksum, datetime.now(UTC).isoformat(),
+                         start.isoformat(), end.isoformat(), row["checksum"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise sqlite3.OperationalError("hourly record changed during repair")
+                return True
+            except sqlite3.OperationalError as error:
+                if attempt == 2 or "locked" not in str(error).lower():
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        return False
 
     def hourly_range(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
         """Load only intervals overlapping a bounded UTC range."""

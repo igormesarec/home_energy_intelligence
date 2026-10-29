@@ -302,9 +302,17 @@ async def ws_history(hass, connection, msg):
     representative_outdoor_id = coordinator.config.get(
         "representative_outdoor_source_id"
     )
+    representative_outdoor = next((
+        item for item in _temperatures(coordinator)
+        if item.source_id == representative_outdoor_id
+    ), None)
     response_profile = heating_response_profile(
         period_records, equipment,
         outdoor_source_id=representative_outdoor_id,
+        outdoor_source_is_measured_air=bool(
+            representative_outdoor and representative_outdoor.enabled
+            and representative_outdoor.role == "outdoor"
+        ),
         floor_area_m2=coordinator.config.get("floor_area_m2"),
         minimum_temperature_coverage=float(coordinator.config.get(
             "response_temperature_coverage_minimum", 95

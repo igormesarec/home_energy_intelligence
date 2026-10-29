@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 import json
+import logging
+from math import isfinite
+from time import monotonic
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -33,6 +37,7 @@ from .recorder import (
 from .timeutils import local_day_bounds
 
 LEGACY_SITE_KEYS = {"pv": "pv_energy", "import": "grid_import", "export": "grid_export"}
+_LOGGER = logging.getLogger(__name__)
 
 
 class HomeEnergyCoordinator:
@@ -43,6 +48,19 @@ class HomeEnergyCoordinator:
         self.config = {**entry.data, **entry.options}
         self.reader = RecorderReader(hass)
         self.timezone = hass.config.time_zone
+        self._temperature_repair_lock = asyncio.Lock()
+
+    def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
+        explicit = list(temperatures_from_config(self.config))
+        selected = explicit if include_disabled else [item for item in explicit if item.enabled]
+        explicit_keys = {(item.entity_id, item.role) for item in selected}
+        if equipment is None:
+            equipment = [item for item in equipment_from_config(self.config) if item.enabled]
+        selected.extend(
+            item for item in equipment_temperature_mappings(equipment)
+            if (item.entity_id, item.role) not in explicit_keys
+        )
+        return selected
 
     def _site_sources(self) -> dict[str, str | None]:
         configured = self.config.get("site_sources", {})
@@ -139,58 +157,130 @@ class HomeEnergyCoordinator:
 
     async def async_reprocess_temperature_history(
         self, start_date: date, end_date: date,
-    ) -> dict[str, int]:
+    ) -> dict[str, object]:
         """Recover temperature summaries only, preserving valid energy evidence."""
         if end_date < start_date or (end_date - start_date).days > 30:
             raise ValueError("Temperature repair range must be ordered and at most 31 days")
-        changed_daily = changed_hourly = processed_days = 0
-        day = start_date
-        while day <= end_date:
-            start, end = local_day_bounds(day, self.timezone)
-            daily = await self.hass.async_add_executor_job(
-                self.database.daily, day.isoformat()
-            )
-            hours = await self.hass.async_add_executor_job(
-                self.database.hourly_range, start, end
-            )
-            if daily is None and not hours:
-                day += timedelta(days=1)
-                continue
-            source = await self._async_collect_range(
-                start, end, store_mapping_revision=False,
-            )
-            aggregator = self._aggregator()
-            provenance = {
-                "source": "bounded_recorder_temperature_repair",
-                "processed_at": datetime.now(UTC).isoformat(),
-                "collection": source.provenance.get("temperature_collection", {}),
+        if self._temperature_repair_lock.locked():
+            return {
+                "processed_days": 0, "changed_daily_records": 0,
+                "changed_hourly_records": 0, "errors": [{
+                    "reason": "temperature_repair_already_running",
+                }], "error_count": 1,
             }
-            if daily is not None:
-                recovered = await self.hass.async_add_executor_job(
-                    aggregator.aggregate_range, day, start, end, source
-                )
-                changed_daily += int(await self.hass.async_add_executor_job(
-                    self.database.merge_daily_temperatures, day.isoformat(),
-                    recovered.temperatures, provenance,
-                ))
-            for hour in hours:
-                hour_start = datetime.fromisoformat(hour["period_start_utc"])
-                hour_end = datetime.fromisoformat(hour["period_end_utc"])
-                recovered = await self.hass.async_add_executor_job(
-                    aggregator.aggregate_range, day, hour_start, hour_end, source
-                )
-                changed_hourly += int(await self.hass.async_add_executor_job(
-                    self.database.merge_hourly_temperatures, hour_start, hour_end,
-                    recovered.temperatures, provenance,
-                ))
-            processed_days += 1
-            day += timedelta(days=1)
+        started = monotonic()
+        changed_daily = changed_hourly = processed_days = 0
+        sources_inspected = skipped_complete = sources_with_history = 0
+        missing_recorder_data = 0
+        errors: list[dict[str, str]] = []
+        configured = {item.source_id: item for item in self._temperature_sources()}
+
+        def complete(summary: object) -> bool:
+            if not isinstance(summary, dict):
+                return False
+            mean = summary.get("mean")
+            coverage = float(summary.get("coverage_percent") or 0)
+            return (
+                isinstance(mean, (int, float)) and isfinite(float(mean))
+                and coverage >= 95.0
+                and summary.get("quality") not in {
+                    "missing", "poor", "partial", "rejected", "unreconciled",
+                }
+            )
+
+        async with self._temperature_repair_lock:
+            day = start_date
+            while day <= end_date:
+                start, end = local_day_bounds(day, self.timezone)
+                try:
+                    daily = await self.hass.async_add_executor_job(
+                        self.database.daily, day.isoformat()
+                    )
+                    hours = await self.hass.async_add_executor_job(
+                        self.database.hourly_range, start, end
+                    )
+                    if daily is None and not hours:
+                        day += timedelta(days=1)
+                        continue
+                    needed: set[str] = set()
+                    records = ([daily] if daily is not None else []) + hours
+                    for source_id in configured:
+                        source_complete = all(
+                            complete(record.get("temperatures", {}).get(source_id))
+                            for record in records
+                        )
+                        if source_complete:
+                            skipped_complete += 1
+                        else:
+                            needed.add(source_id)
+                    if not needed:
+                        processed_days += 1
+                        day += timedelta(days=1)
+                        continue
+                    sources_inspected += len(needed)
+                    source = await self._async_collect_temperatures(start, end, needed)
+                    if source.provenance.get("query_errors"):
+                        errors.extend({
+                            "date": day.isoformat(), **error,
+                        } for error in source.provenance["query_errors"])
+                    collection = source.provenance.get("temperature_collection", {})
+                    available = {
+                        source_id for source_id in needed
+                        if collection.get(source_id, {}).get("valid_samples", 0) > 0
+                    }
+                    sources_with_history += len(available)
+                    missing_recorder_data += len(needed - available)
+                    if not available:
+                        processed_days += 1
+                        day += timedelta(days=1)
+                        continue
+                    aggregator = self._aggregator()
+                    provenance = {
+                        "source": "bounded_recorder_temperature_repair",
+                        "processed_at": datetime.now(UTC).isoformat(),
+                        "period_start_utc": start.isoformat(),
+                        "period_end_utc": end.isoformat(),
+                        "collection": collection,
+                    }
+                    if daily is not None:
+                        recovered = await self.hass.async_add_executor_job(
+                            aggregator.aggregate_range, day, start, end, source
+                        )
+                        changed_daily += int(await self.hass.async_add_executor_job(
+                            self.database.merge_daily_temperatures, day.isoformat(),
+                            {key: value for key, value in recovered.temperatures.items()
+                             if key in available}, provenance,
+                        ))
+                    for hour in hours:
+                        hour_start = datetime.fromisoformat(hour["period_start_utc"])
+                        hour_end = datetime.fromisoformat(hour["period_end_utc"])
+                        recovered = await self.hass.async_add_executor_job(
+                            aggregator.aggregate_range, day, hour_start, hour_end, source
+                        )
+                        changed_hourly += int(await self.hass.async_add_executor_job(
+                            self.database.merge_hourly_temperatures, hour_start, hour_end,
+                            {key: value for key, value in recovered.temperatures.items()
+                             if key in available}, provenance,
+                        ))
+                    processed_days += 1
+                except Exception as error:  # Isolate one bad day from the bounded repair.
+                    _LOGGER.exception("Temperature repair failed for %s", day)
+                    errors.append({"date": day.isoformat(), "error": type(error).__name__})
+                day += timedelta(days=1)
+                await asyncio.sleep(0)
         if changed_daily or changed_hourly:
             async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
         return {
             "processed_days": processed_days,
             "changed_daily_records": changed_daily,
             "changed_hourly_records": changed_hourly,
+            "sources_inspected": sources_inspected,
+            "sources_skipped_complete": skipped_complete,
+            "sources_with_available_history": sources_with_history,
+            "missing_recorder_data": missing_recorder_data,
+            "error_count": len(errors),
+            "errors": errors,
+            "elapsed_seconds": round(monotonic() - started, 3),
         }
 
     async def async_temperature_diagnostics(
@@ -205,22 +295,15 @@ class HomeEnergyCoordinator:
             requested_end,
             datetime.now(UTC).replace(minute=0, second=0, microsecond=0),
         )
-        source = await self._async_collect_range(
-            start, end, store_mapping_revision=False,
-        )
+        enabled_ids = {item.source_id for item in self._temperature_sources()}
+        source = await self._async_collect_temperatures(start, end, enabled_ids)
         hourly = await self.hass.async_add_executor_job(
             self.database.hourly_range, start, end
         )
         daily = await self.hass.async_add_executor_job(
             self.database.history_period, start_date.isoformat(), end_date.isoformat()
         )
-        configured = list(temperatures_from_config(self.config))
-        explicit = {(item.entity_id, item.role) for item in configured}
-        configured.extend(
-            item for item in equipment_temperature_mappings(
-                [item for item in equipment_from_config(self.config) if item.enabled]
-            ) if (item.entity_id, item.role) not in explicit
-        )
+        configured = self._temperature_sources(include_disabled=True)
         collection = source.provenance.get("temperature_collection", {})
         expected_hours = []
         cursor = start
@@ -278,8 +361,29 @@ class HomeEnergyCoordinator:
                 if summary.get("mean") is not None
                 and float(summary.get("coverage_seconds", 0) or 0) > 0
             )
+            live_unit = (None if live is None else (
+                live.attributes.get("unit_of_measurement")
+                or live.attributes.get("temperature_unit")
+            ))
+            unit_status = (
+                "unknown" if live is None else
+                "compatible" if live_unit in {"°C", "°F"} else "incompatible_or_missing"
+            )
+            coverage_seconds = sum(
+                float(summary.get("coverage_seconds", 0) or 0)
+                for summary in persisted_hourly
+            )
+            expected_seconds = max(0.0, (end - start).total_seconds())
             if not item.enabled:
                 stage = "disabled"
+            elif live is None:
+                stage = "live_entity_not_found"
+            elif str(live.state).lower() in {"unknown", "unavailable", "none", ""}:
+                stage = "live_entity_unavailable"
+            elif item.attribute and item.attribute not in live.attributes:
+                stage = "configured_attribute_missing"
+            elif unit_status != "compatible":
+                stage = "incompatible_live_unit"
             elif not raw.get("normalized_samples"):
                 stage = "recorder_history_unavailable"
             elif not raw.get("valid_samples"):
@@ -290,6 +394,12 @@ class HomeEnergyCoordinator:
                 stage = "hourly_temperature_not_persisted"
             elif not valid_hourly:
                 stage = "hourly_temperature_rejected_or_uncovered"
+            elif daily and not persisted_daily:
+                stage = "daily_temperature_not_persisted"
+            elif persisted_daily and not valid_daily:
+                stage = "daily_temperature_rejected_or_uncovered"
+            elif expected_seconds and coverage_seconds / expected_seconds < 0.95:
+                stage = "low_persisted_coverage"
             else:
                 stage = "available"
             live_value = None
@@ -307,14 +417,18 @@ class HomeEnergyCoordinator:
                     self.config.get("representative_indoor_source_id"),
                     self.config.get("representative_outdoor_source_id"),
                 },
+                "mapping_effective_at": self.config.get("mapping_effective_at"),
+                "persisted_source_provenance": next((
+                    summary.get("source_provenance")
+                    for summary in reversed([*persisted_hourly, *persisted_daily])
+                    if summary.get("source_provenance")
+                ), None),
                 "live_state": live_value,
                 "live_last_updated": (
                     live.last_updated.isoformat() if live is not None else None
                 ),
-                "live_unit": (None if live is None else (
-                    live.attributes.get("unit_of_measurement")
-                    or live.attributes.get("temperature_unit")
-                )),
+                "live_unit": live_unit,
+                "unit_validation": unit_status,
                 "attribute_available": bool(
                     live is not None and (
                         not item.attribute or item.attribute in live.attributes
@@ -324,6 +438,10 @@ class HomeEnergyCoordinator:
                 "persisted_valid_hourly_summaries": valid_hourly,
                 "persisted_daily_summaries": len(persisted_daily),
                 "persisted_valid_daily_summaries": valid_daily,
+                "persisted_hourly_coverage_seconds": coverage_seconds,
+                "persisted_hourly_coverage_percent": round(
+                    coverage_seconds / expected_seconds * 100.0, 2
+                ) if expected_seconds else 0.0,
                 "rejected_samples": rejections[-100:],
                 "missing_interval_count": len(expected_hours) - valid_hourly,
                 "missing_intervals": missing_intervals,
@@ -333,6 +451,12 @@ class HomeEnergyCoordinator:
             "start_utc": start.isoformat(), "end_utc": end.isoformat(),
             "bounded_days": (end_date - start_date).days + 1,
             "expected_hourly_intervals": len(expected_hours),
+            "query_errors": source.provenance.get("query_errors", []),
+            "configuration_status": "configured" if configured else "not_configured",
+            "representative_sources": {
+                "indoor": self.config.get("representative_indoor_source_id"),
+                "outdoor": self.config.get("representative_outdoor_source_id"),
+            },
             "sources": sources,
         }
 
@@ -383,22 +507,39 @@ class HomeEnergyCoordinator:
         return changed
 
     async def async_catch_up(self) -> None:
-        await self.async_refresh_hourly()
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
-        # A mapping may have been corrected after otherwise valid hourly rows
-        # were persisted. Repair only temperature evidence and never rewrite
-        # valid energy/allocation values. Older archives remain an explicit,
-        # administrator-triggered bounded operation.
-        await self.async_reprocess_temperature_history(
-            local_today - timedelta(days=1), local_today,
-        )
-        await self.async_recover_checkpoints()
+        async def startup_temperature_repair() -> None:
+            try:
+                async with asyncio.timeout(120):
+                    await self.async_reprocess_temperature_history(
+                        local_today - timedelta(days=1), local_today,
+                    )
+            except Exception:  # Never prevent hourly/checkpoint/daily recovery.
+                _LOGGER.exception("Bounded startup temperature repair failed")
+
+        task_name = f"{self.entry.entry_id}_temperature_repair"
+        create_background = getattr(self.entry, "async_create_background_task", None)
+        if create_background is not None:
+            create_background(self.hass, startup_temperature_repair(), task_name)
+        else:  # Test harness and older HA compatibility.
+            self.hass.async_create_task(startup_temperature_repair())
+        try:
+            await self.async_refresh_hourly()
+        except Exception:
+            _LOGGER.exception("Hourly startup recovery failed")
+        try:
+            await self.async_recover_checkpoints()
+        except Exception:
+            _LOGGER.exception("Checkpoint startup recovery failed")
         yesterday = local_today - timedelta(days=1)
         latest = await self.hass.async_add_executor_job(self.database.latest)
         next_day = yesterday if latest is None else date.fromisoformat(latest["local_date"]) + timedelta(days=1)
         next_day = max(next_day, yesterday - timedelta(days=30))
         while next_day <= yesterday:
-            await self.async_process_day(next_day, reason="startup_catchup")
+            try:
+                await self.async_process_day(next_day, reason="startup_catchup")
+            except Exception:
+                _LOGGER.exception("Daily startup recovery failed for %s", next_day)
             next_day += timedelta(days=1)
 
     async def async_recover_checkpoints(self) -> None:
@@ -426,6 +567,144 @@ class HomeEnergyCoordinator:
         start, end = local_day_bounds(day, self.timezone)
         return await self._async_collect_range(start, end)
 
+    async def _async_collect_temperatures(
+        self, start: datetime, end: datetime, source_ids: set[str] | None = None,
+    ) -> DailyInput:
+        """Read only bounded temperature evidence; never query energy or HVAC modes."""
+        sources = self._temperature_sources()
+        if source_ids is not None:
+            sources = [item for item in sources if item.source_id in source_ids]
+        entity_ids = sorted({item.entity_id for item in sources if item.entity_id})
+        query_errors: list[dict[str, str]] = []
+        try:
+            history = await self.reader.async_history(entity_ids, start, end) if entity_ids else {}
+        except Exception as error:  # Recorder may be temporarily unavailable at startup.
+            history = {}
+            query_errors.append({"query": "history", "error": type(error).__name__})
+        statistic_entities = {
+            item.entity_id for item in sources if item.entity_id and item.attribute is None
+        }
+        try:
+            statistics = (
+                await self.reader.async_statistics(statistic_entities, start, end)
+                if statistic_entities else {}
+            )
+        except Exception as error:
+            statistics = {}
+            query_errors.append({"query": "statistics", "error": type(error).__name__})
+
+        try:
+            influx_mapping = json.loads(self.config.get(CONF_INFLUX_MAPPING, "{}") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            influx_mapping = {}
+        influx = None
+        if (
+            self.config.get(CONF_INFLUX_ENABLED)
+            and self.config.get(CONF_INFLUX_HOST)
+            and self.config.get(CONF_INFLUX_DATABASE)
+        ):
+            influx = InfluxBackfillClient(
+                host=self.config[CONF_INFLUX_HOST],
+                port=int(self.config.get(CONF_INFLUX_PORT, 8086)),
+                database=self.config[CONF_INFLUX_DATABASE],
+                username=self.config.get(CONF_INFLUX_USERNAME),
+                password=self.config.get(CONF_INFLUX_PASSWORD),
+                use_ssl=bool(self.config.get("influx_use_ssl", False)),
+                verify_ssl=bool(self.config.get("influx_verify_ssl", True)),
+                retention_policy=str(self.config.get("influx_retention_policy", "autogen")),
+            )
+
+        def source_unit(entity_id: str) -> str | None:
+            state = self.hass.states.get(entity_id)
+            return state.attributes.get("unit_of_measurement") if state else None
+
+        temperatures: dict[str, list[NumericSample]] = {}
+        quality = {}
+        roles = {}
+        collection = {}
+        used_influx: list[str] = []
+        for item in sources:
+            state_rows = history.get(item.entity_id, [])
+            samples = [
+                NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                              sample.source_unit, sample.normalized_unit)
+                for sample in states_to_numeric(
+                    state_rows, attribute=item.attribute, dimension="temperature",
+                )
+            ]
+            if len(samples) < 2 and item.attribute is None:
+                statistic_samples = statistics_to_numeric_samples(
+                    statistics.get(item.entity_id, []),
+                    source_unit=source_unit(item.entity_id) or "°C",
+                )
+                if len(statistic_samples) >= 2:
+                    samples = [
+                        NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                                      sample.source_unit, sample.normalized_unit)
+                        for sample in statistic_samples
+                    ]
+            mapping_key = f"temperature.{item.source_id}"
+            mapping = influx_mapping.get(mapping_key) if isinstance(influx_mapping, dict) else None
+            if len(samples) < 2 and influx is not None and isinstance(mapping, dict):
+                rows = await self.hass.async_add_executor_job(partial(
+                    influx.query, mapping["measurement"], mapping.get("field", "value"),
+                    start, end, entity_tag=mapping.get("entity_tag"),
+                ))
+                if rows:
+                    used_influx.append(mapping_key)
+                    converted = states_to_numeric([
+                        SimpleNamespace(
+                            last_updated=timestamp, state=value,
+                            attributes={"unit_of_measurement": mapping.get("unit")},
+                        ) for timestamp, value in rows
+                    ], dimension="temperature")
+                    samples = [
+                        NumericSample(sample.timestamp, sample.value, sample.reason, item.entity_id,
+                                      sample.source_unit, sample.normalized_unit)
+                        for sample in converted
+                    ]
+            temperatures[item.source_id] = samples
+            quality[item.source_id] = item.quality
+            roles[item.source_id] = item.role
+            valid = [sample for sample in samples if sample.value is not None]
+            collection[item.source_id] = {
+                "source_id": item.source_id,
+                "entity_id": item.entity_id,
+                "attribute": item.attribute,
+                "role": item.role,
+                "configured": True,
+                "enabled": item.enabled,
+                "recorder_state_rows": len(state_rows),
+                "recorder_statistics_rows": len(statistics.get(item.entity_id, [])),
+                "normalized_samples": len(samples),
+                "valid_samples": len(valid),
+                "available_start": (
+                    min(sample.timestamp for sample in valid).isoformat() if valid else None
+                ),
+                "available_end": (
+                    max(sample.timestamp for sample in valid).isoformat() if valid else None
+                ),
+                "invalid_reasons": sorted({
+                    str(sample.reason) for sample in samples
+                    if sample.value is None and sample.reason
+                }),
+                "source_units": sorted({
+                    str(sample.source_unit) for sample in samples if sample.source_unit
+                }),
+                "normalized_unit": "°C",
+            }
+        return DailyInput({}, {}, temperatures, provenance={
+            "primary_source": "home_assistant_recorder",
+            "collector": "temperature_only",
+            "period_start_utc": start.isoformat(),
+            "period_end_utc": end.isoformat(),
+            "raw_history_includes_preceding_state": True,
+            "long_term_statistics_fallback": True,
+            "influx_backfill_keys": used_influx,
+            "query_errors": query_errors,
+            "temperature_collection": collection,
+        }, temperature_quality=quality, temperature_roles=roles)
+
     async def _async_collect_range(
         self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None,
         store_mapping_revision: bool = True,
@@ -433,12 +712,7 @@ class HomeEnergyCoordinator:
         equipment = [item for item in equipment_from_config(self.config) if item.enabled]
         if equipment_ids is not None:
             equipment = [item for item in equipment if item.equipment_id in equipment_ids]
-        temperature_sources = [item for item in temperatures_from_config(self.config) if item.enabled]
-        explicitly_mapped = {(item.entity_id, item.role) for item in temperature_sources}
-        temperature_sources.extend(
-            item for item in equipment_temperature_mappings(equipment)
-            if (item.entity_id, item.role) not in explicitly_mapped
-        )
+        temperature_sources = self._temperature_sources(equipment=equipment)
         site_sources = self._site_sources()
         entity_ids = [
             entity for item in equipment

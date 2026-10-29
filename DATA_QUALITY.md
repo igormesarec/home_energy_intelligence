@@ -61,6 +61,16 @@ summary exists or replaces it only when the recovered valid duration is greater.
 It never fills a gap, overwrites a stronger valid measurement, creates a finalized
 day, or changes electricity/allocation fields.
 
+The repair collector requests only enabled temperature entities. Before querying
+Recorder it skips source/day combinations that already have at least 95% valid
+coverage and non-partial quality. Every candidate must identify the exact UTC
+period and mapped entity. A dedicated `BEGIN IMMEDIATE` transaction re-reads the
+latest payload under the write lock, compares quality/coverage/provenance, and
+updates only the JSON temperature map, checksum/revision metadata and rejection
+rows belonging to changed temperature sources. A retry with identical evidence
+is a no-op. Overlapping repairs are rejected and a failed startup repair is logged
+without blocking hourly, checkpoint or daily recovery.
+
 For an in-progress local date, date availability uses completed elapsed seconds
 against that date's full 23/24/25-hour duration. Meter and allocation coverage use
 the completed-hour processing scope, so a fully processed six-hour cutoff can have
@@ -76,3 +86,6 @@ frontend requires at least 10 admitted dates, an observed outdoor span of 8 °C 
 R² ≥ 0.5 before showing a conservative electrical fit. These are evidence-quality
 gates, not a claim of thermal output, COP, physical balance point or design-day
 capacity.
+
+Overview and House Thermal Profile consume this same backend candidate list and
+the same `validated` status. The panel does not independently admit dates.

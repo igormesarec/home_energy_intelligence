@@ -24,4 +24,13 @@ Period responses expose independent `date_coverage`, `meter_coverage`, `allocati
 
 Checkpoint upserts use interval/device primary keys and checksums, making restart recovery and retries idempotent. Daily finalization reads stored checkpoints first and uses Recorder's daily counter change to reconcile rather than reclassify valid checkpoint evidence.
 
+Temperature history repair does not call the general daily/hourly upsert path.
+It acquires an immediate SQLite write transaction, re-reads the latest row,
+requires exact stored UTC boundaries and entity provenance, then changes only
+`payload_json`, its SHA-256 checksum and row update/revision metadata. Daily
+repairs add a `temperature_history_repair` revision; hourly repair follows the
+existing no-revision hourly convention. Allocation rows and unrelated rejection
+audits are untouched. A failure rolls the payload, checksum, revision and audit
+changes back together.
+
 The ten-year synthetic growth test keeps 3,650 compact daily rows below 5 MB in the test environment. Actual size depends on checkpoint detail and retained revisions.

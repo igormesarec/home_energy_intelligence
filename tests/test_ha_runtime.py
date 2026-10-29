@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import importlib.util
 import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -63,6 +65,191 @@ async def test_temperature_pipeline_preserves_recorder_rows_and_collection_evide
     )
     assert record.temperatures["indoor"]["mean"] == pytest.approx(21.5)
     assert record.temperatures["indoor"]["coverage_percent"] == 100
+
+
+@pytest.mark.asyncio
+async def test_temperature_only_collector_never_requests_energy_mode_pv_or_grid(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": json.dumps([{
+            "equipment_id": "hp", "display_name": "Heat pump", "kind": "heat_pump",
+            "enabled": True, "energy_entity": "sensor.hp_energy",
+            "power_entity": "sensor.hp_power", "state_entity": "sensor.hp_mode",
+        }]),
+        "site_sources": {"pv": "sensor.pv", "import": "sensor.import", "export": "sensor.export"},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.outdoor", "enabled": True,
+        }]),
+    }, options={})
+    coordinator = HomeEnergyCoordinator(
+        hass, entry, SimpleNamespace(store_mapping_revision=lambda _revision: True)
+    )
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.outdoor": []}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    await coordinator._async_collect_temperatures(start, end, {"outdoor"})
+    history_ids = coordinator.reader.async_history.await_args.args[0]
+    statistic_ids = coordinator.reader.async_statistics.await_args.args[0]
+    assert history_ids == ["sensor.outdoor"]
+    assert statistic_ids == {"sensor.outdoor"}
+    forbidden = {"sensor.hp_energy", "sensor.hp_power", "sensor.hp_mode",
+                 "sensor.pv", "sensor.import", "sensor.export"}
+    assert forbidden.isdisjoint(history_ids)
+    assert forbidden.isdisjoint(statistic_ids)
+
+
+@pytest.mark.asyncio
+async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_sources(
+    hass, tmp_path,
+):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+    from custom_components.home_energy_intelligence.models import DailyRecord
+
+    target = date(2026, 10, 29)
+    start = datetime(2026, 10, 29, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    database = EnergyDatabase(tmp_path / "energy.sqlite3")
+    database.initialize()
+    database.upsert_daily(DailyRecord(
+        target.isoformat(), "UTC", start.isoformat(), end.isoformat(), 86400,
+        6.7, None, None, None, None, "partial", temperatures={}, allocations={},
+    ))
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": json.dumps([{
+            "equipment_id": "hp", "display_name": "Heat pump", "kind": "heat_pump",
+            "enabled": True, "energy_entity": "sensor.hp_energy",
+            "power_entity": "sensor.hp_power", "state_entity": "sensor.hp_mode",
+        }]),
+        "site_sources": {"pv": "sensor.pv", "import": "sensor.import"},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.outdoor", "enabled": True,
+            "quality": {"minimum": -40, "maximum": 55,
+                        "invalid_values": [-55, 155]},
+        }]),
+    }, options={})
+    hass.states.async_set("sensor.outdoor", "8", {
+        "device_class": "temperature", "unit_of_measurement": "°C",
+    })
+    rows = [
+        SimpleNamespace(last_updated=start, state="8", attributes={
+            "unit_of_measurement": "°C",
+        }),
+        SimpleNamespace(last_updated=end, state="9", attributes={
+            "unit_of_measurement": "°C",
+        }),
+    ]
+    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.outdoor": rows}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    coordinator._async_collect_range = AsyncMock(
+        side_effect=AssertionError("repair must not invoke the general collector")
+    )
+    result = await coordinator.async_reprocess_temperature_history(target, target)
+    assert result["changed_daily_records"] == 1
+    assert result["sources_with_available_history"] == 1
+    assert result["error_count"] == 0
+    assert coordinator.reader.async_history.await_count == 1
+    assert coordinator.reader.async_statistics.await_count == 1
+    queried = coordinator.reader.async_history.await_args.args[0]
+    assert queried == ["sensor.outdoor"]
+    assert {"sensor.hp_energy", "sensor.hp_power", "sensor.hp_mode",
+            "sensor.pv", "sensor.import"}.isdisjoint(queried)
+    assert coordinator._async_collect_range.await_count == 0
+    repaired = database.daily(target.isoformat())
+    assert repaired["household_kwh"] == 6.7
+    assert repaired["temperatures"]["outdoor"]["mean"] == pytest.approx(8)
+
+    second = await coordinator.async_reprocess_temperature_history(target, target)
+    assert second["changed_daily_records"] == 0
+    assert second["sources_skipped_complete"] == 1
+    assert coordinator.reader.async_history.await_count == 1
+    assert coordinator.reader.async_statistics.await_count == 1
+
+    await coordinator._temperature_repair_lock.acquire()
+    try:
+        overlap = await coordinator.async_reprocess_temperature_history(target, target)
+    finally:
+        coordinator._temperature_repair_lock.release()
+    assert overlap["errors"][0]["reason"] == "temperature_repair_already_running"
+
+
+@pytest.mark.asyncio
+async def test_startup_temperature_repair_failure_does_not_block_other_recovery(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    local_today = datetime.now(UTC).astimezone(ZoneInfo(hass.config.time_zone)).date()
+    background = []
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "temperature_sources": "[]", "site_sources": {},
+    }, options={})
+    entry.async_create_background_task = (
+        lambda target_hass, coroutine, _name:
+        background.append(target_hass.async_create_task(coroutine))
+    )
+    database = SimpleNamespace(latest=lambda: {
+        "local_date": (local_today - timedelta(days=1)).isoformat(),
+    })
+    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    coordinator.async_refresh_hourly = AsyncMock(return_value=0)
+    coordinator.async_recover_checkpoints = AsyncMock(return_value=None)
+    coordinator.async_reprocess_temperature_history = AsyncMock(
+        side_effect=RuntimeError("Recorder unavailable")
+    )
+    coordinator.async_process_day = AsyncMock(return_value=False)
+
+    await coordinator.async_catch_up()
+    await asyncio.gather(*background)
+    coordinator.async_refresh_hourly.assert_awaited_once()
+    coordinator.async_recover_checkpoints.assert_awaited_once()
+    coordinator.async_reprocess_temperature_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slow_startup_temperature_repair_runs_outside_normal_recovery(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    local_today = datetime.now(UTC).astimezone(ZoneInfo(hass.config.time_zone)).date()
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    background = []
+
+    async def slow_repair(*_args):
+        started.set()
+        await gate.wait()
+        return {"changed_daily_records": 0, "changed_hourly_records": 0}
+
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": "[]", "temperature_sources": "[]", "site_sources": {},
+    }, options={})
+    entry.async_create_background_task = (
+        lambda target_hass, coroutine, _name:
+        background.append(target_hass.async_create_task(coroutine))
+    )
+    database = SimpleNamespace(latest=lambda: {
+        "local_date": (local_today - timedelta(days=1)).isoformat(),
+    })
+    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    coordinator.async_refresh_hourly = AsyncMock(return_value=0)
+    coordinator.async_recover_checkpoints = AsyncMock(return_value=None)
+    coordinator.async_reprocess_temperature_history = AsyncMock(side_effect=slow_repair)
+    coordinator.async_process_day = AsyncMock(return_value=False)
+
+    await coordinator.async_catch_up()
+    await started.wait()
+    assert background and not background[0].done()
+    coordinator.async_refresh_hourly.assert_awaited_once()
+    coordinator.async_recover_checkpoints.assert_awaited_once()
+    gate.set()
+    await asyncio.gather(*background)
 
 
 def test_current_recorder_read_api_contract():

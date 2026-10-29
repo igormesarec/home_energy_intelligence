@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Any
 
 from .timeutils import local_day_bounds
@@ -338,6 +339,7 @@ def attach_canonical(record: dict[str, Any], equipment: Iterable[dict[str, Any]]
 def heating_response_profile(
     records: Iterable[dict[str, Any]], equipment: Iterable[dict[str, Any]],
     *, outdoor_source_id: str | None, floor_area_m2: float | None,
+    outdoor_source_is_measured_air: bool = True,
     minimum_temperature_coverage: float = 95.0,
     reconciliation_tolerance_kwh: float = 0.05,
 ) -> dict[str, Any]:
@@ -361,9 +363,11 @@ def heating_response_profile(
         outdoor_coverage = _number(temperature.get("coverage_percent"))
         if not outdoor_source_id:
             reasons.append("representative_outdoor_not_configured")
+        elif not outdoor_source_is_measured_air:
+            reasons.append("representative_source_not_measured_outdoor_air")
         elif outdoor_mean is None:
             reasons.append("outdoor_temperature_unavailable")
-        elif outdoor_mean in {-55.0, 155.0}:
+        elif not isfinite(outdoor_mean) or outdoor_mean in {-55.0, 155.0}:
             reasons.append("invalid_outdoor_temperature")
         if outdoor_coverage is None:
             reasons.append("outdoor_coverage_unknown")
@@ -374,22 +378,51 @@ def heating_response_profile(
 
         energy = canonical_energy(record, equipment)
         heating = _number(energy.get("space_heating_kwh"))
-        if heating is None:
+        if heating is None or not isfinite(heating):
             reasons.append("incomplete_heating_classification")
+            if heating is not None and not isfinite(heating):
+                heating = None
         discrepancy = _number(energy.get("unallocated_discrepancy_kwh"))
         if discrepancy is None:
             reasons.append("reconciliation_unknown")
         elif abs(discrepancy) > reconciliation_tolerance_kwh:
             reasons.append("unreconciled_hvac_energy")
-        if not floor_area_m2 or floor_area_m2 <= 0:
+        if not floor_area_m2 or floor_area_m2 <= 0 or not isfinite(float(floor_area_m2)):
             reasons.append("floor_area_unavailable")
 
         devices = energy.get("equipment") or []
+        equipment_heating = []
+        for item in devices:
+            confirmed = _number(item.get("known_confirmed_heating_kwh")) or 0.0
+            uncertain = sum(
+                _number(item.get(key)) or 0.0 for key in (
+                    "known_assumed_heating_kwh", "known_selected_heating_kwh",
+                    "known_estimated_heating_kwh",
+                )
+            )
+            equipment_heating.append({
+                "equipment_id": item.get("equipment_id"),
+                "display_name": item.get("display_name"),
+                "kind": item.get("kind"),
+                "confirmed_heating_kwh": confirmed,
+                "uncertain_heating_kwh": uncertain,
+                "space_heating_kwh": confirmed + uncertain,
+                "classification_complete": bool(item.get("classification_complete")),
+                "classification_quality": item.get("quality", "missing"),
+                "classification_source": (
+                    item.get("classification_source") or item.get("source")
+                ),
+                "coverage_percent": item.get("coverage_percent"),
+            })
+        outdoor_validated_seconds = _number(temperature.get("coverage_seconds"))
         point = {
             "local_date": local_date,
+            "period_start_utc": record.get("period_start_utc"),
+            "period_end_utc": record.get("period_end_utc"),
             "outdoor_source_id": outdoor_source_id,
             "outdoor_mean_c": outdoor_mean,
             "outdoor_coverage_percent": outdoor_coverage,
+            "outdoor_validated_seconds": outdoor_validated_seconds,
             "heating_electricity_kwh": heating,
             "heat_pump_heating_kwh": (
                 None if heating is None else sum(
@@ -421,12 +454,20 @@ def heating_response_profile(
                 heating / floor_area_m2
                 if heating is not None and floor_area_m2 and floor_area_m2 > 0 else None
             ),
+            "equipment_heating": equipment_heating,
+            "classification_complete": bool(
+                heating is not None and all(
+                    item["classification_complete"] for item in equipment_heating
+                )
+            ),
+            "reconciliation_discrepancy_kwh": discrepancy,
             "device_classification_quality": {
                 str(item.get("equipment_id")): item.get("quality", "missing")
                 for item in devices
             },
             "source_provenance": {
                 "temperature_source_id": outdoor_source_id,
+                "temperature": temperature.get("source_provenance"),
                 "classification_sources": {
                     str(item.get("equipment_id")): item.get("classification_source")
                     or item.get("source")

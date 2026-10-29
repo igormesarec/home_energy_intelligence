@@ -56,6 +56,10 @@ Covered acceptance cases include:
 - October 29 blank representative-temperature symptom: Recorder samples retain source/entity/unit/range provenance, missing persisted summaries receive temperature-only repair, stronger existing values and all energy/allocation fields remain unchanged, and retries are idempotent.
 - Temperature diagnostic and repair WebSockets are administrator-only, bounded to 31 days and expose live/Recorder/rejection/hourly/daily/missing-interval stages.
 - Daily Energy Split uses independent incomplete-period, missing-meter, incomplete-classification, estimated-allocation and missing-temperature labels; a current partial day is not also called missing merely because it is partial.
+- Overview and House Thermal Profile consume one backend-qualified response-point set with the exact 95% coverage boundary, dynamic per-device evidence and explicit exclusions.
+- Atomic temperature repair rejects mismatched UTC intervals/entity provenance and quality downgrades, preserves allocations/unrelated rejection audits, keeps checksums valid, is idempotent and rolls back payload/revision changes on a simulated write failure.
+- The lean temperature collector's Recorder entity sets exclude HVAC energy/power/mode, PV and grid sources; a successful retry performs one bounded history and one statistics query per queried day, while a complete source performs zero queries.
+- Energy Split frontend contracts preserve unavailable category nulls and label them unavailable rather than converting them to confirmed zero segments.
 
 ## Responsive layout evidence
 

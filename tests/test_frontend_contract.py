@@ -182,3 +182,19 @@ def test_energy_split_quality_does_not_call_an_intentional_partial_day_missing()
         assert label in method
     assert "!r.energy?.complete" not in chart
     assert "this.splitQuality(r)" in chart
+    assert "known_selected_heating_kwh" in method
+    assert "known_space_heating_kwh ?? null" in chart
+    assert "known_dhw_kwh ?? null" in chart
+    assert "known_cooling_kwh ?? null" in chart
+    assert "Unavailable is not measured zero" in chart
+
+
+def test_overview_and_thermal_use_the_same_backend_response_points():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    scatter = source[source.index("scatterChart()"):source.index("responseProfile()")]
+    thermal = source[source.index("responseProfile()"):source.index("thermalView()")]
+    assert "this.history" not in scatter
+    assert "responseProfileData" in scatter
+    assert 'status==="validated"' in scatter
+    assert "exclusion_reasons" in scatter
+    assert "responseProfileData" in thermal

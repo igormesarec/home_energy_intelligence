@@ -2,6 +2,11 @@
 
 ## V0.1.1 — draft
 
+- Made the backend `heating_response_profile()` the single qualification source for both Overview and House Thermal Profile; the frontend no longer derives a second point set from History rows.
+- Replaced temperature repair's read/rebuild/generic-upsert sequence with interval-checked `BEGIN IMMEDIATE` merges that update only temperature payload evidence, checksum/revision metadata and affected-source rejection audits.
+- Added a temperature-only bounded Recorder collector. It never requests equipment energy, power, modes, PV or grid entities; complete sources are skipped before any Recorder query, repairs are serialized and startup failures cannot block hourly/checkpoint/daily recovery.
+- Strengthened diagnostics with live entity/attribute/unit state, Recorder query errors/range, persisted coverage seconds/percentage and representative stable-source IDs.
+- Kept unavailable Energy Split categories null and visibly unavailable instead of converting them to display zeroes.
 - Added idempotent completed-hour aggregation, restart recovery and an additive SQLite schema V3 migration.
 - Made the backend canonical energy contract authoritative for Overview, History and authenticated CSV export.
 - Added today-through-last-completed-hour actuals, yesterday same-cutoff/full-day comparisons, freshness labels and manual/hourly refresh.
