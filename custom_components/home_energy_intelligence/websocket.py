@@ -15,7 +15,7 @@ from .configuration import (
     equipment_from_config, equipment_temperature_mappings, temperatures_from_config,
 )
 from .analytics import (
-    attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
+    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records, daily_coverage,
     derive_record_quality, heating_response_profile,
     interval_coverage, replace_with_partial_day,
 )
@@ -24,6 +24,10 @@ from .periods import period_bounds, previous_day_same_local_cutoff
 from .timeutils import local_day_bounds
 from .temperature_timeline import (
     build_timeline_intervals, hourly_axis_ticks, validate_timeline_dates,
+)
+from .thermal import (
+    cumulative_intervals, normalize_manual_reading, ratio_of_sums,
+    thermal_performance_points,
 )
 
 
@@ -40,6 +44,11 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_status)
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
     websocket_api.async_register_command(hass, ws_temperature_timeline)
+    websocket_api.async_register_command(hass, ws_v02_report)
+    websocket_api.async_register_command(hass, ws_thermal_readings)
+    websocket_api.async_register_command(hass, ws_save_thermal_reading)
+    websocket_api.async_register_command(hass, ws_delete_thermal_reading)
+    websocket_api.async_register_command(hass, ws_backfill_thermal_readings)
 
 
 def _coordinator(hass):
@@ -162,6 +171,281 @@ async def ws_temperature_timeline(hass, connection, msg):
         "axis_ticks": (hourly_axis_ticks(start_utc, end_utc, timezone)
                        if resolution == "hourly" else []),
     })
+
+
+def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
+    points = []
+    for record in records:
+        energy = canonical_energy(record, equipment)
+        temperature = (record.get("temperatures") or {}).get(outdoor_source_id, {})
+        devices = energy.get("equipment") or []
+        heat_pumps = []
+        air_conditioners = []
+        cooling_units = []
+        for item in devices:
+            if item.get("kind") == "heat_pump":
+                value = sum(float(item.get(key) or 0) for key in (
+                    "known_confirmed_heating_kwh", "known_assumed_heating_kwh",
+                ))
+                heat_pumps.append({"equipment_id": item.get("equipment_id"),
+                                   "display_name": item.get("display_name"),
+                                   "electricity_kwh": value,
+                                   "quality": item.get("quality")})
+            elif item.get("kind") == "air_conditioner":
+                heating = sum(float(item.get(key) or 0) for key in (
+                    "known_confirmed_heating_kwh", "known_selected_heating_kwh",
+                    "known_estimated_heating_kwh",
+                ))
+                cooling = sum(float(item.get(key) or 0) for key in (
+                    "known_confirmed_cooling_kwh", "known_selected_cooling_kwh",
+                    "known_estimated_cooling_kwh",
+                ))
+                air_conditioners.append({"equipment_id": item.get("equipment_id"),
+                                         "display_name": item.get("display_name"),
+                                         "electricity_kwh": heating,
+                                         "quality": item.get("quality")})
+                cooling_units.append({"equipment_id": item.get("equipment_id"),
+                                      "display_name": item.get("display_name"),
+                                      "electricity_kwh": cooling,
+                                      "quality": item.get("quality")})
+        whole = sum(item["electricity_kwh"] for item in heat_pumps + air_conditioners)
+        cooling = sum(item["electricity_kwh"] for item in cooling_units)
+        complete = all(bool(item.get("classification_complete")) for item in devices)
+        points.append({
+            "local_date": record.get("local_date"),
+            "outdoor_mean_c": temperature.get("mean"),
+            "outdoor_coverage_percent": temperature.get("coverage_percent"),
+            "heat_pumps": heat_pumps, "air_conditioners": air_conditioners,
+            "cooling_units": cooling_units,
+            "whole_house_heating_kwh": whole if complete else None,
+            "whole_house_heating_known_subtotal_kwh": whole,
+            "normalized_heating_kwh_m2_day": (
+                whole / float(floor_area_m2) if complete and floor_area_m2 else None
+            ),
+            "ac_cooling_kwh": cooling if complete else None,
+            "ac_cooling_known_subtotal_kwh": cooling,
+            "normalized_cooling_kwh_m2_day": (
+                cooling / float(floor_area_m2) if complete and floor_area_m2 else None
+            ),
+            "classification_complete": complete,
+        })
+    return points
+
+
+def _outdoor_interval_evidence(intervals, hourly, source_id):
+    result = {}
+    for interval in intervals:
+        start = datetime.fromisoformat(interval["start_utc"]).astimezone(UTC)
+        end = datetime.fromisoformat(interval["end_utc"]).astimezone(UTC)
+        weighted = valid = 0.0
+        for record in hourly:
+            row_start = datetime.fromisoformat(record["period_start_utc"]).astimezone(UTC)
+            row_end = datetime.fromisoformat(record["period_end_utc"]).astimezone(UTC)
+            if row_start < start or row_end > end:
+                continue
+            value = (record.get("temperatures") or {}).get(source_id, {})
+            mean = value.get("mean")
+            seconds = float(value.get("coverage_seconds") or 0)
+            if mean is not None and seconds > 0:
+                weighted += float(mean) * seconds
+                valid += seconds
+        expected = (end - start).total_seconds()
+        coverage = valid / expected * 100 if expected else 0.0
+        key = (interval["start_utc"], interval["end_utc"])
+        result[key] = {
+            "mean_c": weighted / valid if valid and coverage >= 95.0 else None,
+            "coverage_percent": coverage,
+            "response_eligible": coverage >= 95.0,
+            "complete": coverage >= 100.0,
+        }
+    return result
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/v02_report",
+    vol.Required("start_date"): str, vol.Required("end_date"): str,
+})
+@websocket_api.async_response
+async def ws_v02_report(hass, connection, msg):
+    """Return four separated response datasets without fabricating COP."""
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = validate_timeline_dates(
+            msg["start_date"], msg["end_date"], maximum_days=3660
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    records = await hass.async_add_executor_job(
+        coordinator.database.history_period, start.isoformat(), end.isoformat()
+    )
+    local_today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    if start <= local_today <= end:
+        partial_today, _hours, _coverage, _cutoff, _today = (
+            await _current_day_snapshot(hass, coordinator)
+        )
+        records = replace_with_partial_day(records, partial_today)
+    equipment = _equipment(coordinator)
+    outdoor_source_id = coordinator.config.get("representative_outdoor_source_id")
+    daily = _v02_daily_curves(
+        records, equipment, outdoor_source_id, coordinator.config.get("floor_area_m2")
+    )
+    period_start, _ = local_day_bounds(start, coordinator.timezone)
+    _, period_end = local_day_bounds(end, coordinator.timezone)
+    readings = await hass.async_add_executor_job(
+        coordinator.database.thermal_readings_period, period_start, period_end
+    )
+    intervals = [item for item in cumulative_intervals(readings)
+                 if item["end_utc"] >= period_start.isoformat()
+                 and item["start_utc"] <= period_end.isoformat()]
+    hourly = []
+    if intervals:
+        interval_start = min(datetime.fromisoformat(item["start_utc"]) for item in intervals)
+        interval_end = max(datetime.fromisoformat(item["end_utc"]) for item in intervals)
+        hourly = await hass.async_add_executor_job(
+            coordinator.database.hourly_range, interval_start, interval_end
+        )
+    outdoor = _outdoor_interval_evidence(intervals, hourly, outdoor_source_id)
+    thermal_points = thermal_performance_points(
+        intervals, hourly, equipment,
+        {key: value["mean_c"] for key, value in outdoor.items()},
+    )
+    for point in thermal_points:
+        point["outdoor_evidence"] = outdoor[(point["start_utc"], point["end_utc"])]
+    def category_report(category):
+        eligible = [point for point in thermal_points
+                    if point.get(f"{category}_thermal_delta_kwh") is not None
+                    and point.get(f"{category}_electricity_kwh") is not None]
+        thermal_values = [point[f"{category}_thermal_delta_kwh"] for point in eligible]
+        electricity_values = [point[f"{category}_electricity_kwh"] for point in eligible]
+        return {"thermal_kwh": sum(thermal_values),
+                "electricity_kwh": sum(electricity_values),
+                "cop": ratio_of_sums(thermal_values, electricity_values),
+                "matched_interval_count": len(eligible)}
+    heating_report = category_report("heating")
+    dhw_report = category_report("dhw")
+    combined_report = {
+        "thermal_kwh": heating_report["thermal_kwh"] + dhw_report["thermal_kwh"],
+        "electricity_kwh": (
+            heating_report["electricity_kwh"] + dhw_report["electricity_kwh"]
+        ),
+        "matched_interval_count": (
+            heating_report["matched_interval_count"] + dhw_report["matched_interval_count"]
+        ),
+    }
+    combined_report["cop"] = ratio_of_sums(
+        [combined_report["thermal_kwh"]], [combined_report["electricity_kwh"]]
+    )
+    connection.send_result(msg["id"], {
+        "timezone": coordinator.timezone, "floor_area_m2": coordinator.config.get("floor_area_m2"),
+        "outdoor_source_id": outdoor_source_id,
+        "whole_house_heating": daily, "ac_cooling": daily,
+        "ecodan_space_heating": thermal_points, "ecodan_dhw": thermal_points,
+        "ecodan_reports": {"heating": heating_report, "dhw": dhw_report,
+                           "combined": combined_report},
+        "cop_scope": "ecodan_only", "ac_cop_supported": False,
+    })
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/thermal_readings"})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_thermal_readings(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    readings = await hass.async_add_executor_job(
+        lambda: coordinator.database.thermal_readings(limit=500)
+    )
+    total = await hass.async_add_executor_job(coordinator.database.thermal_reading_count)
+    connection.send_result(msg["id"], {"readings": readings,
+                                        "intervals": cumulative_intervals(readings),
+                                        "total": total, "limit": 500})
+
+
+_OPTIONAL_COUNTER = vol.Any(None, str, int, float)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/save_thermal_reading",
+    vol.Optional("reading_id"): int,
+    vol.Required("ecodan_equipment_id"): str, vol.Required("meter_identity"): str,
+    vol.Required("local_date"): str, vol.Required("local_time"): str,
+    vol.Optional("fold"): vol.In([0, 1]),
+    vol.Optional("heating_thermal_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("dhw_thermal_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_heating_electricity_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_dhw_electricity_kwh"): _OPTIONAL_COUNTER,
+    vol.Required("source_label"): str, vol.Optional("note"): str,
+    vol.Optional("unit", default="kWh"): vol.In(["Wh", "kWh", "MWh"]),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_save_thermal_reading(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    equipment = {item.equipment_id: item for item in equipment_from_config(coordinator.config)}
+    selected = equipment.get(msg["ecodan_equipment_id"])
+    if selected is None or selected.kind != "heat_pump":
+        connection.send_error(msg["id"], "invalid_equipment", "Select a configured heat pump")
+        return
+    try:
+        payload = normalize_manual_reading(msg, coordinator.timezone)
+        result = await hass.async_add_executor_job(
+            coordinator.database.save_thermal_reading, payload, msg.get("reading_id")
+        )
+    except (ValueError, KeyError) as error:
+        connection.send_error(msg["id"], "invalid_reading", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/delete_thermal_reading",
+    vol.Required("reading_id"): int,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_thermal_reading(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    deleted = await hass.async_add_executor_job(
+        coordinator.database.delete_thermal_reading, msg["reading_id"]
+    )
+    if not deleted:
+        connection.send_error(msg["id"], "not_found", "Thermal reading was not found")
+        return
+    connection.send_result(msg["id"], {"deleted": True})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/backfill_thermal_readings",
+    vol.Required("start_date"): str, vol.Required("end_date"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_backfill_thermal_readings(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = validate_timeline_dates(
+            msg["start_date"], msg["end_date"], maximum_days=366
+        )
+        result = await coordinator.async_backfill_thermal_counters(start, end)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
 
 
 async def _current_day_snapshot(
@@ -761,6 +1045,13 @@ async def ws_settings(hass, connection, msg):
     for item in temperatures_from_config(config):
         mapping.append({"key": f"temperature.{item.source_id}", "label": item.display_name,
                         "entity_id": item.entity_id, "enabled": item.enabled})
+    for key in (
+        "heating_thermal_energy_entity", "dhw_thermal_energy_entity",
+        "vendor_heating_electricity_entity", "vendor_dhw_electricity_entity",
+    ):
+        if config.get(key):
+            mapping.append({"key": f"thermal.{key}", "label": key.replace("_", " ").title(),
+                            "entity_id": config[key], "enabled": True})
     storage = await hass.async_add_executor_job(coordinator.database.storage_status)
     connection.send_result(msg["id"], {
         "configured": True,
@@ -769,6 +1060,8 @@ async def ws_settings(hass, connection, msg):
         "floor_area_m2": config.get("floor_area_m2"),
         "cycle_hours": config.get("cycle_hours", 6),
         "influx_enabled": bool(config.get("influx_enabled", False)),
+        "thermal_source_mode": config.get("thermal_source_mode", "manual_only"),
+        "ecodan_thermal_equipment_id": config.get("ecodan_thermal_equipment_id"),
         "mapping": mapping,
         "database_size_bytes": storage["database_size_bytes"],
         "storage": storage,

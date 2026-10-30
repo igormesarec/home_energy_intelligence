@@ -53,12 +53,12 @@ def test_dashboard_role_contract_keeps_settings_admin_only_not_history():
         assert "require_admin" in prefix
 
 
-def test_v012_frontend_cache_key_uses_content_hash_and_keeps_sidebar_path():
+def test_v02_frontend_cache_key_uses_content_hash_and_keeps_sidebar_path():
     panel = (INTEGRATION / "panel.py").read_text(encoding="utf-8")
     manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
     const = (INTEGRATION / "const.py").read_text(encoding="utf-8")
-    assert manifest["version"] == "0.1.2"
-    assert 'VERSION: Final = "0.1.2"' in const
+    assert manifest["version"] == "0.2.0"
+    assert 'VERSION: Final = "0.2.0"' in const
     assert "sha256" in panel and "frontend_build" in panel
     assert "?v={VERSION}-{frontend_build}" in panel
     assert "frontend_url_path=PANEL_URL" in panel
@@ -140,7 +140,7 @@ def test_overview_and_history_share_today_period_controls_and_cutoff():
     frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
     websocket = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
     assert 'this.historyPreset = "today"' in frontend
-    assert frontend.count("${this.periodControls()}") == 3
+    assert frontend.count("${this.periodControls()}") == 4
     assert "cutoff_utc:this.overviewData.cutoff_utc" in frontend
     assert "replace_with_partial_day(" in websocket and "stored_records, partial_today" in websocket
     assert websocket.count("_current_day_snapshot(") >= 3
@@ -178,18 +178,21 @@ def test_unconfigured_representatives_are_explicit_and_never_claim_coverage():
     assert "weather provider or water-circuit sensor is never substituted" in source
 
 
-def test_thermal_profile_is_electrical_and_withholds_unmeasured_heat_output():
+def test_v02_thermal_profile_uses_measured_heat_and_never_ac_cop():
     source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
     backend = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
     analytics = (INTEGRATION / "analytics.py").read_text(encoding="utf-8")
-    assert "Whole-House Electrical Heating Response" in source
+    assert "Whole-House Heating Electricity" in source
+    assert "Whole-House Energy / Toplotni profil hiše" in source
     assert "minimum outdoor coverage" in source
     assert "Insufficient validated data" in source
-    assert "Thermal output / COP" in source and "Unavailable" in source
-    assert "Electricity is not heat output" in source
+    assert "Ecodan Space-Heating Performance Curve" in source
+    assert "Ecodan DHW Performance Curve" in source
+    assert "AC COP is never inferred" in source
     assert '"response_profile"' in backend
     assert '"representative_outdoor_source_id"' in backend
     assert "heating_response_profile" in backend
+    assert "thermal_performance_points" in backend
     assert "heat_pump_heating_kwh" in analytics and "ac_heating_kwh" in analytics
 
 

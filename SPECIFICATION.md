@@ -1,5 +1,23 @@
 # V0.1 implementation specification
 
+## V0.2 thermal and response contract
+
+- Thermal inputs are cumulative measured counters, not inferred heat. Supported units
+  are Wh, kWh and MWh and storage is normalized to kWh with source-unit provenance.
+- Each observation retains UTC and local timestamp, timezone, DST fold, Ecodan stable
+  equipment ID, meter identity, source entity/label, mapping-effective timestamp and note.
+- The first observation is a baseline. Consecutive differences form intervals using
+  actual elapsed seconds. Decreases are resets/corrections and never clamp to zero.
+- Heating and DHW COP use category-matched Ecodan electricity over the exact same
+  interval. Unknown/assumed heating, DHW cross-allocation and every AC term are excluded.
+- Heating, DHW and combined COP reports use ratio of thermal sums to electricity sums.
+- Daily charts are allowed only when evidence truly matches daily boundaries. Otherwise
+  the UI exposes the actual interval; no interpolation or daily redistribution occurs.
+- Whole-house electrical heating and AC cooling are equipment-neutral and dynamically
+  include all enabled devices, with confirmed/selected/estimated quality retained.
+- The four V0.2 charts are distinct. No AC COP or AC thermal output is displayed.
+- V0.3 forecasting has only an input/provenance contract in V0.2 and returns no forecast.
+
 ## Objective
 
 Create a standalone Home Assistant custom integration with domain `home_energy_intelligence`. Its authoritative output is one validated record per local calendar date. Raw source history remains owned by Home Assistant Recorder or an optional read-only InfluxDB 1.x source.
@@ -98,4 +116,4 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - Canonical current-period energy separates complete-through-cutoff from calendar finalization. Valid confirmed plus assumed/selected/estimated electricity is visible as a known/provisional main value while its evidence classes remain distinct. Missing evidence never becomes a display zero.
 - A true 100% temperature interval remains complete even when filtered invalid samples are audited. The configurable response threshold (95% default) is independent and never claims full completeness.
 - General configuration uses localized English/Slovenian month choices, a visible 1–28 start-day field and a season preview. Editing season fields preserves floor area, equipment, sources, representative selections and mapping-effective dates.
-- The integration and manifest version are 0.1.2. The unchanged sidebar path loads a JavaScript module URL containing both the integration version and a deterministic content hash.
+- The V0.1.2 baseline introduced deterministic content-hash cache invalidation. V0.2.0 retains the unchanged sidebar path and the same cache-safety contract.

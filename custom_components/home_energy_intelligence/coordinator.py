@@ -161,9 +161,100 @@ class HomeEnergyCoordinator:
         payload["interval_kind"] = "completed_hour"
         payload["collected_at"] = datetime.now(UTC).isoformat()
         changed = await self.hass.async_add_executor_job(self.database.upsert_hourly, payload)
+        try:
+            await self._async_capture_thermal_counters(start, end)
+        except Exception:  # Thermal evidence must never break electrical collection.
+            _LOGGER.exception("Automatic Ecodan thermal counter capture failed")
         if changed:
             async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
         return changed
+
+    async def _async_capture_thermal_counters(
+        self, start: datetime, end: datetime,
+    ) -> None:
+        """Capture source-timestamped cumulative thermal observations read-only."""
+        if self.config.get("thermal_source_mode", "manual_only") not in {
+            "ha_counters", "mixed",
+        }:
+            return
+        equipment_id = self.config.get("ecodan_thermal_equipment_id")
+        configured_equipment = {
+            item.equipment_id: item for item in equipment_from_config(self.config)
+            if item.enabled and item.kind == "heat_pump"
+        }
+        if equipment_id not in configured_equipment:
+            return
+        sources = {
+            "heating_thermal_kwh": self.config.get("heating_thermal_energy_entity"),
+            "dhw_thermal_kwh": self.config.get("dhw_thermal_energy_entity"),
+            "vendor_heating_electricity_kwh": self.config.get(
+                "vendor_heating_electricity_entity"
+            ),
+            "vendor_dhw_electricity_kwh": self.config.get(
+                "vendor_dhw_electricity_entity"
+            ),
+        }
+        entity_ids = sorted({entity for entity in sources.values() if entity})
+        if not entity_ids:
+            return
+        history = await self.reader.async_history(entity_ids, start, end)
+        zone = ZoneInfo(self.timezone)
+        for field, entity_id in sources.items():
+            if not entity_id:
+                continue
+            samples = [sample for sample in states_to_numeric(
+                history.get(entity_id, []), dimension="energy"
+            ) if sample.value is not None and sample.timestamp <= end]
+            if not samples:
+                continue
+            for sample in {item.timestamp: item for item in samples}.values():
+                local = sample.timestamp.astimezone(zone)
+                thermal_values = {
+                    "heating_thermal_kwh": None, "dhw_thermal_kwh": None,
+                    "vendor_heating_electricity_kwh": None,
+                    "vendor_dhw_electricity_kwh": None,
+                }
+                thermal_values[field] = float(sample.value)
+                payload = {
+                    "ecodan_equipment_id": equipment_id,
+                    "meter_identity": entity_id,
+                    "effective_at_utc": sample.timestamp.astimezone(UTC).isoformat(),
+                    "local_date": local.date().isoformat(),
+                    "local_time": local.time().isoformat(),
+                    "timezone": self.timezone, "fold": local.fold,
+                    **thermal_values,
+                    "source_label": f"Home Assistant Recorder: {entity_id}",
+                    "note": None, "unit": "kWh", "source_entity_id": entity_id,
+                    "source_unit": sample.source_unit,
+                    "mapping_effective_at": self.mapping_revision.get("effective_at"),
+                }
+                await self.hass.async_add_executor_job(
+                    self.database.save_automatic_thermal_reading, payload
+                )
+
+    async def async_backfill_thermal_counters(
+        self, start_date: date, end_date: date,
+    ) -> dict[str, object]:
+        """Bounded, rerunnable Recorder backfill for configured thermal counters."""
+        if end_date < start_date or (end_date - start_date).days > 365:
+            raise ValueError("thermal backfill must be ordered and at most 366 local dates")
+        before = await self.hass.async_add_executor_job(self.database.thermal_reading_count)
+        errors: list[dict[str, str]] = []
+        cursor = start_date
+        processed = 0
+        while cursor <= end_date:
+            start, end = local_day_bounds(cursor, self.timezone)
+            try:
+                await self._async_capture_thermal_counters(start, end)
+            except Exception as error:
+                errors.append({"local_date": cursor.isoformat(),
+                               "error": type(error).__name__})
+            processed += 1
+            cursor += timedelta(days=1)
+        after = await self.hass.async_add_executor_job(self.database.thermal_reading_count)
+        return {"processed_days": processed, "new_readings": after - before,
+                "error_count": len(errors), "errors": errors,
+                "idempotent": True, "source": "recorder_read_only"}
 
     async def async_refresh_hourly(
         self, now: datetime | None = None, *, reprocess_poor: bool = False,

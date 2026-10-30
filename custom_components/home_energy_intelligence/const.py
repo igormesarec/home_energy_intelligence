@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "home_energy_intelligence"
 NAME: Final = "Home Energy Intelligence"
-VERSION: Final = "0.1.2"
+VERSION: Final = "0.2.0"
 PLATFORMS: Final = ["sensor"]
 
 CONF_LOCALE: Final = "locale"
@@ -23,7 +23,7 @@ CONF_INFLUX_PASSWORD: Final = "influx_password"
 CONF_INFLUX_MAPPING: Final = "influx_mapping_json"
 
 DEFAULT_LOCALE: Final = "en"
-DEFAULT_FLOOR_AREA: Final = 180.0
+DEFAULT_FLOOR_AREA: Final = 170.0
 DEFAULT_CYCLE_HOURS: Final = 6
 DEFAULT_TEMPERATURE_FRESHNESS_MINUTES: Final = 0
 DATABASE_FILENAME: Final = "home_energy_intelligence.sqlite3"

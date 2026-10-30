@@ -1,5 +1,19 @@
 # Changelog
 
+## V0.2.0 — draft
+
+- Added additive schema V6 cumulative Ecodan thermal readings with source timestamps,
+  source-unit/mapping provenance, revision audit, reset evidence and idempotent imports.
+- Added admin-only manual cumulative reading create/edit/delete and bounded read-only
+  Recorder backfill for configured heating/DHW thermal counters.
+- Added four separate outdoor-response charts: Ecodan space-heating performance,
+  whole-house heating electricity, AC cooling electricity and Ecodan DHW performance.
+- Added Ecodan-only heating, DHW and combined COP as ratios of exactly matched sums.
+  AC COP and AC thermal output remain unavailable; sparse counters remain interval data.
+- Added the Whole-House Energy / Toplotni profil hiše card and explicit partially-known
+  thermal status when AC thermal measurements do not exist.
+- Kept forecasting as a V0.3 input contract only; no forecast values are emitted.
+
 ## V0.1.2 — draft
 
 - Added a bounded authenticated historical temperature-timeline API. Today, Yesterday, −2 through −7 and custom single-day views now use persisted elapsed-hour evidence instead of drawing one daily-summary point; longer periods remain daily by default.

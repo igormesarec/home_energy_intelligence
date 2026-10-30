@@ -138,6 +138,18 @@ def mapping_revision(config: dict[str, Any], *, effective_at: datetime | None = 
              "attribute": item.attribute, "role": item.role, "enabled": item.enabled}
             for item in temperature_mappings
         ],
+        "thermal": {
+            "source_mode": config.get("thermal_source_mode", "manual_only"),
+            "ecodan_equipment_id": config.get("ecodan_thermal_equipment_id"),
+            "heating_thermal_entity": config.get("heating_thermal_energy_entity"),
+            "dhw_thermal_entity": config.get("dhw_thermal_energy_entity"),
+            "vendor_heating_electricity_entity": config.get(
+                "vendor_heating_electricity_entity"
+            ),
+            "vendor_dhw_electricity_entity": config.get(
+                "vendor_dhw_electricity_entity"
+            ),
+        },
     }
 
 

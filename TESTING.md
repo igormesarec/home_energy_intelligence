@@ -1,5 +1,13 @@
 # Testing
 
+## V0.2 acceptance evidence
+
+The V0.2 suite covers cumulative unit normalization, DST ambiguous/nonexistent wall
+times, 25-hour elapsed intervals, first-reading baselines, counter resets, ratio-of-sums,
+exact hourly classification matching, exclusion of assumed heating, schema V5→V6,
+audit-preserving edit/delete, idempotent storage, and executable Node rendering of all
+four response charts with visible heating and DHW interval COP values.
+
 Run tests without Home Assistant hardware or network access:
 
 ```bash
@@ -71,7 +79,7 @@ Covered acceptance cases include:
 - Chronological mapping tests cover A→B→A without obsolete effective-date reuse; one physical Recorder entity can serve multiple stable logical temperature roles with one history query.
 - Bounded temperature-only job tests cover preview/action-required truthfulness, before/after counts, 23/25-hour days, idempotence, cancellation/restart metadata and no writes to Recorder or energy tables.
 - Current-cutoff tests reproduce 9.0 kWh household, 3.1 kWh confirmed heat-pump heating and 1.0 kWh selected AC heating as a 4.1 kWh known/provisional total without promoting selected energy to confirmed.
-- Frontend contracts require version 0.1.2, content-hash cache busting, distinct Diagnose/existing-repair/temperature-only actions and a non-green zero-recovery action-required result.
+- Frontend regressions retain content-hash cache busting, distinct Diagnose/existing-repair/temperature-only actions and a non-green zero-recovery action-required result; V0.2 additionally executes all four response-chart renderers under Node.
 - Historical timeline regressions use independently defined October 29 hourly fixtures whose elapsed-hour aggregation remains 23.0 °C indoor (22.5/23.2 min/max) and 11.5 °C outdoor (9/17 min/max). Executable Web Component rendering proves 24 points and a 00:00/06:00/12:00/18:00/24:00 local-time axis rather than a daily dot.
 - Timeline tests cover daily-only evidence with an honest backfill-required message, two-hour visible gaps, one truthful isolated point, filtered 100% coverage, bounded daily resolution, and 23/25 elapsed-hour DST days with two offset-distinct fall-back 02:00 intervals.
 - The authenticated timeline API accepts at most seven local days at hourly resolution and eight configured source IDs; ordinary month/year navigation uses compact daily summaries and never performs raw Recorder reads.
