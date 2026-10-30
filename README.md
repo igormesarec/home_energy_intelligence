@@ -12,6 +12,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 - Schema V5 adds chronological temperature mapping events and independent temperature history. A→B→A is preserved, and historical identity requires recorded evidence or an explicit bounded administrator attestation.
 - English/Slovenian energy-season controls use readable month/day inputs and retain the saved floor area and all unrelated mappings.
 - The 0.1.2 panel URL includes a JavaScript content hash so a HACS update plus Home Assistant restart serves the changed frontend bundle.
+- Single local-day temperature charts request bounded persisted hourly summaries for Today, Yesterday, −2 through −7 days and custom one-day ranges. They show HA-local time labels, min/max, validated duration, quality and explicit gaps; a daily aggregate is never converted into a fabricated hourly curve. Multi-day/month/year/season views use validated daily time-weighted summaries by default.
 
 ## V0.1.1 foundation
 
@@ -61,6 +62,7 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 9. If a representative sensor has blank history, open dashboard **Settings → Temperature pipeline diagnostics and recovery**. Select 1–31 dates, run **Diagnose**, then **Preview temperature-only backfill**. Start the backfill only after reviewing mapping blocks and query cost. Use the explicit attestation checkbox only when you can prove the displayed current entity/attribute/role applied to the entire selected range. Missing Recorder intervals remain gaps.
+10. After upgrading V0.1.2 through HACS, redownload the integration if needed and restart Home Assistant. The panel content hash changes with the JavaScript bundle; no config-entry recreation or database rebuild is required.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 

@@ -87,6 +87,35 @@ def test_indoor_and_outdoor_cards_share_one_component_contract():
     assert "representative_${role}_source_id" in source
 
 
+def test_single_day_temperature_charts_share_bounded_hourly_endpoint():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    backend = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    database = (INTEGRATION / "database.py").read_text(encoding="utf-8")
+    assert 'type: "home_energy_intelligence/temperature_timeline"' in frontend
+    assert 'period.start_date === period.end_date ? "hourly" : "daily"' in frontend
+    assert "this.historyPreset === \"today\" ? this.temperatureTimeline" not in frontend
+    assert "return this.temperatureTimeline(role)" in frontend
+    assert "Daily summary available, but hourly temperature history has not been archived/backfilled" in frontend
+    assert "Gaps are not interpolated" in frontend
+    assert 'tabindex="0"' in frontend and "temp-hit" in frontend
+    assert 'f"{DOMAIN}/temperature_timeline"' in backend
+    endpoint_prefix = backend[backend.rindex(
+        "@websocket_api.websocket_command", 0, backend.index("async def ws_temperature_timeline")
+    ):backend.index("async def ws_temperature_timeline")]
+    assert "require_admin" not in endpoint_prefix
+    assert "maximum_days=7 if resolution == \"hourly\" else 3660" in backend
+    assert "result.extend(" in database and "temperature_history_range(\"hourly\"" in database
+
+
+def test_temperature_timeline_refreshes_with_period_and_keeps_mobile_targets_readable():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert source.count("await this.loadTemperatureTimeline(") >= 2
+    assert ".temp-hit{fill:transparent" in source
+    assert 'r="8"' in source
+    assert "height:98px" in source
+    assert "new Date(" not in source
+
+
 def test_all_history_presets_are_backend_resolved_and_refresh_state_is_preserved():
     frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
     backend = (INTEGRATION / "periods.py").read_text(encoding="utf-8")

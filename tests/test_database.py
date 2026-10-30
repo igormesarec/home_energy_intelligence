@@ -745,6 +745,44 @@ def test_v5_temperature_history_exists_without_energy_parent_and_is_idempotent(t
     }
 
 
+def test_hourly_range_returns_independent_temperature_without_energy_parent(tmp_path):
+    db = EnergyDatabase(tmp_path / "temperature-only-hour.sqlite3")
+    db.initialize()
+    start = datetime(2026, 10, 29, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    identity = {
+        "source_id": "indoor", "entity_id": "sensor.indoor",
+        "attribute": None, "role": "indoor", "enabled": True,
+    }
+    db.ensure_mapping_revision({
+        "effective_at": (start - timedelta(days=1)).isoformat(),
+        "temperatures": [identity],
+    })
+    applicability = db.temperature_mapping_applicability(
+        "indoor", start, end, identity, allow_historical_identity=True,
+    )
+    assert applicability["eligible"], applicability
+    assert db.upsert_temperature_history(
+        "hourly", start, end, "2026-10-29", "Europe/Berlin", "indoor",
+        {"mean": 23.0, "minimum": 22.5, "maximum": 23.2,
+         "coverage_seconds": 3600, "period_seconds": 3600,
+         "coverage_percent": 100, "quality": "good",
+         "period_start_utc": start.isoformat(),
+         "period_end_utc": end.isoformat(),
+         "source_provenance": {
+             **identity,
+             "mapping_effective_at": applicability["mapping_effective_at"],
+         }}, applicability,
+    ) == "inserted"
+    before_daily = db.history_period("2026-10-29", "2026-10-29")
+    rows = db.hourly_range(start, end)
+    after_daily = db.history_period("2026-10-29", "2026-10-29")
+    assert len(rows) == 1 and rows[0]["temperature_only"] is True
+    assert rows[0]["temperatures"]["indoor"]["mean"] == 23.0
+    assert rows[0]["household_kwh"] is None
+    assert after_daily == before_daily
+
+
 def test_v5_mapping_events_represent_a_to_b_to_a_chronologically(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()

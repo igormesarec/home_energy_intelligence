@@ -1565,7 +1565,9 @@ class EnergyDatabase:
         independent_by_start = {
             item["period_start_utc"]: item for item in independent
         }
+        represented_starts: set[str] = set()
         for item in result:
+            represented_starts.add(item["period_start_utc"])
             extra = independent_by_start.get(item["period_start_utc"])
             if not extra:
                 continue
@@ -1574,7 +1576,11 @@ class EnergyDatabase:
             )
             item["temperatures"] = merged
             item.setdefault("provenance", {})["temperature_history_overlay"] = True
-        return result
+        result.extend(
+            item for item in independent
+            if item["period_start_utc"] not in represented_starts
+        )
+        return sorted(result, key=lambda item: item["period_start_utc"])
 
     def hourly_exists(self, start: datetime, end: datetime) -> bool:
         with self.connect() as connection:

@@ -89,6 +89,7 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 
 ## V0.1.2 correction requirements
 
+- Single-local-day representative temperature charts use persisted hourly summaries through an authenticated bounded timeline API. Today ends at the last completed elapsed hour; historical dates span the complete 23-, 24- or 25-hour HA-local day using UTC interval identity. Missing hours are null gaps, and daily aggregates are never expanded into fabricated hourly points. Longer periods use validated daily time-weighted summaries by default.
 - Schema V5 stores temperature-only hourly/completed-day summaries independently of energy parents and overlays them at read time. Temperature-only dates keep every energy/PV/grid/HVAC value unavailable and cannot qualify a heating-response point without separate completed daily electricity evidence.
 - Administrator backfill is limited to 1–31 inclusive Home Assistant-local dates and supports dry-run, progress, cancellation, persisted next-date cursors, restart continuation and idempotent source/UTC-interval upserts. Future current-day hours are excluded.
 - Recorder state transitions, including carry-in state, remain the canonical temperature evidence. Statistics and optional read-only InfluxDB are fallbacks only where raw states have no validated coverage; missing intervals remain gaps.

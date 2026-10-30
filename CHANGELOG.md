@@ -2,6 +2,9 @@
 
 ## V0.1.2 — draft
 
+- Added a bounded authenticated historical temperature-timeline API. Today, Yesterday, −2 through −7 and custom single-day views now use persisted elapsed-hour evidence instead of drawing one daily-summary point; longer periods remain daily by default.
+- Historical timelines include independent temperature-only hours without an energy parent, explicit unavailable intervals, local timezone/UTC timestamps, 23/25-hour DST identity, validated min/max and coverage, rejection reasons and source provenance. Daily summaries are never expanded into invented hourly points.
+- Unified Overview cards and History indoor/outdoor charts on the same timeline component with local-time axes, visible gaps, isolated real points, keyboard/touch targets and a clear archive/backfill message when only a daily summary exists.
 - Added additive Schema V5 temperature-only hourly/daily history so bounded Recorder backfill can recover validated temperatures even when no electricity row exists; energy, PV, HVAC allocations, checkpoints and V4 audits are not rewritten.
 - Added administrator-only Diagnose, existing-record repair, dry-run temperature-only preview, resumable backfill, progress, cancellation, exact skip reasons and before/after coverage counts.
 - Replaced mapping-identity reuse with chronological mapping events, including A→B→A, and added optional explicit bounded historical-identity attestations. Current mappings are never silently projected backward.

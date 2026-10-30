@@ -22,6 +22,9 @@ from .analytics import (
 from .const import DOMAIN
 from .periods import period_bounds, previous_day_same_local_cutoff
 from .timeutils import local_day_bounds
+from .temperature_timeline import (
+    build_timeline_intervals, hourly_axis_ticks, validate_timeline_dates,
+)
 
 
 def async_register_websocket(hass) -> None:
@@ -36,6 +39,7 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_start)
     websocket_api.async_register_command(hass, ws_temperature_backfill_status)
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
+    websocket_api.async_register_command(hass, ws_temperature_timeline)
 
 
 def _coordinator(hass):
@@ -79,6 +83,85 @@ def _representative_temperature_source_ids(coordinator) -> list[str]:
 
 def _response_temperature_coverage_minimum(coordinator) -> float:
     return float(coordinator.config.get("response_temperature_coverage_minimum", 95))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_timeline",
+    vol.Required("start_date"): str,
+    vol.Required("end_date"): str,
+    vol.Required("resolution"): vol.In({"hourly", "daily"}),
+    vol.Required("source_ids"): vol.All([str], vol.Length(min=1, max=8)),
+})
+@websocket_api.async_response
+async def ws_temperature_timeline(hass, connection, msg):
+    """Return bounded, persisted and explicitly gapped temperature history."""
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    resolution = msg["resolution"]
+    try:
+        start_date, end_date = validate_timeline_dates(
+            msg["start_date"], msg["end_date"],
+            maximum_days=7 if resolution == "hourly" else 3660,
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    configured = {
+        item.source_id: item for item in _temperatures(coordinator) if item.enabled
+    }
+    requested_ids = list(dict.fromkeys(msg["source_ids"]))
+    invalid_ids = [source_id for source_id in requested_ids if source_id not in configured]
+    if invalid_ids:
+        connection.send_error(
+            msg["id"], "invalid_source",
+            f"Sources are not configured and enabled: {', '.join(invalid_ids)}",
+        )
+        return
+
+    timezone = coordinator.timezone
+    start_utc, _ = local_day_bounds(start_date, timezone)
+    _, requested_end_utc = local_day_bounds(end_date, timezone)
+    now = datetime.now(UTC)
+    completed_hour = now.replace(minute=0, second=0, microsecond=0)
+    end_utc = min(requested_end_utc, completed_hour) if end_date >= now.astimezone(
+        ZoneInfo(timezone)
+    ).date() else requested_end_utc
+    if end_utc < start_utc:
+        end_utc = start_utc
+
+    if resolution == "hourly":
+        stored = await hass.async_add_executor_job(
+            coordinator.database.hourly_range, start_utc, end_utc
+        )
+    else:
+        stored = await hass.async_add_executor_job(
+            coordinator.database.history_period,
+            start_date.isoformat(), end_date.isoformat(),
+        )
+    intervals, available = build_timeline_intervals(
+        resolution=resolution, start_date=start_date, end_date=end_date,
+        timezone=timezone, range_end_utc=end_utc, stored=stored,
+        source_ids=requested_ids,
+    )
+    connection.send_result(msg["id"], {
+        "resolution": resolution, "timezone": timezone,
+        "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
+        "range_start_utc": start_utc.isoformat(), "range_end_utc": end_utc.isoformat(),
+        "requested_range_end_utc": requested_end_utc.isoformat(),
+        "partial": end_utc < requested_end_utc,
+        "source_ids": requested_ids,
+        "sources": [{"source_id": source_id,
+                     "display_name": configured[source_id].display_name,
+                     "entity_id": configured[source_id].entity_id,
+                     "role": configured[source_id].role}
+                    for source_id in requested_ids],
+        "intervals": intervals, "expected_interval_count": len(intervals),
+        "available_interval_count": available,
+        "axis_ticks": (hourly_axis_ticks(start_utc, end_utc, timezone)
+                       if resolution == "hourly" else []),
+    })
 
 
 async def _current_day_snapshot(
