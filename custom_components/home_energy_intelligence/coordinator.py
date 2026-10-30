@@ -444,7 +444,7 @@ class HomeEnergyCoordinator:
         if not isinstance(before_counts, dict):
             before_counts = await self.hass.async_add_executor_job(
                 self.database.temperature_history_counts,
-                range_start_utc, range_end_utc, None, None,
+                range_start_utc, range_end_utc, None,
             )
             details["temperature_summaries_before"] = before_counts
         configured = {item.source_id: item for item in self._temperature_sources()}
@@ -638,7 +638,7 @@ class HomeEnergyCoordinator:
                 outcome = "no_changes_needed"
             after_counts = await self.hass.async_add_executor_job(
                 self.database.temperature_history_counts,
-                range_start_utc, range_end_utc, None, None,
+                range_start_utc, range_end_utc, None,
             )
             details = {
                 **details, **counters, "skip_reasons": reasons[-500:],
@@ -998,8 +998,12 @@ class HomeEnergyCoordinator:
 
     async def async_catch_up(self) -> None:
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
-        resumable_jobs = await self.hass.async_add_executor_job(
-            self.database.resumable_temperature_backfill_jobs
+        resumable_reader = getattr(
+            self.database, "resumable_temperature_backfill_jobs", None
+        )
+        resumable_jobs = (
+            await self.hass.async_add_executor_job(resumable_reader)
+            if resumable_reader is not None else []
         )
         for job in resumable_jobs:
             task = self._async_run_temperature_backfill(int(job["id"]))
