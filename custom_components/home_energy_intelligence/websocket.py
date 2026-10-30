@@ -213,7 +213,7 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
         complete = all(bool(item.get("classification_complete")) for item in devices)
         points.append({
             "local_date": record.get("local_date"),
-            "outdoor_mean_c": temperature.get("mean_c"),
+            "outdoor_mean_c": temperature.get("mean"),
             "outdoor_coverage_percent": temperature.get("coverage_percent"),
             "heat_pumps": heat_pumps, "air_conditioners": air_conditioners,
             "cooling_units": cooling_units,
@@ -244,7 +244,7 @@ def _outdoor_interval_evidence(intervals, hourly, source_id):
             if row_start < start or row_end > end:
                 continue
             value = (record.get("temperatures") or {}).get(source_id, {})
-            mean = value.get("mean_c")
+            mean = value.get("mean")
             seconds = float(value.get("coverage_seconds") or 0)
             if mean is not None and seconds > 0:
                 weighted += float(mean) * seconds
