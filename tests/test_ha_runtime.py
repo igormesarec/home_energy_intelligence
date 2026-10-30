@@ -40,6 +40,7 @@ async def test_temperature_pipeline_preserves_recorder_rows_and_collection_evide
     ]
     database = SimpleNamespace(store_mapping_revision=lambda _revision: True)
     entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
         "equipment": "[]", "site_sources": {},
         "temperature_sources": json.dumps([{
             "source_id": "indoor", "display_name": "Indoor", "role": "indoor",
@@ -75,6 +76,7 @@ async def test_temperature_only_collector_never_requests_energy_mode_pv_or_grid(
     start = datetime(2026, 10, 29, 8, tzinfo=UTC)
     end = start + timedelta(hours=1)
     entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
         "equipment": json.dumps([{
             "equipment_id": "hp", "display_name": "Heat pump", "kind": "heat_pump",
             "enabled": True, "energy_entity": "sensor.hp_energy",
@@ -230,6 +232,135 @@ async def test_single_valid_carry_state_does_not_trigger_statistics_fallback(has
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("failure_mode", "expected_error"), [
+    ("timeout", "TimeoutError"),
+    ("connection", "ConnectionError"),
+    ("malformed", "MalformedFallbackData"),
+])
+async def test_influx_failure_is_isolated_per_temperature_source(
+    hass, failure_mode, expected_error,
+):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    for entity_id in ("sensor.stable", "sensor.broken"):
+        hass.states.async_set(entity_id, "5", {
+            "device_class": "temperature", "unit_of_measurement": "°C",
+        })
+    entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([
+            {"source_id": "stable", "display_name": "Stable", "role": "outdoor",
+             "entity_id": "sensor.stable", "enabled": True},
+            {"source_id": "broken", "display_name": "Broken", "role": "indoor",
+             "entity_id": "sensor.broken", "enabled": True},
+        ]),
+        "influx_enabled": True, "influx_host": "localhost",
+        "influx_database": "homeassistant",
+        "influx_mapping_json": json.dumps({
+            "temperature.broken": {"measurement": "°C", "field": "value", "unit": "°C"},
+        }),
+    }, options={})
+    stable_row = SimpleNamespace(
+        last_updated=start, state="5", attributes={"unit_of_measurement": "°C"},
+    )
+    unavailable = SimpleNamespace(
+        last_updated=start, state="unavailable",
+        attributes={"unit_of_measurement": "°C"},
+    )
+    coordinator = HomeEnergyCoordinator(
+        hass, entry, SimpleNamespace(store_mapping_revision=lambda _revision: True)
+    )
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={
+            "sensor.stable": [stable_row], "sensor.broken": [unavailable],
+        }),
+        async_statistics=AsyncMock(return_value={"sensor.broken": []}),
+    )
+
+    def query(*_args, **_kwargs):
+        if failure_mode == "timeout":
+            raise TimeoutError("timed out")
+        if failure_mode == "connection":
+            raise ConnectionError("offline")
+        return [(start, "not-a-number")]
+
+    with patch(
+        "custom_components.home_energy_intelligence.coordinator.InfluxBackfillClient",
+        return_value=SimpleNamespace(query=query),
+    ):
+        collected = await coordinator._async_collect_temperatures(start, end)
+    summaries = coordinator._aggregator().aggregate_range(
+        start.date(), start, end, collected
+    ).temperatures
+    assert summaries["stable"]["mean"] == 5
+    assert summaries["stable"]["coverage_percent"] == 100
+    assert summaries["broken"]["mean"] is None
+    assert summaries["broken"]["coverage_percent"] == 0
+    evidence = collected.provenance["temperature_collection"]
+    assert evidence["stable"]["selected_history_source"] == "recorder_states"
+    assert evidence["stable"]["query_errors"] == []
+    assert evidence["broken"]["selected_history_source"] == "recorder_states"
+    assert evidence["broken"]["validated_coverage_seconds"] == 0
+    assert evidence["broken"]["query_errors"][0]["error"] == expected_error
+    assert collected.provenance["query_errors"][0]["source_id"] == "broken"
+
+
+@pytest.mark.asyncio
+async def test_temperature_repair_skips_period_when_current_mapping_did_not_apply(
+    hass, tmp_path,
+):
+    from custom_components.home_energy_intelligence.configuration import mapping_revision
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+    from custom_components.home_energy_intelligence.models import DailyRecord
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+
+    target = date(2026, 1, 15)
+    start, end = local_day_bounds(target, hass.config.time_zone)
+    database = EnergyDatabase(tmp_path / "mapping-history.sqlite3")
+    database.initialize()
+    database.upsert_daily(DailyRecord(
+        target.isoformat(), hass.config.time_zone, start.isoformat(), end.isoformat(),
+        int((end - start).total_seconds()), 4.2, None, None, None, None,
+        "partial", temperatures={}, allocations={},
+    ))
+    database.store_mapping_revision({
+        "effective_at": "2026-01-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.old_outdoor",
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }],
+    })
+    entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-02-01T00:00:00+00:00",
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.new_outdoor", "enabled": True,
+        }]),
+    }, options={})
+    registered = database.ensure_mapping_revision(mapping_revision(entry.data))
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered)
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    result = await coordinator.async_reprocess_temperature_history(target, target)
+    assert result["changed_daily_records"] == 0
+    assert result["skipped_repair_count"] == 1
+    assert result["skipped_repair_reasons"][0]["source_id"] == "outdoor"
+    assert result["skipped_repair_reasons"][0]["reason"] == "mapping_entity_id_changed"
+    coordinator.reader.async_history.assert_not_awaited()
+    coordinator.reader.async_statistics.assert_not_awaited()
+    persisted = database.daily(target.isoformat())
+    assert persisted["household_kwh"] == 4.2
+    assert persisted.get("temperatures", {}) == {}
+
+
+@pytest.mark.asyncio
 async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_sources(
     hass, tmp_path,
 ):
@@ -247,6 +378,7 @@ async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_
         6.7, None, None, None, None, "partial", temperatures={}, allocations={},
     ))
     entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
         "equipment": json.dumps([{
             "equipment_id": "hp", "display_name": "Heat pump", "kind": "heat_pump",
             "enabled": True, "energy_entity": "sensor.hp_energy",
@@ -271,7 +403,9 @@ async def test_bounded_temperature_repair_is_lean_idempotent_and_skips_complete_
             "unit_of_measurement": "°C",
         }),
     ]
-    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    from custom_components.home_energy_intelligence.configuration import mapping_revision
+    registered_mapping = database.ensure_mapping_revision(mapping_revision(entry.data))
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered_mapping)
     coordinator.reader = SimpleNamespace(
         async_history=AsyncMock(return_value={"sensor.outdoor": rows}),
         async_statistics=AsyncMock(return_value={}),
@@ -705,6 +839,7 @@ async def test_temperature_repair_query_and_memory_bounds_scale_by_day(
             "partial", temperatures={}, allocations={},
         ))
     entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
         "equipment": "[]", "site_sources": {},
         "temperature_sources": json.dumps([{
             "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
@@ -726,7 +861,9 @@ async def test_temperature_repair_query_and_memory_bounds_scale_by_day(
             }),
         ]}
 
-    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    from custom_components.home_energy_intelligence.configuration import mapping_revision
+    registered_mapping = database.ensure_mapping_revision(mapping_revision(entry.data))
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered_mapping)
     coordinator.reader = SimpleNamespace(
         async_history=AsyncMock(side_effect=history),
         async_statistics=AsyncMock(return_value={}),

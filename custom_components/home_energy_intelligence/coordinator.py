@@ -65,14 +65,23 @@ def _validated_temperature_coverage(
 
 
 class HomeEnergyCoordinator:
-    def __init__(self, hass: HomeAssistant, entry, database: EnergyDatabase) -> None:
+    def __init__(self, hass: HomeAssistant, entry, database: EnergyDatabase,
+                 registered_mapping: dict[str, object] | None = None) -> None:
         self.hass = hass
         self.entry = entry
         self.database = database
         self.config = {**entry.data, **entry.options}
+        self.mapping_revision = registered_mapping or mapping_revision(self.config)
         self.reader = RecorderReader(hass)
         self.timezone = hass.config.time_zone
         self._temperature_repair_lock = asyncio.Lock()
+
+    def _temperature_mapping_identity(self, item) -> dict[str, object]:
+        return {
+            "source_id": item.source_id, "entity_id": item.entity_id,
+            "attribute": item.attribute, "role": item.role, "enabled": item.enabled,
+            "mapping_effective_at": self.mapping_revision.get("effective_at"),
+        }
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
         explicit = list(temperatures_from_config(self.config))
@@ -190,7 +199,8 @@ class HomeEnergyCoordinator:
                 "processed_days": 0, "changed_daily_records": 0,
                 "changed_hourly_records": 0, "errors": [{
                     "reason": "temperature_repair_already_running",
-                }], "error_count": 1,
+                }], "error_count": 1, "skipped_repair_count": 0,
+                "skipped_repair_reasons": [],
             }
         started = monotonic()
         changed_daily = changed_hourly = processed_days = 0
@@ -199,6 +209,7 @@ class HomeEnergyCoordinator:
         recorder_query_count = influx_query_count = 0
         peak_normalized_samples_per_day = 0
         errors: list[dict[str, str]] = []
+        skipped_repair_reasons: list[dict[str, object]] = []
         configured = {item.source_id: item for item in self._temperature_sources()}
 
         def complete(summary: object) -> bool:
@@ -243,6 +254,25 @@ class HomeEnergyCoordinator:
                         processed_days += 1
                         day += timedelta(days=1)
                         continue
+                    mapping_applicability: dict[str, dict[str, object]] = {}
+                    for source_id in sorted(needed):
+                        applicability = await self.hass.async_add_executor_job(
+                            self.database.temperature_mapping_applicability,
+                            source_id, start, end,
+                            self._temperature_mapping_identity(configured[source_id]),
+                        )
+                        if applicability.get("eligible"):
+                            mapping_applicability[source_id] = applicability
+                        else:
+                            skipped_repair_reasons.append({
+                                "date": day.isoformat(), "source_id": source_id,
+                                **applicability,
+                            })
+                    needed &= set(mapping_applicability)
+                    if not needed:
+                        processed_days += 1
+                        day += timedelta(days=1)
+                        continue
                     sources_inspected += len(needed)
                     source = await self._async_collect_temperatures(start, end, needed)
                     metrics = source.provenance.get("collection_metrics", {})
@@ -257,9 +287,22 @@ class HomeEnergyCoordinator:
                             "date": day.isoformat(), **error,
                         } for error in source.provenance["query_errors"])
                     collection = source.provenance.get("temperature_collection", {})
+                    for source_id, applicability in mapping_applicability.items():
+                        evidence = collection.get(source_id)
+                        if isinstance(evidence, dict):
+                            # The bounded repair is evidence for the historical mapping
+                            # revision, not for whichever unrelated revision is current.
+                            evidence["mapping_effective_at"] = applicability.get(
+                                "mapping_effective_at"
+                            )
+                            evidence["mapping_effective_end"] = applicability.get(
+                                "mapping_effective_end"
+                            )
                     available = {
                         source_id for source_id in needed
-                        if collection.get(source_id, {}).get("valid_samples", 0) > 0
+                        if collection.get(source_id, {}).get(
+                            "validated_coverage_seconds", 0
+                        ) > 0
                     }
                     sources_with_history += len(available)
                     missing_recorder_data += len(needed - available)
@@ -274,6 +317,7 @@ class HomeEnergyCoordinator:
                         "period_start_utc": start.isoformat(),
                         "period_end_utc": end.isoformat(),
                         "collection": collection,
+                        "mapping_applicability": mapping_applicability,
                     }
                     if daily is not None:
                         recovered = await self.hass.async_add_executor_job(
@@ -316,6 +360,8 @@ class HomeEnergyCoordinator:
             "peak_normalized_samples_per_day": peak_normalized_samples_per_day,
             "error_count": len(errors),
             "errors": errors,
+            "skipped_repair_count": len(skipped_repair_reasons),
+            "skipped_repair_reasons": skipped_repair_reasons,
             "elapsed_seconds": round(monotonic() - started, 3),
         }
 
@@ -453,7 +499,7 @@ class HomeEnergyCoordinator:
                     self.config.get("representative_indoor_source_id"),
                     self.config.get("representative_outdoor_source_id"),
                 },
-                "mapping_effective_at": self.config.get("mapping_effective_at"),
+                "mapping_effective_at": self.mapping_revision.get("effective_at"),
                 "persisted_source_provenance": next((
                     summary.get("source_provenance")
                     for summary in reversed([*persisted_hourly, *persisted_daily])
@@ -712,17 +758,42 @@ class HomeEnergyCoordinator:
             mapping = influx_mapping.get(mapping_key) if isinstance(influx_mapping, dict) else None
             if (validated_coverage(samples) <= 0 and influx is not None
                     and isinstance(mapping, dict)):
-                rows = await self.hass.async_add_executor_job(partial(
-                    influx.query, mapping["measurement"], mapping.get("field", "value"),
-                    start, end, entity_tag=mapping.get("entity_tag"),
-                ))
+                try:
+                    rows = await self.hass.async_add_executor_job(partial(
+                        influx.query, mapping["measurement"], mapping.get("field", "value"),
+                        start, end, entity_tag=mapping.get("entity_tag"),
+                    ))
+                except Exception as error:  # One fallback must not abort other sources.
+                    rows = []
+                    query_errors.append({
+                        "query": "influx", "source_id": item.source_id,
+                        "entity_id": item.entity_id, "error": type(error).__name__,
+                    })
                 if rows:
-                    converted = states_to_numeric([
-                        SimpleNamespace(
-                            last_updated=timestamp, state=value,
-                            attributes={"unit_of_measurement": mapping.get("unit")},
-                        ) for timestamp, value in rows
-                    ], dimension="temperature")
+                    try:
+                        if any(
+                            not isinstance(row, (tuple, list)) or len(row) != 2
+                            or not isinstance(row[0], datetime) for row in rows
+                        ):
+                            raise ValueError("malformed Influx temperature row")
+                        converted = states_to_numeric([
+                            SimpleNamespace(
+                                last_updated=timestamp, state=value,
+                                attributes={"unit_of_measurement": mapping.get("unit")},
+                            ) for timestamp, value in rows
+                        ], dimension="temperature")
+                        if any(sample.value is None for sample in converted):
+                            query_errors.append({
+                                "query": "influx", "source_id": item.source_id,
+                                "entity_id": item.entity_id,
+                                "error": "MalformedFallbackData",
+                            })
+                    except (TypeError, ValueError) as error:
+                        converted = []
+                        query_errors.append({
+                            "query": "influx", "source_id": item.source_id,
+                            "entity_id": item.entity_id, "error": type(error).__name__,
+                        })
                     influx_samples = [
                         NumericSample(sample.timestamp, sample.value,
                                       (sample.reason or "point_sample"), item.entity_id,
@@ -745,6 +816,7 @@ class HomeEnergyCoordinator:
                 "entity_id": item.entity_id,
                 "attribute": item.attribute,
                 "role": item.role,
+                "mapping_effective_at": self.mapping_revision.get("effective_at"),
                 "configured": True,
                 "enabled": item.enabled,
                 "recorder_state_rows": len(state_rows),
@@ -758,6 +830,10 @@ class HomeEnergyCoordinator:
                 "validated_coverage_percent": (
                     100 * selected_coverage / max((end - start).total_seconds(), 1)
                 ),
+                "query_errors": [
+                    error for error in query_errors
+                    if error.get("source_id") == item.source_id
+                ],
                 "available_start": (
                     min(sample.timestamp for sample in valid).isoformat() if valid else None
                 ),
@@ -831,6 +907,7 @@ class HomeEnergyCoordinator:
         }
         statistics = await self.reader.async_statistics(statistic_entities, start, end)
         used_influx: list[str] = []
+        query_errors: list[dict[str, str]] = []
         try:
             influx_mapping = json.loads(self.config.get(CONF_INFLUX_MAPPING, "{}") or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -909,19 +986,44 @@ class HomeEnergyCoordinator:
                         return normalized_statistics
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
             if influx is not None and isinstance(mapping, dict):
-                rows = await self.hass.async_add_executor_job(partial(
-                    influx.query, mapping["measurement"], mapping.get("field", "value"),
-                    start, end, entity_tag=mapping.get("entity_tag"),
-                ))
+                try:
+                    rows = await self.hass.async_add_executor_job(partial(
+                        influx.query, mapping["measurement"], mapping.get("field", "value"),
+                        start, end, entity_tag=mapping.get("entity_tag"),
+                    ))
+                except Exception as error:
+                    rows = []
+                    query_errors.append({
+                        "query": "influx", "source_key": source_key,
+                        "entity_id": entity_id, "error": type(error).__name__,
+                    })
                 if rows:
                     influx_unit = mapping.get("unit")
-                    converted = states_to_numeric([
-                        SimpleNamespace(
-                            last_updated=timestamp, state=value,
-                            attributes={"unit_of_measurement": influx_unit},
-                        )
-                        for timestamp, value in rows
-                    ], dimension=dimension)
+                    try:
+                        if any(
+                            not isinstance(row, (tuple, list)) or len(row) != 2
+                            or not isinstance(row[0], datetime) for row in rows
+                        ):
+                            raise ValueError("malformed Influx row")
+                        converted = states_to_numeric([
+                            SimpleNamespace(
+                                last_updated=timestamp, state=value,
+                                attributes={"unit_of_measurement": influx_unit},
+                            )
+                            for timestamp, value in rows
+                        ], dimension=dimension)
+                        if any(sample.value is None for sample in converted):
+                            query_errors.append({
+                                "query": "influx", "source_key": source_key,
+                                "entity_id": entity_id,
+                                "error": "MalformedFallbackData",
+                            })
+                    except (TypeError, ValueError) as error:
+                        converted = []
+                        query_errors.append({
+                            "query": "influx", "source_key": source_key,
+                            "entity_id": entity_id, "error": type(error).__name__,
+                        })
                     influx_samples = [
                         NumericSample(item.timestamp, item.value,
                                       ((item.reason or "point_sample")
@@ -997,6 +1099,8 @@ class HomeEnergyCoordinator:
                 "source_id": item.source_id,
                 "entity_id": item.entity_id,
                 "attribute": item.attribute,
+                "role": item.role,
+                "mapping_effective_at": self.mapping_revision.get("effective_at"),
                 "configured": True,
                 "enabled": item.enabled,
                 "recorder_state_rows": len(history.get(item.entity_id, [])),
@@ -1021,9 +1125,13 @@ class HomeEnergyCoordinator:
                     str(sample.source_unit) for sample in samples if sample.source_unit
                 }),
                 "normalized_unit": "°C",
+                "query_errors": [
+                    error for error in query_errors
+                    if error.get("source_key") == f"temperature.{item.source_id}"
+                ],
                 **numeric_evidence.get(f"temperature.{item.source_id}", {}),
             }
-        revision = mapping_revision(self.config)
+        revision = self.mapping_revision
         if store_mapping_revision:
             await self.hass.async_add_executor_job(
                 self.database.store_mapping_revision, revision
@@ -1033,6 +1141,7 @@ class HomeEnergyCoordinator:
             "raw_history_includes_preceding_state": True,
             "long_term_statistics_fallback": True,
             "influx_backfill_keys": used_influx,
+            "query_errors": query_errors,
             "collected_at": datetime.now(UTC).isoformat(),
             "mapping_effective_at": revision["effective_at"],
             "temperature_collection": temperature_collection,

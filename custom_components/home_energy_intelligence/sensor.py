@@ -59,6 +59,11 @@ class _BaseSensor(SensorEntity):
                 self.record, equipment_ids=equipment_ids,
                 temperature_source_ids=representative_ids,
                 timezone=self.coordinator.timezone,
+                response_temperature_coverage_minimum=float(
+                    self.coordinator.config.get(
+                        "response_temperature_coverage_minimum", 95
+                    )
+                ),
             )
 
 

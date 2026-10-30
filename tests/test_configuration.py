@@ -64,3 +64,8 @@ def test_climate_temperature_source_uses_current_temperature_attribute_explicitl
     }])}
     source = temperatures_from_config(config)[0]
     assert source.attribute == "current_temperature"
+    revision = mapping_revision(config, effective_at=None)["temperatures"][0]
+    assert revision == {
+        "source_id": "living-room", "entity_id": "climate.living_room",
+        "attribute": "current_temperature", "role": "indoor", "enabled": True,
+    }

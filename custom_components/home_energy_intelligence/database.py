@@ -386,14 +386,17 @@ def _merge_temperature_maps(
         )
         current_source = (current or {}).get("source_provenance") or {}
         candidate_source = (candidate or {}).get("source_provenance") or {}
-        if current is not None and not current_source.get("entity_id"):
+        if current is not None and (
+            not current_source.get("entity_id")
+            or any(field not in current_source for field in ("attribute", "role"))
+        ):
             # Legacy rows without source identity are intentionally immutable.
             # A current mapping cannot prove that it represents the same
             # historical sensor, even when the stable source_id is unchanged.
             continue
-        if (
-            current_source.get("entity_id") and candidate_source.get("entity_id")
-            and current_source["entity_id"] != candidate_source["entity_id"]
+        if current_source.get("entity_id") and any(
+            current_source.get(field) != candidate_source.get(field)
+            for field in ("entity_id", "attribute", "role")
         ):
             # A remap is a new historical meaning, not permission to rewrite
             # an older source under the same stable source ID.
@@ -415,16 +418,58 @@ def _merge_temperature_maps(
 
 def _eligible_temperature_repair(
     recovered: dict[str, Any], start: str, end: str,
+    expected_mappings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Accept only summaries tied to the exact interval and configured entity."""
-    return {
-        source_id: summary for source_id, summary in (recovered or {}).items()
-        if isinstance(summary, dict)
-        and summary.get("period_start_utc") == start
-        and summary.get("period_end_utc") == end
-        and isinstance(summary.get("source_provenance"), dict)
-        and bool(summary["source_provenance"].get("entity_id"))
-    }
+    """Accept only summaries tied to the exact interval and proven mapping."""
+    eligible: dict[str, Any] = {}
+    for source_id, summary in (recovered or {}).items():
+        if (
+            not isinstance(summary, dict)
+            or summary.get("period_start_utc") != start
+            or summary.get("period_end_utc") != end
+            or not isinstance(summary.get("source_provenance"), dict)
+            or not summary["source_provenance"].get("entity_id")
+        ):
+            continue
+        if expected_mappings is not None:
+            expected = expected_mappings.get(source_id)
+            provenance = summary["source_provenance"]
+            if not isinstance(expected, dict) or not expected.get("eligible"):
+                continue
+            if any(
+                provenance.get(field) != expected.get(field)
+                for field in ("entity_id", "attribute", "role")
+            ):
+                continue
+            try:
+                mapping_start = datetime.fromisoformat(
+                    str(expected["mapping_effective_at"]).replace("Z", "+00:00")
+                )
+                interval_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                interval_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                mapping_end = (
+                    datetime.fromisoformat(
+                        str(expected["mapping_effective_end"]).replace("Z", "+00:00")
+                    ) if expected.get("mapping_effective_end") else None
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if interval_start < mapping_start or (
+                mapping_end is not None and interval_end > mapping_end
+            ):
+                continue
+            provenance_effective = provenance.get("mapping_effective_at")
+            if provenance_effective is None:
+                continue
+            try:
+                if datetime.fromisoformat(
+                    str(provenance_effective).replace("Z", "+00:00")
+                ) != mapping_start:
+                    continue
+            except ValueError:
+                continue
+        eligible[source_id] = summary
+    return eligible
 
 
 def protected_export_path(config_path: str | Path, stamp: str) -> Path:
@@ -637,6 +682,127 @@ class EnergyDatabase:
                 (payload.get("effective_at", datetime.now(UTC).isoformat()), checksum, serialized),
             )
         return True
+
+    def ensure_mapping_revision(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a mapping identity and return its canonical effective revision."""
+        serialized_identity = _canonical_json({
+            key: value for key, value in payload.items() if key != "effective_at"
+        })
+        checksum = _checksum(serialized_identity)
+        with self.connect() as connection:
+            prior = connection.execute(
+                """SELECT payload_json FROM mapping_revisions
+                WHERE checksum=? ORDER BY id LIMIT 1""", (checksum,)
+            ).fetchone()
+            if prior:
+                return json.loads(prior["payload_json"])
+            serialized = _canonical_json(payload)
+            connection.execute(
+                "INSERT INTO mapping_revisions(effective_at,checksum,payload_json) VALUES (?,?,?)",
+                (payload.get("effective_at", datetime.now(UTC).isoformat()), checksum, serialized),
+            )
+        return dict(payload)
+
+    def temperature_mapping_applicability(
+        self, source_id: str, start: datetime, end: datetime,
+        current_mapping: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Prove one temperature mapping applies to the complete UTC interval."""
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            return {"eligible": False, "reason": "invalid_repair_interval"}
+
+        def instant(value: str) -> datetime:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id,effective_at,payload_json FROM mapping_revisions ORDER BY id"
+            ).fetchall()
+        revisions = []
+        for row in rows:
+            try:
+                effective = instant(row["effective_at"])
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            revisions.append((effective, int(row["id"]), payload))
+        applicable = [item for item in revisions if item[0] <= start.astimezone(UTC)]
+        if not applicable:
+            return {
+                "eligible": False, "reason": "mapping_not_recorded_for_interval",
+                "source_id": source_id,
+            }
+        active_effective, _active_id, active_payload = max(
+            applicable, key=lambda item: (item[0], item[1])
+        )
+        historical = next((
+            item for item in active_payload.get("temperatures", [])
+            if item.get("source_id") == source_id
+        ), None)
+        if not isinstance(historical, dict):
+            return {
+                "eligible": False, "reason": "source_not_in_historical_mapping",
+                "source_id": source_id,
+                "mapping_effective_at": active_effective.isoformat(),
+            }
+        historical_identity = {
+            key: historical.get(key) for key in ("entity_id", "attribute", "role", "enabled")
+        }
+        effective_end = None
+        for later_effective, _later_id, later_payload in sorted(
+            (item for item in revisions if item[0] > active_effective),
+            key=lambda item: (item[0], item[1]),
+        ):
+            later_mapping = next((
+                item for item in later_payload.get("temperatures", [])
+                if item.get("source_id") == source_id
+            ), None)
+            later_identity = (
+                {key: later_mapping.get(key) for key in historical_identity}
+                if isinstance(later_mapping, dict) else None
+            )
+            if later_identity != historical_identity:
+                effective_end = later_effective
+                break
+        if effective_end is not None and effective_end < end.astimezone(UTC):
+            return {
+                "eligible": False, "reason": "mapping_changes_within_interval",
+                "source_id": source_id,
+                "mapping_effective_at": active_effective.isoformat(),
+                "mapping_effective_end": effective_end.isoformat(),
+            }
+        required_fields = ("entity_id", "attribute", "role")
+        for field in required_fields:
+            if field not in historical:
+                return {
+                    "eligible": False,
+                    "reason": f"historical_mapping_{field}_unknown",
+                    "source_id": source_id,
+                    "mapping_effective_at": active_effective.isoformat(),
+                }
+            if historical.get(field) != current_mapping.get(field):
+                return {
+                    "eligible": False, "reason": f"mapping_{field}_changed",
+                    "source_id": source_id,
+                    "mapping_effective_at": active_effective.isoformat(),
+                    "historical_value": historical.get(field),
+                    "current_value": current_mapping.get(field),
+                }
+        if historical.get("enabled") is False:
+            return {
+                "eligible": False, "reason": "source_disabled_for_interval",
+                "source_id": source_id,
+                "mapping_effective_at": active_effective.isoformat(),
+            }
+        return {
+            "eligible": True, "reason": "mapping_verified",
+            "source_id": source_id,
+            "entity_id": historical.get("entity_id"),
+            "attribute": historical.get("attribute"),
+            "role": historical.get("role"),
+            "mapping_effective_at": active_effective.isoformat(),
+            "mapping_effective_end": effective_end.isoformat() if effective_end else None,
+        }
 
     def start_job(self, job_type: str, details: dict[str, Any] | None = None) -> int:
         with self.connect() as connection:
@@ -865,6 +1031,7 @@ class EnergyDatabase:
                     eligible = _eligible_temperature_repair(
                         temperatures, payload.get("period_start_utc"),
                         payload.get("period_end_utc"),
+                        (provenance or {}).get("mapping_applicability"),
                     )
                     merged, changed = _merge_temperature_maps(
                         payload.get("temperatures", {}), eligible,
@@ -957,6 +1124,7 @@ class EnergyDatabase:
                     eligible = _eligible_temperature_repair(
                         temperatures, payload.get("period_start_utc"),
                         payload.get("period_end_utc"),
+                        (provenance or {}).get("mapping_applicability"),
                     )
                     merged, changed = _merge_temperature_maps(
                         payload.get("temperatures", {}), eligible,

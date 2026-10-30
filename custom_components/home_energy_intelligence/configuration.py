@@ -120,15 +120,23 @@ def equipment_temperature_mappings(equipment: list[EquipmentMapping]) -> list[Te
 
 def mapping_revision(config: dict[str, Any], *, effective_at: datetime | None = None) -> dict[str, Any]:
     """Non-secret provenance stored with derived records."""
+    equipment = equipment_from_config(config)
+    explicit = list(temperatures_from_config(config))
+    explicit_keys = {(item.entity_id, item.role) for item in explicit}
+    temperature_mappings = explicit + [
+        item for item in equipment_temperature_mappings(equipment)
+        if (item.entity_id, item.role) not in explicit_keys
+    ]
     return {
         "effective_at": config.get("mapping_effective_at") or (effective_at or datetime.now(UTC)).isoformat(),
         "equipment": [
             asdict(item)
-            for item in equipment_from_config(config)
+            for item in equipment
         ],
         "temperatures": [
-            {"source_id": item.source_id, "entity_id": item.entity_id, "role": item.role}
-            for item in temperatures_from_config(config)
+            {"source_id": item.source_id, "entity_id": item.entity_id,
+             "attribute": item.attribute, "role": item.role, "enabled": item.enabled}
+            for item in temperature_mappings
         ],
     }
 

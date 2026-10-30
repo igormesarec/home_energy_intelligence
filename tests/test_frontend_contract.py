@@ -210,5 +210,5 @@ def test_quality_ui_exposes_independent_derived_layers_and_legacy_provenance():
     assert 'layer("allocation"' in source
     assert 'temperatureLayer("indoor")' in source
     assert 'temperatureLayer("outdoor")' in source
-    assert "derived_from_independent_coverage_layers_v1" in analytics
+    assert "derived_from_independent_coverage_layers_v2" in analytics
     assert "stored_quality_provenance" in analytics

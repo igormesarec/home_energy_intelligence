@@ -2,6 +2,9 @@
 
 ## V0.1.1 — draft
 
+- Required representative-temperature completeness now means exactly 100% validated elapsed coverage on normal and 23/25-hour dates; the independently configurable 95% threshold remains only a heating-response admission rule.
+- Historical temperature repair now registers effective-dated source identity at setup, verifies entity ID, attribute, role, enabled state and the entire mapping interval before querying, preserves unidentifiable legacy summaries and reports every skipped mapping reason.
+- Read-only InfluxDB fallback failures are isolated per temperature source. Timeouts, connection errors and malformed rows retain validated Recorder evidence, expose non-secret query-error provenance and leave uncovered time missing.
 - Replaced temperature fallback row-count heuristics with canonical validated-duration checks in both normal and repair collectors. A carry-in state can be complete; invalid/unavailable rows can fall back to Recorder statistics and optional read-only InfluxDB; partial valid raw evidence remains authoritative and uncovered time remains missing.
 - Hardened Schema V4 for constrained Home Assistant hosts: V1/V2/V3 upgrades are transactional through the version bump, conversion is keyset-batched, startup `VACUUM` was removed, lock/busy errors are not corruption, disk/schema/version-bump failures roll back and retry safely, and Settings exposes non-secret backup/migration status.
 - Separated configurable 95% electrical-response admission from 100% temporal completeness and prevented current mappings from rewriting legacy temperature summaries whose historical entity identity is unknown.

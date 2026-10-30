@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -289,6 +289,84 @@ def test_repaired_representative_temperature_recomputes_overall_quality():
     assert repaired["quality"] == "good"
     assert repaired["complete"] is True
     assert repaired["stored_quality_provenance"]["2026-01-01"] == "partial"
+
+
+@pytest.mark.parametrize(("local_date", "day_seconds"), [
+    ("2026-01-15", 86400),
+    ("2026-03-29", 23 * 3600),
+    ("2026-10-25", 25 * 3600),
+])
+@pytest.mark.parametrize("coverage_percent", [0, 94.99, 95, 97, 99.9, 100])
+def test_temperature_completeness_requires_100_but_response_gate_remains_95(
+    local_date, day_seconds, coverage_percent,
+):
+    record = _hour(datetime(2026, 1, 15, tzinfo=UTC), 2)
+    record.update({
+        "local_date": local_date, "timezone": "Europe/Ljubljana",
+        "day_seconds": day_seconds, "finalized": True, "partial": False,
+    })
+    record["allocations"]["hp-a"].update({
+        "covered_seconds": day_seconds, "period_seconds": day_seconds,
+        "coverage_percent": 100, "quality": "good",
+    })
+    valid_seconds = day_seconds * coverage_percent / 100
+    record["temperatures"] = {"outdoor": {
+        "mean": None if coverage_percent == 0 else 5.0,
+        "minimum": None if coverage_percent == 0 else 3.0,
+        "maximum": None if coverage_percent == 0 else 7.0,
+        "coverage_seconds": valid_seconds, "period_seconds": day_seconds,
+        "coverage_percent": coverage_percent,
+        "quality": (
+            "missing" if coverage_percent == 0 else
+            "good" if coverage_percent == 100 else "partial"
+        ),
+    }}
+    coverage = daily_coverage(
+        [record], local_date, local_date, equipment_ids=["hp-a"],
+        temperature_source_ids=["outdoor"], timezone="Europe/Ljubljana",
+        response_temperature_coverage_minimum=95,
+    )
+    temperature = coverage["temperature_coverage"]["outdoor"]
+    assert coverage["energy_complete"] is True
+    assert temperature["coverage_percent"] == pytest.approx(coverage_percent)
+    assert temperature["complete"] is (coverage_percent == 100)
+    assert temperature["full_temporal_coverage"] is (coverage_percent == 100)
+    assert temperature["response_eligible"] is (coverage_percent >= 95)
+    assert coverage["temperature_complete"] is (coverage_percent == 100)
+    assert coverage["complete"] is (coverage_percent == 100)
+    assert temperature["quality"] == (
+        "missing" if coverage_percent == 0 else
+        "good" if coverage_percent == 100 else "partial"
+    )
+    assert coverage["quality"] == ("good" if coverage_percent == 100 else "partial")
+
+
+def test_period_temperature_completeness_does_not_hide_one_incomplete_day():
+    records = []
+    for offset, percent in enumerate((100, 99.9)):
+        day = date(2026, 1, 1) + timedelta(days=offset)
+        record = _hour(datetime(2026, 1, 1 + offset, tzinfo=UTC), 2)
+        record.update({"local_date": day.isoformat(), "day_seconds": 86400})
+        record["allocations"]["hp-a"].update({
+            "covered_seconds": 86400, "period_seconds": 86400,
+            "coverage_percent": 100, "quality": "good",
+        })
+        record["temperatures"] = {"outdoor": {
+            "mean": 5.0, "coverage_seconds": 86400 * percent / 100,
+            "period_seconds": 86400, "coverage_percent": percent,
+            "quality": "good" if percent == 100 else "partial",
+        }}
+        records.append(record)
+    coverage = daily_coverage(
+        records, "2026-01-01", "2026-01-02", equipment_ids=["hp-a"],
+        temperature_source_ids=["outdoor"], timezone="UTC",
+    )
+    temperature = coverage["temperature_coverage"]["outdoor"]
+    assert temperature["coverage_percent"] == pytest.approx(99.95)
+    assert temperature["response_eligible"] is True
+    assert temperature["complete"] is False
+    assert temperature["partial_dates"] == ["2026-01-02"]
+    assert coverage["quality"] == "partial"
 
 
 def test_legacy_unknown_classification_is_unknown_not_good_or_missing():

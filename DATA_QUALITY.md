@@ -41,6 +41,11 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - Missing allocation-coverage metadata is **unknown**, never a compatibility alias for 100%. Legacy meter totals and known subtotals remain visible, while complete category values remain unavailable until explicit evidence exists.
 - **Temperature coverage** is valid elapsed duration for each source independently. A representative card with no explicit selection says **Not configured** and never reports 100%.
 
+Full temperature completeness requires 100% validated temporal coverage. The
+separate response-analysis gate is configurable and defaults to 95%; passing it
+never changes a 95–99.99% source from partial to complete. This distinction is
+applied to 23-, 24- and 25-hour local dates and to multi-day periods.
+
 These layers are intentionally independent. A complete household meter can remain complete when an indoor sensor is missing, while a partial HVAC classifier keeps its meter total and raw residual evidence without promoting missing categories to confirmed zero.
 
 Public daily/period quality is recalculated from these layers on every read; the
@@ -70,6 +75,14 @@ configured read-only InfluxDB fallback) evidence. It adds a source only when no
 summary exists or replaces it only when the recovered valid duration is greater.
 It never fills a gap, overwrites a stronger valid measurement, creates a finalized
 day, or changes electricity/allocation fields.
+
+Before a historical query, repair proves that the recorded mapping applicable to
+the entire UTC interval matches the current stable source's entity ID, attribute,
+role and enabled state. A mapping transition inside the interval, a newer remap,
+or legacy provenance missing any identity field is skipped with an explicit
+reason. Existing legacy summaries remain immutable when their historical identity
+cannot be proven. Per-source InfluxDB errors are retained in provenance and do not
+erase validated Recorder evidence or fill uncovered seconds.
 
 The repair collector requests only enabled temperature entities. Before querying
 Recorder it skips source/day combinations only when they have 100% valid

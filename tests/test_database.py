@@ -494,6 +494,119 @@ def test_mapping_revisions_preserve_source_replacement_history(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM mapping_revisions").fetchone()[0] == 2
 
 
+def test_temperature_mapping_applicability_verifies_entity_attribute_role_and_interval(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    old = {
+        "effective_at": "2026-01-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor_old",
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }],
+    }
+    new = {
+        "effective_at": "2026-02-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor_new",
+            "attribute": "temperature", "role": "outdoor", "enabled": True,
+        }],
+    }
+    assert db.store_mapping_revision(old)
+    assert db.store_mapping_revision(new)
+    old_identity = {
+        "entity_id": "sensor.outdoor_old", "attribute": None, "role": "outdoor",
+    }
+    valid = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 15, tzinfo=UTC),
+        datetime(2026, 1, 16, tzinfo=UTC), old_identity,
+    )
+    assert valid["eligible"] is True
+    assert valid["mapping_effective_end"] == "2026-02-01T00:00:00+00:00"
+    crossing = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 31, tzinfo=UTC),
+        datetime(2026, 2, 2, tzinfo=UTC), old_identity,
+    )
+    assert crossing["reason"] == "mapping_changes_within_interval"
+    remapped = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), old_identity,
+    )
+    assert remapped["reason"] == "mapping_entity_id_changed"
+    changed_attribute = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor_new", "attribute": None, "role": "outdoor",
+        },
+    )
+    assert changed_attribute["reason"] == "mapping_attribute_changed"
+    changed_role = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor_new", "attribute": "temperature", "role": "indoor",
+        },
+    )
+    assert changed_role["reason"] == "mapping_role_changed"
+
+
+def test_legacy_mapping_without_attribute_cannot_authorize_historical_repair(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.store_mapping_revision({
+        "effective_at": "2026-01-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor",
+            "role": "outdoor", "enabled": True,
+        }],
+    })
+    result = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 2, tzinfo=UTC),
+        datetime(2026, 1, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor", "attribute": None, "role": "outdoor",
+        },
+    )
+    assert result["eligible"] is False
+    assert result["reason"] == "historical_mapping_attribute_unknown"
+
+
+def test_unverified_mapping_cannot_fill_absent_summary_or_change_energy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    db.upsert_daily(item)
+    with db.connect() as connection:
+        before = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records WHERE local_date=?",
+            (item.local_date,),
+        ).fetchone()
+        allocations_before = connection.execute(
+            "SELECT COUNT(*) FROM allocations WHERE local_date=?", (item.local_date,)
+        ).fetchone()[0]
+    candidate = {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {
+            "entity_id": "sensor.current", "attribute": None, "role": "outdoor",
+            "mapping_effective_at": "2026-10-26T00:00:00+00:00",
+        },
+    }
+    assert not db.merge_daily_temperatures(
+        item.local_date, {"outdoor": candidate},
+        {"mapping_applicability": {}},
+    )
+    with db.connect() as connection:
+        after = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records WHERE local_date=?",
+            (item.local_date,),
+        ).fetchone()
+        allocations_after = connection.execute(
+            "SELECT COUNT(*) FROM allocations WHERE local_date=?", (item.local_date,)
+        ).fetchone()[0]
+    assert tuple(after) == tuple(before)
+    assert allocations_after == allocations_before
+
+
 def test_realistic_ten_year_checkpoint_volume_remains_compact(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
@@ -617,7 +730,10 @@ def test_temperature_history_repair_is_idempotent_and_preserves_energy(tmp_path)
             "latest_timestamp": "2026-10-25T22:00:00+00:00", "quality": "good",
             "rejections": [], "period_start_utc": item.period_start_utc,
             "period_end_utc": item.period_end_utc,
-            "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+            "source_provenance": {
+                "entity_id": "sensor.outdoor", "source_id": "outdoor",
+                "attribute": None, "role": "outdoor",
+            },
         },
     }
     assert db.merge_daily_temperatures("2026-10-25", recovered, {"source": "test"})
@@ -848,7 +964,10 @@ def test_competing_temperature_repairs_serialize_and_best_evidence_wins(tmp_path
             "coverage_percent": coverage / 900, "quality": quality, "rejections": [],
             "period_start_utc": record().period_start_utc,
             "period_end_utc": record().period_end_utc,
-            "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+            "source_provenance": {
+                "entity_id": "sensor.outdoor", "source_id": "outdoor",
+                "attribute": None, "role": "outdoor",
+            },
         }}, {"source": "concurrent"})
 
     with ThreadPoolExecutor(max_workers=2) as executor:

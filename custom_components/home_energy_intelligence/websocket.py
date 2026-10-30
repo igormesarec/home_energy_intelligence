@@ -73,6 +73,10 @@ def _representative_temperature_source_ids(coordinator) -> list[str]:
     ]
 
 
+def _response_temperature_coverage_minimum(coordinator) -> float:
+    return float(coordinator.config.get("response_temperature_coverage_minimum", 95))
+
+
 async def _current_day_snapshot(
     hass, coordinator, cutoff: datetime | None = None, *, now: datetime | None = None,
 ):
@@ -129,6 +133,9 @@ async def ws_overview(hass, connection, msg):
             equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
             temperature_source_ids=required_temperature_ids,
             timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
     latest_hour_end = today_hours[-1]["period_end_utc"] if today_hours else None
     temperatures = [
@@ -303,12 +310,18 @@ async def ws_history(hass, connection, msg):
             temperature_source_ids=temperature_source_ids,
             required_temperature_source_ids=required_temperature_ids,
             equipment_ids=equipment_ids, timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         selected_coverage = daily_coverage(
             period_records, start_date, end_date,
             equipment_ids=equipment_ids,
             temperature_source_ids=required_temperature_ids,
             timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         if combined:
             selected_coverage = combined["period_coverage"]
@@ -320,6 +333,9 @@ async def ws_history(hass, connection, msg):
             temperature_source_ids=temperature_source_ids,
             required_temperature_source_ids=required_temperature_ids,
             equipment_ids=equipment_ids, timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         selected_coverage = combined["period_coverage"] if combined else None
     else:
@@ -341,15 +357,16 @@ async def ws_history(hass, connection, msg):
             and representative_outdoor.role == "outdoor"
         ),
         floor_area_m2=coordinator.config.get("floor_area_m2"),
-        minimum_temperature_coverage=float(coordinator.config.get(
-            "response_temperature_coverage_minimum", 95
-        )),
+        minimum_temperature_coverage=_response_temperature_coverage_minimum(coordinator),
     )
     connection.send_result(msg["id"], {
         "records": [attach_canonical(derive_record_quality(
             record, equipment_ids=equipment_ids,
             temperature_source_ids=required_temperature_ids,
             timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         ), equipment) for record in records],
         "summary": attach_canonical(combined, equipment) if combined else None,
         "total": total, "offset": msg["offset"], "limit": msg["limit"],
@@ -489,6 +506,9 @@ async def ws_csv(hass, connection, msg):
             equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
             temperature_source_ids=_representative_temperature_source_ids(coordinator),
             timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         energy = attach_canonical(record, equipment)["energy"] or {}
         row_coverage = daily_coverage(
@@ -496,6 +516,9 @@ async def ws_csv(hass, connection, msg):
             equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
             temperature_source_ids=_representative_temperature_source_ids(coordinator),
             timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         allocation_coverage = row_coverage["allocation_coverage"]
         writer.writerow({"date": record["local_date"], **{

@@ -64,6 +64,9 @@ Covered acceptance cases include:
 - Schema V4 migration preserves hydrated daily values, revision history and rejection audits; V1/V2/V3/V4 paths are idempotent; thousands of daily/hourly rows migrate with bounded memory; injected schema, conversion, disk-full and pre-version-bump failures roll back; a locked database is not renamed as corrupt; startup never runs `VACUUM`.
 - Recorder temperature fallback tests cover a single valid carry-in state, multiple invalid sentinel rows with valid statistics, explicit-unavailable gaps, partial raw coverage that must remain a gap, and bounded read-only InfluxDB recovery. Selection is based on validated elapsed seconds, never row count.
 - Temperature-only repair benchmarks exercise 2 and 31 inclusive local days, assert exactly one bounded Recorder call per day when the raw carry state is valid, zero non-temperature entities/Influx calls, bounded peak normalized samples and a 64 MiB runtime allocation ceiling in the HA test harness.
+- Temperature quality boundaries cover 0%, 94.99%, 95%, 97%, 99.9% and 100% on ordinary, 23-hour and 25-hour dates, proving that response eligibility and full completeness remain separate.
+- Effective-dated repair tests cover unchanged mappings, remapped entities, changed attributes/roles, mapping transitions, legacy rows and missing provenance while asserting electricity, allocations and checksums remain untouched.
+- Home Assistant runtime fallback tests isolate InfluxDB timeout, connection and malformed-row failures per source, preserve a parallel 100%-validated Recorder source and prove the failed source remains zero-coverage rather than zero-valued or complete.
 
 ## Responsive layout evidence
 

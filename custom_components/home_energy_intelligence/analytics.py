@@ -730,7 +730,7 @@ def combine_interval_records(
 def daily_coverage(
     records: list[dict[str, Any]], start_date: str, end_date: str,
     *, equipment_ids: Iterable[str] = (), temperature_source_ids: Iterable[str] = (),
-    timezone: str | None = None,
+    timezone: str | None = None, response_temperature_coverage_minimum: float = 95.0,
 ) -> dict[str, Any]:
     """Derive independent quality layers for a local-date range.
 
@@ -908,10 +908,12 @@ def daily_coverage(
         source_missing_dates: list[str] = []
         source_partial_dates: list[str] = []
         source_filtered_dates: list[str] = []
+        response_ineligible_dates: list[str] = []
         for day in expected:
             summary = (by_date.get(day, {}).get("temperatures") or {}).get(source_id)
             if not isinstance(summary, dict) or _number(summary.get("mean")) is None:
                 source_missing_dates.append(day)
+                response_ineligible_dates.append(day)
                 continue
             day_expected = expected_seconds(day)
             covered = max(0.0, min(
@@ -920,14 +922,17 @@ def daily_coverage(
             valid_seconds += covered
             rejected_count += int(summary.get("rejected_count", 0) or 0)
             percent = 100 * covered / day_expected if day_expected else 0.0
-            if percent < 95 or summary.get("quality") in {
+            invalid_quality = summary.get("quality") in {
                 "missing", "poor", "rejected", "unreconciled",
-            }:
+            }
+            if percent + 1e-9 < 100 or invalid_quality:
                 source_partial_dates.append(day)
             elif summary.get("quality") == "filtered" or int(
                 summary.get("rejected_count", 0) or 0
             ):
                 source_filtered_dates.append(day)
+            if percent + 1e-9 < response_temperature_coverage_minimum or invalid_quality:
+                response_ineligible_dates.append(day)
         source_expected_seconds = sum(expected_seconds(day) for day in expected)
         percent = (
             100 * valid_seconds / source_expected_seconds
@@ -935,7 +940,13 @@ def daily_coverage(
         )
         complete = bool(
             source_expected_seconds and not source_missing_dates
-            and not source_partial_dates and percent is not None and percent >= 95
+            and not source_partial_dates and percent is not None
+            and percent + 1e-9 >= 100
+        )
+        response_eligible = bool(
+            source_expected_seconds and not response_ineligible_dates
+            and percent is not None
+            and percent + 1e-9 >= response_temperature_coverage_minimum
         )
         quality = (
             "missing" if not valid_seconds else
@@ -951,6 +962,10 @@ def daily_coverage(
             "filtered_dates": source_filtered_dates,
             "rejected_count": rejected_count,
             "complete": complete,
+            "full_temporal_coverage": complete,
+            "response_eligible": response_eligible,
+            "response_coverage_minimum_percent": response_temperature_coverage_minimum,
+            "response_ineligible_dates": sorted(set(response_ineligible_dates)),
             "quality": quality,
         }
 
@@ -994,7 +1009,7 @@ def daily_coverage(
         "temperature_complete": temperature_complete,
         "complete": required_layers_complete,
         "quality": derived_quality,
-        "quality_basis": "derived_from_independent_coverage_layers_v1",
+        "quality_basis": "derived_from_independent_coverage_layers_v2",
         "stored_quality_provenance": stored_quality,
     }
 
@@ -1003,7 +1018,7 @@ def combine_daily_records(
     records: list[dict[str, Any]], start_date: str, end_date: str,
     *, temperature_source_ids: Iterable[str] = (), equipment_ids: Iterable[str] = (),
     required_temperature_source_ids: Iterable[str] | None = None,
-    timezone: str | None = None,
+    timezone: str | None = None, response_temperature_coverage_minimum: float = 95.0,
 ) -> dict[str, Any] | None:
     """Combine the full requested daily range with explicit missing dates."""
     if not records:
@@ -1018,6 +1033,7 @@ def combine_daily_records(
             else required_temperature_source_ids
         ),
         timezone=timezone,
+        response_temperature_coverage_minimum=response_temperature_coverage_minimum,
     )
     combined["period_coverage"] = coverage
     meter_fields = coverage["meter_coverage"]["fields"]
@@ -1056,14 +1072,29 @@ def combine_daily_records(
         )
         item["quality"] = (
             "missing" if not valid_seconds
-            else ("good" if valid_seconds >= expected_seconds and item.get("quality") == "good"
-                  else "partial")
+            else (("filtered" if item.get("quality") == "filtered"
+                   or int(item.get("rejected_count", 0) or 0) else "good")
+                  if valid_seconds + 1e-9 >= expected_seconds else "partial")
+        )
+        full_temporal_coverage = bool(
+            expected_seconds and valid_seconds + 1e-9 >= expected_seconds
+        )
+        response_eligible = bool(
+            expected_seconds and 100 * valid_seconds / expected_seconds + 1e-9
+            >= response_temperature_coverage_minimum
+        )
+        item["full_temporal_coverage"] = full_temporal_coverage
+        item["response_eligible"] = response_eligible
+        item["response_coverage_minimum_percent"] = (
+            response_temperature_coverage_minimum
         )
         source_coverage = {
             "valid_seconds": valid_seconds, "expected_seconds": expected_seconds,
             "coverage_percent": item["coverage_percent"],
-            "complete": bool(expected_seconds and valid_seconds >= expected_seconds
-                             and item["quality"] == "good"),
+            "complete": full_temporal_coverage,
+            "full_temporal_coverage": full_temporal_coverage,
+            "response_eligible": response_eligible,
+            "response_coverage_minimum_percent": response_temperature_coverage_minimum,
             "quality": item["quality"],
         }
         if source_id not in coverage["temperature_coverage"]:
@@ -1082,12 +1113,14 @@ def combine_daily_records(
 def derive_record_quality(
     record: dict[str, Any], *, equipment_ids: Iterable[str] = (),
     temperature_source_ids: Iterable[str] = (), timezone: str | None = None,
+    response_temperature_coverage_minimum: float = 95.0,
 ) -> dict[str, Any]:
     """Return one record with read-time, evidence-derived quality metadata."""
     local_date = str(record["local_date"])
     coverage = daily_coverage(
         [record], local_date, local_date, equipment_ids=equipment_ids,
         temperature_source_ids=temperature_source_ids, timezone=timezone,
+        response_temperature_coverage_minimum=response_temperature_coverage_minimum,
     )
     result = dict(record)
     result["stored_quality"] = record.get("stored_quality", record.get("quality"))
