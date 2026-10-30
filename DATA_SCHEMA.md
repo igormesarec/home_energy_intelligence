@@ -1,5 +1,17 @@
 # Data schema
 
+## Schema V6 thermal ledger
+
+`thermal_meter_readings` stores cumulative Ecodan observations independently of daily
+energy rows. Its uniqueness key is stable equipment ID + meter identity + source UTC
+timestamp, making Recorder backfill idempotent. `thermal_meter_reading_audit` retains
+create, update and delete revisions. V6 is additive: migration does not rewrite daily,
+hourly, checkpoint, allocation, checksum or temperature evidence.
+
+Derived thermal intervals are recomputed from adjacent observations so a backdated edit
+updates both neighbouring intervals. Resets and missing endpoints remain explicit issues.
+Only intervals exactly tiled by complete classified Ecodan electricity can produce COP.
+
 The dedicated SQLite database uses WAL mode, foreign keys, transactional writes, SHA-256 payload checksums, and a version table.
 
 | Table | Purpose | Retention |
@@ -22,7 +34,7 @@ The dedicated SQLite database uses WAL mode, foreign keys, transactional writes,
 | `model_parameters` | Reserved for versioned model parameters | Future use |
 | `mapping_revisions` | Effective-dated, non-secret source/equipment provenance | Indefinite |
 
-`daily_records.local_date` is unique. `hourly_records` is unique by exact UTC start/end, so both repeated local hours on a DST fallback day remain distinct and retries are idempotent. Upserting unchanged content is a no-op; corrected daily content increments `revision`. Schema V4 keeps the V3 hourly layer and moves repeated temperature summaries/audit arrays out of record blobs. Schema V5 is additive: independent temperature records can be joined into History and cards without manufacturing an energy parent. The V4→V5 migration does not update daily/hourly/checkpoint payloads or checksums. All forward migrations run transactionally, update the version only after success and never run startup `VACUUM`. A failed migration leaves the prior version retryable. Lock/busy errors are never treated as corruption. Database integrity is checked at startup. A genuinely corrupt file is preserved with a timestamped `.corrupt-*.sqlite3` name before a new schema is created.
+`daily_records.local_date` is unique. `hourly_records` is unique by exact UTC start/end, so both repeated local hours on a DST fallback day remain distinct and retries are idempotent. Upserting unchanged content is a no-op; corrected daily content increments `revision`. Schema V4 keeps the V3 hourly layer and moves repeated temperature summaries/audit arrays out of record blobs. Schema V5 is additive: independent temperature records can be joined into History and cards without manufacturing an energy parent. Schema V6 adds only the cumulative thermal/audit tables. The migrations do not update daily/hourly/checkpoint payloads or checksums. All forward migrations run transactionally, update the version only after success and never run startup `VACUUM`. A failed migration leaves the prior version retryable. Lock/busy errors are never treated as corruption. Database integrity is checked at startup. A genuinely corrupt file is preserved with a timestamped `.corrupt-*.sqlite3` name before a new schema is created.
 
 Temperature-only rows contain temperature statistics and provenance only. Their energy, PV, import/export, non-HVAC and allocation fields are unavailable (`null`/empty), never zero. Read paths overlay stronger independent temperature summaries onto matching energy dates and expose temperature-only dates where no energy record exists. Heating-response admission still requires separate completed-day electricity evidence.
 

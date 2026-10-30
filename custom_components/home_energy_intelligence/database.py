@@ -19,7 +19,7 @@ from .models import DailyRecord
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -153,6 +153,29 @@ CREATE TABLE IF NOT EXISTS temperature_backfill_jobs (
   details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+"""
+MIGRATION_6 = """
+CREATE TABLE IF NOT EXISTS thermal_meter_readings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ecodan_equipment_id TEXT NOT NULL, meter_identity TEXT NOT NULL,
+  effective_at_utc TEXT NOT NULL, local_date TEXT NOT NULL,
+  local_time TEXT NOT NULL, timezone TEXT NOT NULL, fold INTEGER NOT NULL DEFAULT 0,
+  heating_thermal_kwh REAL, dhw_thermal_kwh REAL,
+  vendor_heating_electricity_kwh REAL, vendor_dhw_electricity_kwh REAL,
+  source_label TEXT NOT NULL, note TEXT, unit TEXT NOT NULL DEFAULT 'kWh',
+  source_entity_id TEXT, source_unit TEXT, mapping_effective_at TEXT,
+  revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(ecodan_equipment_id, meter_identity, effective_at_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_thermal_readings_effective
+  ON thermal_meter_readings(ecodan_equipment_id, meter_identity, effective_at_utc);
+CREATE TABLE IF NOT EXISTS thermal_meter_reading_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, reading_id INTEGER,
+  action TEXT NOT NULL, revision INTEGER NOT NULL,
+  payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_thermal_reading_audit_reading
+  ON thermal_meter_reading_audit(reading_id, id);
 """
 
 _TEMPERATURE_REJECTION_REASONS = (
@@ -421,6 +444,13 @@ def _migrate_temperature_storage_v5(connection: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_thermal_storage_v6(connection: sqlite3.Connection) -> None:
+    """Add the manual cumulative thermal ledger in the caller transaction."""
+    for statement in MIGRATION_6.split(";"):
+        if statement.strip():
+            connection.execute(statement)
+
+
 def _temperature_coverage(value: dict[str, Any] | None) -> float:
     if not isinstance(value, dict):
         return -1.0
@@ -625,7 +655,9 @@ class EnergyDatabase:
                     row[0], SCHEMA_VERSION,
                 )
             if row is None:
-                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4 + MIGRATION_5)
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n" + MIGRATION_4 + MIGRATION_5 + MIGRATION_6
+                )
                 connection.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
             elif row[0] == 1:
                 connection.executescript(
@@ -633,20 +665,28 @@ class EnergyDatabase:
                 )
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
+                _migrate_thermal_storage_v6(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 2:
                 connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_3 + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
+                _migrate_thermal_storage_v6(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 3:
                 connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
+                _migrate_thermal_storage_v6(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 4:
                 connection.execute("BEGIN IMMEDIATE")
                 _migrate_temperature_storage_v5(connection)
+                _migrate_thermal_storage_v6(connection)
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            elif row[0] == 5:
+                connection.execute("BEGIN IMMEDIATE")
+                _migrate_thermal_storage_v6(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
@@ -1625,6 +1665,177 @@ class EnergyDatabase:
                 )"""
             ).fetchone()
         return row[0], row[1]
+
+    def save_thermal_reading(
+        self, payload: dict[str, Any], reading_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Insert or revise one normalized cumulative Ecodan meter observation."""
+        fields = (
+            "ecodan_equipment_id", "meter_identity", "effective_at_utc",
+            "local_date", "local_time", "timezone", "fold",
+            "heating_thermal_kwh", "dhw_thermal_kwh",
+            "vendor_heating_electricity_kwh", "vendor_dhw_electricity_kwh",
+            "source_label", "note", "unit",
+            "source_entity_id", "source_unit", "mapping_effective_at",
+        )
+        now = datetime.now(UTC).isoformat()
+        values = [payload.get(field) for field in fields]
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflict = connection.execute(
+                """SELECT id FROM thermal_meter_readings
+                WHERE ecodan_equipment_id=? AND meter_identity=? AND effective_at_utc=?""",
+                (payload.get("ecodan_equipment_id"), payload.get("meter_identity"),
+                 payload.get("effective_at_utc")),
+            ).fetchone()
+            if conflict is not None and int(conflict["id"]) != int(reading_id or -1):
+                raise ValueError("a reading already exists for this meter and timestamp")
+            if reading_id is None:
+                cursor = connection.execute(
+                    f"""INSERT INTO thermal_meter_readings
+                    ({','.join(fields)},revision,created_at,updated_at)
+                    VALUES ({','.join('?' for _ in fields)},1,?,?)""",
+                    (*values, now, now),
+                )
+                reading_id = int(cursor.lastrowid)
+                revision = 1
+                action = "create"
+            else:
+                prior = connection.execute(
+                    "SELECT * FROM thermal_meter_readings WHERE id=?", (reading_id,)
+                ).fetchone()
+                if prior is None:
+                    raise ValueError("thermal reading does not exist")
+                revision = int(prior["revision"]) + 1
+                assignments = ",".join(f"{field}=?" for field in fields)
+                connection.execute(
+                    f"""UPDATE thermal_meter_readings SET {assignments},
+                    revision=?,updated_at=? WHERE id=?""",
+                    (*values, revision, now, reading_id),
+                )
+                action = "update"
+            row = connection.execute(
+                "SELECT * FROM thermal_meter_readings WHERE id=?", (reading_id,)
+            ).fetchone()
+            result = dict(row)
+            connection.execute(
+                """INSERT INTO thermal_meter_reading_audit
+                (reading_id,action,revision,payload_json,created_at)
+                VALUES (?,?,?,?,?)""",
+                (reading_id, action, revision, _canonical_json(result), now),
+            )
+        return result
+
+    def delete_thermal_reading(self, reading_id: int) -> bool:
+        """Delete a reading while retaining its last value in the audit ledger."""
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM thermal_meter_readings WHERE id=?", (reading_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            payload = dict(row)
+            revision = int(row["revision"]) + 1
+            connection.execute(
+                """INSERT INTO thermal_meter_reading_audit
+                (reading_id,action,revision,payload_json,created_at)
+                VALUES (?,?,?,?,?)""",
+                (reading_id, "delete", revision, _canonical_json(payload), now),
+            )
+            connection.execute("DELETE FROM thermal_meter_readings WHERE id=?", (reading_id,))
+        return True
+
+    def save_automatic_thermal_reading(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Idempotently persist one source-timestamped automatic observation."""
+        with self.connect() as connection:
+            existing = connection.execute(
+                """SELECT * FROM thermal_meter_readings
+                WHERE ecodan_equipment_id=? AND meter_identity=? AND effective_at_utc=?""",
+                (payload["ecodan_equipment_id"], payload["meter_identity"],
+                 payload["effective_at_utc"]),
+            ).fetchone()
+        if existing is not None:
+            return dict(existing)
+        return self.save_thermal_reading(payload)
+
+    def thermal_readings(
+        self, *, ecodan_equipment_id: str | None = None,
+        start: datetime | None = None, end: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        arguments: list[Any] = []
+        if ecodan_equipment_id:
+            clauses.append("ecodan_equipment_id=?")
+            arguments.append(ecodan_equipment_id)
+        if start is not None:
+            clauses.append("effective_at_utc>=?")
+            arguments.append(start.astimezone(UTC).isoformat())
+        if end is not None:
+            clauses.append("effective_at_utc<=?")
+            arguments.append(end.astimezone(UTC).isoformat())
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            order = (
+                "ORDER BY id DESC LIMIT ?" if limit is not None else
+                "ORDER BY ecodan_equipment_id,meter_identity,effective_at_utc,id"
+            )
+            if limit is not None:
+                arguments.append(max(1, min(int(limit), 5000)))
+            rows = connection.execute(
+                f"SELECT * FROM thermal_meter_readings{where} {order}",
+                arguments,
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        return list(reversed(result)) if limit is not None else result
+
+    def thermal_readings_period(
+        self, start: datetime, end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded range plus one preceding baseline per meter."""
+        start_text = start.astimezone(UTC).isoformat()
+        end_text = end.astimezone(UTC).isoformat()
+        with self.connect() as connection:
+            baselines = connection.execute(
+                """SELECT reading.* FROM thermal_meter_readings reading JOIN (
+                SELECT ecodan_equipment_id,meter_identity,MAX(effective_at_utc) AS stamp
+                FROM thermal_meter_readings WHERE effective_at_utc<?
+                GROUP BY ecodan_equipment_id,meter_identity
+                ) prior ON prior.ecodan_equipment_id=reading.ecodan_equipment_id
+                AND prior.meter_identity=reading.meter_identity
+                AND prior.stamp=reading.effective_at_utc""",
+                (start_text,),
+            ).fetchall()
+            rows = connection.execute(
+                """SELECT * FROM thermal_meter_readings
+                WHERE effective_at_utc>=? AND effective_at_utc<=?
+                ORDER BY ecodan_equipment_id,meter_identity,effective_at_utc,id""",
+                (start_text, end_text),
+            ).fetchall()
+        unique = {int(row["id"]): dict(row) for row in [*baselines, *rows]}
+        return sorted(unique.values(), key=lambda row: (
+            row["ecodan_equipment_id"], row["meter_identity"],
+            row["effective_at_utc"], row["id"],
+        ))
+
+    def thermal_reading_count(self) -> int:
+        with self.connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM thermal_meter_readings"
+            ).fetchone()[0])
+
+    def thermal_reading_audit(self, reading_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT action,revision,payload_json,created_at
+                FROM thermal_meter_reading_audit WHERE reading_id=? ORDER BY id""",
+                (reading_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "payload": json.loads(row["payload_json"])} for row in rows
+        ]
 
     def export_to(self, destination: str | Path) -> Path:
         target = Path(destination)

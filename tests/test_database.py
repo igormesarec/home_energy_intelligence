@@ -110,7 +110,7 @@ def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
     migrated.pop("updated_at")
     assert migrated == logical
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
         raw = connection.execute("SELECT payload_json FROM daily_records").fetchone()[0]
         assert "temperatures" not in json.loads(raw)
         assert connection.execute(
@@ -160,7 +160,7 @@ def test_every_supported_legacy_schema_upgrades_losslessly_and_idempotently(
     db.initialize()
     assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 6.5
     with db.connect() as connection:
-            assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+            assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
     before = db.size_bytes()
     db.initialize()
     assert db.size_bytes() == before
@@ -222,7 +222,7 @@ def test_v4_migration_streams_thousands_of_daily_and_hourly_rows(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM temperature_summaries"
         ).fetchone()[0] == 2400
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
 
 
 def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
@@ -382,7 +382,7 @@ def test_storage_status_discloses_safe_maintenance_policy(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
     status = db.storage_status()
-    assert status["schema_version"] == 5
+    assert status["schema_version"] == 6
     assert status["migration_required"] is False
     assert status["startup_vacuum_enabled"] is False
     assert status["backup_method"] == "protected_sqlite_online_backup"
@@ -665,7 +665,7 @@ def test_hourly_records_are_idempotent_bounded_and_dst_safe(tmp_path):
     rows = db.hourly_range(start, start + timedelta(hours=25))
     assert len(rows) == 25
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
 
 
 def _mapping(effective_at, entity_id="sensor.outdoor"):
@@ -862,7 +862,7 @@ def test_v4_to_v5_migration_preserves_energy_and_checkpoint_payloads(tmp_path):
         ).fetchone()
         assert tuple(daily_after) == tuple(daily_before)
         assert tuple(checkpoint_after) == tuple(checkpoint_before)
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
 
 
 def test_v4_to_v5_migration_failure_rolls_back_schema_and_version(tmp_path, monkeypatch):

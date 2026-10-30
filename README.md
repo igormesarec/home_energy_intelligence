@@ -1,6 +1,30 @@
 # Home Energy Intelligence
 
-Home Energy Intelligence is a HACS-installable Home Assistant custom integration for validated daily whole-house energy records. V0.1 focuses on trustworthy collection and allocation: it does not estimate thermal production, COP, or weather-dependent forecasts.
+## V0.2 measured thermal energy (draft)
+
+V0.2 adds measured Ecodan thermal evidence without deriving heat from electricity.
+Configure an Ecodan equipment entry and optional cumulative heating/DHW thermal-energy
+entities in the Data Sources step, or use the administrator-only cumulative reading
+form on **COP & Efficiency**. Existing installations retain their saved floor area;
+new installations default to 170 m² and may override it.
+
+The dashboard provides four independent response charts:
+
+1. Ecodan space-heating electricity, measured thermal energy and interval COP.
+2. Whole-house heating electricity (Ecodan plus each AC) and kWh/m²/day.
+3. Each AC's cooling electricity, combined cooling and kWh/m²/day.
+4. Ecodan DHW electricity, measured thermal energy and interval COP.
+
+COP is Ecodan-only and uses exactly matched measurement intervals. Combined COP is a
+ratio of sums, never an average of COP values. A cumulative span crossing several days
+is labelled as an interval and is not distributed into fictitious daily heat. AC COP,
+AC thermal generation and V0.3 forecast numbers are not calculated.
+
+Automatic backfill uses bounded Home Assistant Recorder reads and is safe to rerun.
+InfluxDB remains read-only. Manual entries require an administrator and record every
+create, revision and deletion in the SQLite audit ledger.
+
+Home Energy Intelligence is a HACS-installable Home Assistant custom integration for validated daily whole-house energy records. The V0.1 foundation focuses on trustworthy collection and allocation. V0.2 adds COP only where measured Ecodan thermal evidence can be exactly matched; it still does not estimate thermal production or weather-dependent forecasts.
 
 ![Approved dashboard design](docs/design/home_energy_intelligence_dashboard.png)
 
@@ -62,7 +86,8 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 9. If a representative sensor has blank history, open dashboard **Settings → Temperature pipeline diagnostics and recovery**. Select 1–31 dates, run **Diagnose**, then **Preview temperature-only backfill**. Start the backfill only after reviewing mapping blocks and query cost. Use the explicit attestation checkbox only when you can prove the displayed current entity/attribute/role applied to the entire selected range. Missing Recorder intervals remain gaps.
-10. After upgrading V0.1.2 through HACS, redownload the integration if needed and restart Home Assistant. The panel content hash changes with the JavaScript bundle; no config-entry recreation or database rebuild is required.
+10. After upgrading through HACS, redownload the integration if needed and restart Home Assistant. V0.2 migrates schema V5 to V6 additively; make a protected backup first. The panel content hash changes with the JavaScript bundle; no config-entry recreation or database rebuild is required.
+11. Open integration Options → Data sources, choose manual-only, Home Assistant counters, or mixed thermal mode, select the Ecodan stable equipment ID and optional cumulative thermal entities. Existing saved floor area and all V0.1.x records are retained.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
@@ -111,6 +136,8 @@ The [V0.1.2 root-cause matrix](docs/V0_1_2_ROOT_CAUSE_MATRIX.md) and [implementa
 - **V0.1:** validated electricity, temperature, source quality, and basic dashboard/history/settings.
 - **V0.1.1:** whole-house electrical heating-response evidence; no thermal output is inferred.
 - **V0.1.2:** independent temperature history recovery, current-cutoff HVAC presentation and release-safety corrections.
+- **V0.2:** measured Ecodan thermal intervals/COP, four separate response curves and whole-house electrical/partially-known thermal profile.
+- **V0.3:** weather-dependent forecasting (interface only in V0.2; no values yet).
 - **V0.2:** manually or natively sourced thermal energy, thermal response, and correctly weighted COP.
 - **V0.3:** weather sources and probabilistic forecasting.
 

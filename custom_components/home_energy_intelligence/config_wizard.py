@@ -52,7 +52,7 @@ def _general(values):
     ]
     return vol.Schema({
         vol.Required("locale", default=values.get("locale", "en")): selector.SelectSelector(selector.SelectSelectorConfig(options=["en", "sl"])),
-        vol.Required("floor_area_m2", default=values.get("floor_area_m2", 180)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=5000, step=1, unit_of_measurement="m²")),
+        vol.Required("floor_area_m2", default=values.get("floor_area_m2", 170)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=5000, step=1, unit_of_measurement="m²")),
         vol.Required("energy_season_start_month", default=str(values.get("energy_season_start_month", 7))): selector.SelectSelector(selector.SelectSelectorConfig(options=month_options)),
         vol.Required("energy_season_start_day", default=values.get("energy_season_start_day", 1)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=28, step=1, mode=selector.NumberSelectorMode.BOX)),
     })
@@ -125,8 +125,13 @@ def _site(values):
     })
 
 
-def _sources(values):
-    return vol.Schema({
+def _sources(values, equipment=None):
+    heat_pumps = [item for item in (equipment or []) if item.get("kind") == "heat_pump"]
+    hp_options = [
+        {"value": item["equipment_id"], "label": item.get("display_name", item["equipment_id"])}
+        for item in heat_pumps
+    ]
+    schema = {
         vol.Required("historical_source", default=values.get("historical_source", "recorder")): selector.SelectSelector(selector.SelectSelectorConfig(options=["recorder", "recorder_with_influx_backfill"])),
         vol.Required("influx_enabled", default=values.get("influx_enabled", False)): selector.BooleanSelector(),
         vol.Optional("influx_host", description={"suggested_value": values.get("influx_host", "")}): str,
@@ -138,7 +143,18 @@ def _sources(values):
         vol.Optional("influx_username", description={"suggested_value": values.get("influx_username", "")}): str,
         vol.Optional("influx_password"): selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
         vol.Optional("influx_mapping_json", default=values.get("influx_mapping_json", "{}")): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
-    })
+        vol.Required("thermal_source_mode", default=values.get("thermal_source_mode", "manual_only")): selector.SelectSelector(selector.SelectSelectorConfig(options=["manual_only", "ha_counters", "mixed"])),
+        _optional("heating_thermal_energy_entity", values.get("heating_thermal_energy_entity")): _entity("sensor", "energy"),
+        _optional("dhw_thermal_energy_entity", values.get("dhw_thermal_energy_entity")): _entity("sensor", "energy"),
+        _optional("vendor_heating_electricity_entity", values.get("vendor_heating_electricity_entity")): _entity("sensor", "energy"),
+        _optional("vendor_dhw_electricity_entity", values.get("vendor_dhw_electricity_entity")): _entity("sensor", "energy"),
+    }
+    if hp_options:
+        current = values.get("ecodan_thermal_equipment_id", hp_options[0]["value"])
+        schema[vol.Required("ecodan_thermal_equipment_id", default=current)] = selector.SelectSelector(
+            selector.SelectSelectorConfig(options=hp_options)
+        )
+    return vol.Schema(schema)
 
 
 def _check_source(hass, entity_id, expected, *, attribute=None):
@@ -389,9 +405,20 @@ class _Wizard:
             if user_input.get("influx_enabled") and (not user_input.get("influx_host") or not user_input.get("influx_database")): errors["base"] = "influx_incomplete"
             try: json.loads(user_input.get("influx_mapping_json", "{}"))
             except json.JSONDecodeError: errors["influx_mapping_json"] = "invalid_json"
-            if errors: return self.async_show_form(step_id="data_sources", data_schema=_sources(user_input), errors=errors)
+            for key in (
+                "heating_thermal_energy_entity", "dhw_thermal_energy_entity",
+                "vendor_heating_electricity_entity", "vendor_dhw_electricity_entity",
+            ):
+                if error := _check_source(self.hass, user_input.get(key), "energy"):
+                    errors[key] = error
+            if user_input.get("thermal_source_mode") == "ha_counters" and not (
+                user_input.get("heating_thermal_energy_entity")
+                or user_input.get("dhw_thermal_energy_entity")
+            ):
+                errors["base"] = "thermal_source_incomplete"
+            if errors: return self.async_show_form(step_id="data_sources", data_schema=_sources(user_input, self.equipment), errors=errors)
             self.result.update(user_input); return await self.async_step_data_quality()
-        return self.async_show_form(step_id="data_sources", data_schema=_sources(self.result))
+        return self.async_show_form(step_id="data_sources", data_schema=_sources(self.result, self.equipment))
 
     async def async_step_data_quality(self, user_input=None):
         if user_input is not None:
@@ -562,6 +589,9 @@ class OptionsFlow(_Wizard, config_entries.OptionsFlow):
         mapping_keys = (
             "equipment", "temperature_sources", "site_sources",
             "representative_indoor_source_id", "representative_outdoor_source_id",
+            "thermal_source_mode", "ecodan_thermal_equipment_id",
+            "heating_thermal_energy_entity", "dhw_thermal_energy_entity",
+            "vendor_heating_electricity_entity", "vendor_dhw_electricity_entity",
         )
         def comparable(key, value):
             # JSON whitespace/key formatting is not a mapping revision.
