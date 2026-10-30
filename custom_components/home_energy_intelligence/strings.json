@@ -43,7 +43,7 @@
           "weather": "Weather entity"
         }
       },
-      "general": {"title": "General", "description": "Configure the home, language and energy season.", "data": {"locale": "Language", "floor_area_m2": "Heated floor area", "energy_season_start_month": "Energy-season start month", "energy_season_start_day": "Energy-season start day"}},
+      "general": {"title": "General", "description": "Configure the home, language and energy season. Season preview: {energy_season_preview}.", "data": {"locale": "Language", "floor_area_m2": "Heated floor area", "energy_season_start_month": "Energy-season start month", "energy_season_start_day": "Energy-season start day"}},
       "heat_pumps": {"title": "Heat pumps", "description": "Add one heat pump at a time. State mappings are installation-specific.", "data": {"configure": "Configure this heat pump", "equipment_id": "Stable equipment ID", "display_name": "Display name", "enabled": "Enabled", "energy_entity": "Electricity energy", "power_entity": "Electricity power", "state_entity": "Operating state", "state_attribute": "State attribute (optional)", "room_temperature_entity": "Room temperature (optional)", "supply_temperature_entity": "Supply temperature (optional; never circuit 2K)", "return_temperature_entity": "Return temperature (optional)", "state_map": "Operating-state mapping (JSON)", "add_another": "Add another heat pump", "action": "Action"}},
       "air_conditioners": {"title": "Air conditioners", "description": "Add zero or more independently metered AC units.", "data": {"configure": "Configure an air conditioner", "equipment_id": "Stable equipment ID", "display_name": "Display name", "enabled": "Enabled", "energy_entity": "Electricity energy", "power_entity": "Electricity power", "state_entity": "Climate/state entity", "state_attribute": "State attribute (optional)", "room_temperature_entity": "Room temperature (optional)", "supply_temperature_entity": "Supply temperature (optional)", "return_temperature_entity": "Return temperature (optional)", "state_map": "Operating-state mapping (JSON)", "add_another": "Add another air conditioner", "action": "Action"}},
       "solar_grid": {"title": "Solar PV and grid", "description": "All three site counters are optional.", "data": {"pv": "PV production energy", "import": "Grid import energy", "export": "Grid export energy"}},
@@ -96,7 +96,7 @@
           "influx_mapping_json": "InfluxDB source mapping (JSON)"
         }
       },
-      "general": {"title": "General", "description": "Reconfigure all mappings; historical records are retained.", "data": {"locale": "Language", "floor_area_m2": "Heated floor area", "energy_season_start_month": "Energy-season start month", "energy_season_start_day": "Energy-season start day"}},
+      "general": {"title": "General", "description": "Reconfigure settings without deleting historical records. Season preview: {energy_season_preview}.", "data": {"locale": "Language", "floor_area_m2": "Heated floor area", "energy_season_start_month": "Energy-season start month", "energy_season_start_day": "Energy-season start day"}},
       "heat_pumps": {"title": "Heat pumps", "description": "Add, edit, disable or omit heat-pump equipment."},
       "air_conditioners": {"title": "Air conditioners", "description": "Add, edit, disable or omit AC equipment."},
       "solar_grid": {"title": "Solar PV and grid", "description": "Optional site counters."},

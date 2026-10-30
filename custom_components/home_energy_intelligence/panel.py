@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
@@ -12,8 +13,8 @@ from .const import DOMAIN, PANEL_ICON, PANEL_TITLE, PANEL_URL, VERSION
 
 async def async_register_panel(hass) -> None:
     domain_data = hass.data.setdefault(DOMAIN, {})
+    frontend_dir = Path(__file__).parent / "frontend"
     if not domain_data.get("panel_static_path_registered"):
-        frontend_dir = Path(__file__).parent / "frontend"
         await hass.http.async_register_static_paths([
             StaticPathConfig(f"/{DOMAIN}_static", str(frontend_dir), True)
         ])
@@ -23,11 +24,12 @@ async def async_register_panel(hass) -> None:
     # setup/reload is idempotent without swallowing registration errors.
     if PANEL_URL in hass.data.get("frontend_panels", {}):
         return
+    frontend_build = sha256((frontend_dir / "hei-panel.js").read_bytes()).hexdigest()[:12]
     await panel_custom.async_register_panel(
         hass=hass,
         frontend_url_path=PANEL_URL,
         webcomponent_name="home-energy-intelligence-panel",
-        module_url=f"/{DOMAIN}_static/hei-panel.js?v={VERSION}",
+        module_url=f"/{DOMAIN}_static/hei-panel.js?v={VERSION}-{frontend_build}",
         sidebar_title=PANEL_TITLE,
         sidebar_icon=PANEL_ICON,
         require_admin=False,

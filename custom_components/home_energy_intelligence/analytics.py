@@ -81,8 +81,15 @@ def canonical_energy(
         ),
     ))
     complete = meter_complete and allocation_complete
-    temporal_complete = bool(
-        (coverage.get("date_coverage") or {}).get("complete", interval_complete)
+    date_coverage = coverage.get("date_coverage") or {}
+    temporal_complete = bool(date_coverage.get(
+        "complete_through_available_cutoff",
+        date_coverage.get("complete", interval_complete),
+    ))
+    calendar_period_finalized = bool(
+        date_coverage.get("complete", interval_complete)
+        and record.get("partial") is not True
+        and record.get("finalized") is not False
     )
 
     def kind_complete(kind: str) -> bool:
@@ -103,6 +110,10 @@ def canonical_energy(
 
     heat_pump_complete = kind_complete("heat_pump")
     ac_complete = kind_complete("air_conditioner")
+    has_heat_pumps = any(item.get("kind") == "heat_pump" for item in enabled)
+    has_air_conditioners = any(
+        item.get("kind") == "air_conditioner" for item in enabled
+    )
     residual_evidence = 0.0
     for item in enabled:
         equipment_id = str(item["equipment_id"])
@@ -233,6 +244,14 @@ def canonical_energy(
     known_idle = totals["idle_kwh"]
     known_other_hvac = totals["other_hvac_kwh"]
     known_hvac_meter = totals["hvac_meter_kwh"]
+    known_heating_evidence = any(
+        item.get("available") for item in breakdown
+    )
+    known_dhw_evidence = any(
+        item.get("available") and item.get("kind") == "heat_pump"
+        for item in breakdown
+    )
+    known_cooling_evidence = known_heating_evidence
     heating_complete = heat_pump_complete and ac_complete
     cooling_complete = heat_pump_complete and ac_complete
     category_requirements = {
@@ -251,20 +270,26 @@ def canonical_energy(
         if not is_complete:
             totals[key] = None
     totals.update({
-        "known_space_heating_kwh": known_space_heating,
-        "known_dhw_kwh": known_dhw,
-        "known_cooling_kwh": known_cooling,
-        "known_idle_kwh": known_idle,
-        "known_other_hvac_kwh": known_other_hvac,
-        "known_hvac_meter_kwh": known_hvac_meter,
+        "known_space_heating_kwh": (
+            known_space_heating if known_heating_evidence else None
+        ),
+        "known_dhw_kwh": known_dhw if known_dhw_evidence else None,
+        "known_cooling_kwh": known_cooling if known_cooling_evidence else None,
+        "known_idle_kwh": known_idle if known_heating_evidence else None,
+        "known_other_hvac_kwh": (
+            known_other_hvac if has_air_conditioners and known_heating_evidence else None
+        ),
+        "known_hvac_meter_kwh": known_hvac_meter if known_heating_evidence else None,
         "space_heating_kwh": known_space_heating if heating_complete else None,
-        "dhw_kwh": known_dhw if heat_pump_complete else None,
-        "cooling_kwh": known_cooling if cooling_complete else None,
+        "dhw_kwh": known_dhw if has_heat_pumps and heat_pump_complete else None,
+        "cooling_kwh": (
+            known_cooling if enabled and cooling_complete else None
+        ),
         "idle_kwh": known_idle if allocation_complete else None,
         "hvac_meter_kwh": known_hvac_meter if allocation_complete else None,
         "heating_and_dhw_kwh": (
             known_space_heating + known_dhw
-            if heating_complete and heat_pump_complete else None
+            if has_heat_pumps and heating_complete and heat_pump_complete else None
         ),
     })
     household = _number(record.get("household_kwh"))
@@ -319,6 +344,24 @@ def canonical_energy(
         # must not downgrade otherwise complete electricity evidence.
         "quality": energy_quality,
         "complete": complete,
+        "complete_through_cutoff": bool(
+            temporal_complete and meter_complete and allocation_complete
+        ),
+        "calendar_period_finalized": calendar_period_finalized,
+        "provisional": not calendar_period_finalized,
+        "provisional_reason": (
+            "current_period_in_progress" if not calendar_period_finalized
+            and temporal_complete else
+            ("incomplete_intervals" if not temporal_complete else None)
+        ),
+        "incompleteness_reasons": [
+            reason for condition, reason in (
+                (not temporal_complete, "incomplete_intervals"),
+                (not meter_complete, "missing_meter_evidence"),
+                (not allocation_complete, "incomplete_classification"),
+                (not calendar_period_finalized, "calendar_period_in_progress"),
+            ) if condition
+        ],
         "completeness": {
             "date": bool((coverage.get("date_coverage") or {}).get("complete", interval_complete)),
             "meter": meter_complete, "allocation": allocation_complete,
@@ -576,6 +619,14 @@ def combine_interval_records(
             else:
                 coverage_known = False
             seconds += period
+        part_qualities = {str(part.get("quality", "missing")) for part in available}
+        allocation_quality = (
+            "partial" if len(available) != len(records) or part_qualities.intersection(
+                {"partial", "poor", "missing", "missing_counter", "unreconciled"}
+            ) else
+            ("uncertain" if part_qualities.intersection({"uncertain", "estimated"}) else
+             ("filtered" if "filtered" in part_qualities else "good"))
+        )
         allocations[equipment_id] = {
             "meter_kwh": (None if len(available) != len(records) or any(
                 _number(part.get("meter_kwh")) is None for part in available
@@ -596,9 +647,7 @@ def combine_interval_records(
             "known_coverage_percent": 100 * covered / seconds if seconds else None,
             "coverage_known": coverage_known,
             "covered_seconds": covered, "period_seconds": seconds,
-            "quality": "good" if len(available) == len(records) and all(
-                part.get("quality") == "good" for part in available
-            ) else "partial",
+            "quality": allocation_quality,
         }
     source_ids = set().union(*(set(item.get("temperatures", {})) for item in records))
     temperatures: dict[str, dict[str, Any]] = {}
@@ -613,6 +662,22 @@ def combine_interval_records(
         )
         means = [(float(part["mean"]), float(part.get("coverage_seconds", 0) or 0))
                  for part in available if _number(part.get("mean")) is not None]
+        temperature_complete = (
+            len(available) == len(records) and period > 0
+            and coverage >= period - 0.001
+        )
+        temperature_qualities = {
+            str(part.get("quality", "missing")) for part in available
+        }
+        temperature_quality = (
+            "missing" if not coverage else
+            ("partial" if not temperature_complete or temperature_qualities.intersection(
+                {"missing", "poor", "rejected", "unreconciled"}
+            ) else
+             ("filtered" if "filtered" in temperature_qualities or any(
+                 int(part.get("rejected_count", 0) or 0) > 0 for part in available
+             ) else "good"))
+        )
         temperatures[source_id] = {
             "mean": sum(value * weight for value, weight in means) / coverage if coverage else None,
             "minimum": min((float(part["minimum"]) for part in available
@@ -621,9 +686,7 @@ def combine_interval_records(
                             if _number(part.get("maximum")) is not None), default=None),
             "coverage_seconds": coverage, "period_seconds": period,
             "coverage_percent": 100 * coverage / period if period else 0.0,
-            "quality": "good" if len(available) == len(records) and all(
-                part.get("quality") == "good" for part in available
-            ) else ("missing" if not coverage else "partial"),
+            "quality": temperature_quality,
             "rejected_count": sum(int(part.get("rejected_count", 0)) for part in available),
             "latest_value": next((part.get("latest_value") for part in reversed(available)
                                   if part.get("latest_value") is not None), None),
@@ -695,7 +758,11 @@ def combine_interval_records(
             },
             "temperature_coverage": {
                 source_id: {
-                    "complete": item.get("quality") == "good",
+                    "complete": float(item.get("coverage_percent", 0) or 0) >= 99.999,
+                    "response_eligible": (
+                        float(item.get("coverage_percent", 0) or 0) >= 95.0
+                        and item.get("mean") is not None
+                    ),
                     "coverage_percent": item.get("coverage_percent", 0.0),
                     "quality": item.get("quality", "missing"),
                 }
@@ -717,9 +784,16 @@ def combine_interval_records(
         "import_kwh": imported if interval_complete else None,
         "export_kwh": exported if interval_complete else None,
         "non_hvac_kwh": non_hvac if interval_complete else None,
-        "quality": "good" if interval_complete and all(
-            item.get("quality") == "good" for item in records
-        ) else "partial",
+        "quality": (
+            "partial" if not interval_complete or any(
+                item.get("quality") in {"missing", "poor", "unreconciled"}
+                for item in records
+            ) else
+            ("uncertain" if any(item.get("quality") in {"uncertain", "estimated"}
+                                for item in records) else
+             ("filtered" if any(item.get("quality") == "filtered" for item in records)
+              else "good"))
+        ),
         "interval_coverage": coverage,
         "updated_at": records[-1].get("updated_at") or records[-1].get("collected_at"),
         "temperatures": temperatures, "allocations": allocations,
@@ -871,6 +945,13 @@ def daily_coverage(
             if date_expected_seconds else None
         ),
         "complete": not missing and not temporal_partial,
+        "complete_through_available_cutoff": not missing and all(
+            not (
+                by_date[day].get("partial") is True
+                or by_date[day].get("finalized") is False
+            ) or bool((by_date[day].get("interval_coverage") or {}).get("complete"))
+            for day in expected if day in by_date
+        ),
         "scope": "full_local_calendar_days",
     }
     allocation_layer = {

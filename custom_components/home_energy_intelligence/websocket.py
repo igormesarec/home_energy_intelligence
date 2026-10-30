@@ -22,6 +22,9 @@ from .analytics import (
 from .const import DOMAIN
 from .periods import period_bounds, previous_day_same_local_cutoff
 from .timeutils import local_day_bounds
+from .temperature_timeline import (
+    build_timeline_intervals, hourly_axis_ticks, validate_timeline_dates,
+)
 
 
 def async_register_websocket(hass) -> None:
@@ -32,6 +35,11 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_csv)
     websocket_api.async_register_command(hass, ws_temperature_diagnostics)
     websocket_api.async_register_command(hass, ws_reprocess_temperature_history)
+    websocket_api.async_register_command(hass, ws_temperature_backfill_preview)
+    websocket_api.async_register_command(hass, ws_temperature_backfill_start)
+    websocket_api.async_register_command(hass, ws_temperature_backfill_status)
+    websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
+    websocket_api.async_register_command(hass, ws_temperature_timeline)
 
 
 def _coordinator(hass):
@@ -77,6 +85,85 @@ def _response_temperature_coverage_minimum(coordinator) -> float:
     return float(coordinator.config.get("response_temperature_coverage_minimum", 95))
 
 
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_timeline",
+    vol.Required("start_date"): str,
+    vol.Required("end_date"): str,
+    vol.Required("resolution"): vol.In({"hourly", "daily"}),
+    vol.Required("source_ids"): vol.All([str], vol.Length(min=1, max=8)),
+})
+@websocket_api.async_response
+async def ws_temperature_timeline(hass, connection, msg):
+    """Return bounded, persisted and explicitly gapped temperature history."""
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    resolution = msg["resolution"]
+    try:
+        start_date, end_date = validate_timeline_dates(
+            msg["start_date"], msg["end_date"],
+            maximum_days=7 if resolution == "hourly" else 3660,
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    configured = {
+        item.source_id: item for item in _temperatures(coordinator) if item.enabled
+    }
+    requested_ids = list(dict.fromkeys(msg["source_ids"]))
+    invalid_ids = [source_id for source_id in requested_ids if source_id not in configured]
+    if invalid_ids:
+        connection.send_error(
+            msg["id"], "invalid_source",
+            f"Sources are not configured and enabled: {', '.join(invalid_ids)}",
+        )
+        return
+
+    timezone = coordinator.timezone
+    start_utc, _ = local_day_bounds(start_date, timezone)
+    _, requested_end_utc = local_day_bounds(end_date, timezone)
+    now = datetime.now(UTC)
+    completed_hour = now.replace(minute=0, second=0, microsecond=0)
+    end_utc = min(requested_end_utc, completed_hour) if end_date >= now.astimezone(
+        ZoneInfo(timezone)
+    ).date() else requested_end_utc
+    if end_utc < start_utc:
+        end_utc = start_utc
+
+    if resolution == "hourly":
+        stored = await hass.async_add_executor_job(
+            coordinator.database.hourly_range, start_utc, end_utc
+        )
+    else:
+        stored = await hass.async_add_executor_job(
+            coordinator.database.history_period,
+            start_date.isoformat(), end_date.isoformat(),
+        )
+    intervals, available = build_timeline_intervals(
+        resolution=resolution, start_date=start_date, end_date=end_date,
+        timezone=timezone, range_end_utc=end_utc, stored=stored,
+        source_ids=requested_ids,
+    )
+    connection.send_result(msg["id"], {
+        "resolution": resolution, "timezone": timezone,
+        "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
+        "range_start_utc": start_utc.isoformat(), "range_end_utc": end_utc.isoformat(),
+        "requested_range_end_utc": requested_end_utc.isoformat(),
+        "partial": end_utc < requested_end_utc,
+        "source_ids": requested_ids,
+        "sources": [{"source_id": source_id,
+                     "display_name": configured[source_id].display_name,
+                     "entity_id": configured[source_id].entity_id,
+                     "role": configured[source_id].role}
+                    for source_id in requested_ids],
+        "intervals": intervals, "expected_interval_count": len(intervals),
+        "available_interval_count": available,
+        "axis_ticks": (hourly_axis_ticks(start_utc, end_utc, timezone)
+                       if resolution == "hourly" else []),
+    })
+
+
 async def _current_day_snapshot(
     hass, coordinator, cutoff: datetime | None = None, *, now: datetime | None = None,
 ):
@@ -89,16 +176,45 @@ async def _current_day_snapshot(
     today_start, _ = local_day_bounds(today, coordinator.timezone)
     if cutoff < today_start:
         raise ValueError("cutoff is outside the current Home Assistant local day")
-    hours = await hass.async_add_executor_job(
+    energy_hours = await hass.async_add_executor_job(
         coordinator.database.hourly_range, today_start, cutoff
     )
-    coverage = interval_coverage(hours, today_start, cutoff)
-    current = combine_interval_records(
-        hours, expected_start=today_start, expected_end=cutoff
+    temperature_hours = await hass.async_add_executor_job(
+        coordinator.database.temperature_history_range,
+        "hourly", today_start, cutoff,
     )
+    coverage = interval_coverage(energy_hours, today_start, cutoff)
+    current = combine_interval_records(
+        energy_hours, expected_start=today_start, expected_end=cutoff
+    )
+    temperature_current = combine_interval_records(
+        temperature_hours, expected_start=today_start, expected_end=cutoff
+    ) if temperature_hours else None
+    if current is None and temperature_current is not None:
+        current = {
+            **temperature_current,
+            "household_kwh": None, "pv_kwh": None, "import_kwh": None,
+            "export_kwh": None, "non_hvac_kwh": None, "allocations": {},
+            "interval_coverage": coverage, "temperature_only": True,
+        }
+    elif current is not None and temperature_current is not None:
+        for source_id, summary in temperature_current.get("temperatures", {}).items():
+            existing = current.setdefault("temperatures", {}).get(source_id)
+            if not isinstance(existing, dict) or float(
+                summary.get("coverage_seconds", 0) or 0
+            ) > float(existing.get("coverage_seconds", 0) or 0):
+                current["temperatures"][source_id] = summary
+    hours_by_start = {item["period_start_utc"]: item for item in energy_hours}
+    for item in temperature_hours:
+        existing = hours_by_start.get(item["period_start_utc"])
+        if existing is None:
+            hours_by_start[item["period_start_utc"]] = item
+        else:
+            existing.setdefault("temperatures", {}).update(item.get("temperatures", {}))
+    display_hours = sorted(hours_by_start.values(), key=lambda item: item["period_start_utc"])
     if current is not None:
         current.update({"partial": True, "finalized": False})
-    return current, hours, coverage, cutoff, today
+    return current, display_hours, coverage, cutoff, today
 
 
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/overview"})
@@ -123,6 +239,8 @@ async def ws_overview(hass, connection, msg):
     comparison = combine_interval_records(
         comparison_hours, expected_start=yesterday_start, expected_end=comparison_end
     )
+    if comparison is not None:
+        comparison.update({"partial": True, "finalized": False})
     yesterday_full = await hass.async_add_executor_job(
         coordinator.database.daily, yesterday.isoformat()
     )
@@ -445,6 +563,89 @@ async def ws_reprocess_temperature_history(hass, connection, msg):
     except ValueError as error:
         connection.send_error(msg["id"], "invalid_range", str(error))
         return
+    connection.send_result(msg["id"], result)
+
+
+async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_start_temperature_backfill(
+            start, end, dry_run=dry_run,
+            attest_current_mapping=bool(msg.get("attest_current_mapping", False)),
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_backfill_preview",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+    vol.Optional("attest_current_mapping", default=False): bool,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_backfill_preview(hass, connection, msg):
+    await _start_temperature_backfill(hass, connection, msg, dry_run=True)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_backfill_start",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+    vol.Optional("attest_current_mapping", default=False): bool,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_backfill_start(hass, connection, msg):
+    await _start_temperature_backfill(hass, connection, msg, dry_run=False)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_backfill_status",
+    vol.Required("job_id"): vol.Coerce(int),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_backfill_status(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    result = await hass.async_add_executor_job(
+        coordinator.database.temperature_backfill_job, msg["job_id"]
+    )
+    if result is None:
+        connection.send_error(msg["id"], "not_found", "Backfill job was not found")
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_backfill_cancel",
+    vol.Required("job_id"): vol.Coerce(int),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_backfill_cancel(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    requested = await hass.async_add_executor_job(
+        coordinator.database.request_temperature_backfill_cancel, msg["job_id"]
+    )
+    result = await hass.async_add_executor_job(
+        coordinator.database.temperature_backfill_job, msg["job_id"]
+    )
+    if result is None:
+        connection.send_error(msg["id"], "not_found", "Backfill job was not found")
+        return
+    result["cancel_requested"] = bool(requested or result.get("cancel_requested"))
     connection.send_result(msg["id"], result)
 
 

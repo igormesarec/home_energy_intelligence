@@ -38,6 +38,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.responseProfileData = null;
     this.temperatureDiagnostics = null;
     this.temperatureRepairResult = null;
+    this.temperatureBackfillJob = null;
+    this.temperatureBackfillPolling = null;
+    this.temperatureTimelineData = null;
+    this.temperatureTimelineError = null;
   }
 
   set hass(value) {
@@ -49,7 +53,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     }
   }
   set panel(value) { this._panel = value; }
-  disconnectedCallback() { if (this._poll) window.clearInterval(this._poll); }
+  disconnectedCallback() { if (this._poll) window.clearInterval(this._poll); if(this.temperatureBackfillPolling)window.clearTimeout(this.temperatureBackfillPolling); }
 
   async load(showLoading = true) {
     if (showLoading) this.loading = true;
@@ -75,6 +79,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       this.responseProfileData = history.response_profile;
       this.selectedPeriod = history.selected_period;
       this.settings = settings;
+      await this.loadTemperatureTimeline(history, overview, false);
     } catch (error) {
       if (this.overviewData) {
         this.refreshError = error?.message || String(error);
@@ -105,6 +110,41 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return configuredId
       ? this.temperatureSources.find((item) => item.source_id === configuredId) || null
       : null;
+  }
+
+  temperatureQualityLabel(summary) {
+    if (!summary) return "Missing";
+    const reasons = (summary.rejected_reasons || summary.rejections || [])
+      .map((item) => typeof item === "string" ? item : item?.reason)
+      .filter(Boolean).map((item) => String(item).replaceAll("_", " "));
+    if (summary.quality === "filtered") return `Filtered samples${reasons.length ? `: ${[...new Set(reasons)].join(", ")}` : ""}`;
+    if (summary.quality === "partial" && (summary.rejected_count || reasons.length)) return `Partial: filtered samples${reasons.length ? ` (${[...new Set(reasons)].join(", ")})` : ""}`;
+    return String(summary.quality || "missing").replaceAll("_", " ");
+  }
+
+  async loadTemperatureTimeline(historyResponse = null, overview = null, shouldRender = true) {
+    const period = historyResponse?.selected_period || this.selectedPeriod;
+    const data = overview || this.overviewData;
+    const sourceIds = [data?.representative_indoor_source_id, data?.representative_outdoor_source_id].filter(Boolean);
+    if (!period?.start_date || !period?.end_date || !sourceIds.length) {
+      this.temperatureTimelineData = null;
+      this.temperatureTimelineError = null;
+      if (shouldRender) this.render();
+      return;
+    }
+    const resolution = period.start_date === period.end_date ? "hourly" : "daily";
+    try {
+      this.temperatureTimelineData = await this._hass.callWS({
+        type: "home_energy_intelligence/temperature_timeline",
+        start_date: period.start_date, end_date: period.end_date,
+        resolution, source_ids: [...new Set(sourceIds)],
+      });
+      this.temperatureTimelineError = null;
+    } catch (error) {
+      this.temperatureTimelineData = null;
+      this.temperatureTimelineError = error?.message || String(error);
+    }
+    if (shouldRender) this.render();
   }
 
   selectedRecord() { return this.historySummary || (this.historyPreset === "today" ? this.latest : null); }
@@ -238,8 +278,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       ${records.map((r) => `<tr><td>${esc(r.local_date)}</td><td>${n(r.energy?.household_kwh)} kWh</td>
         <td>${n(r.energy?.confirmed_heat_pump_heating_kwh)} kWh</td><td>${n(r.energy?.assumed_heat_pump_heating_kwh)} kWh</td>
         <td>${n(r.energy?.confirmed_ac_heating_kwh)} kWh</td><td>${n(addNullable(r.energy?.selected_ac_heating_kwh,r.energy?.estimated_ac_heating_kwh))} kWh</td>
-        <td>${n(r.energy?.space_heating_kwh)} kWh</td><td>${n(r.energy?.dhw_kwh)} kWh</td><td>${n(r.energy?.heating_and_dhw_kwh)} kWh</td><td>${n(r.energy?.cooling_kwh)} kWh</td>
-        <td>${n(r.energy?.idle_kwh)} kWh</td><td>${n(r.energy?.other_hvac_kwh)} kWh</td><td>${n(r.energy?.other_household_kwh)} kWh</td><td>${n(r.energy?.unknown_kwh)} kWh</td><td>${n(r.energy?.unallocated_discrepancy_kwh)} kWh</td>
+        <td>${this.evidence(r.energy?.space_heating_kwh,r.energy?.known_space_heating_kwh)}</td><td>${this.evidence(r.energy?.dhw_kwh,r.energy?.known_dhw_kwh)}</td><td>${this.evidence(r.energy?.heating_and_dhw_kwh,addNullable(r.energy?.known_space_heating_kwh,r.energy?.known_dhw_kwh))}</td><td>${this.evidence(r.energy?.cooling_kwh,r.energy?.known_cooling_kwh)}</td>
+        <td>${this.evidence(r.energy?.idle_kwh,r.energy?.known_idle_kwh)}</td><td>${this.evidence(r.energy?.other_hvac_kwh,r.energy?.known_other_hvac_kwh)}</td><td>${n(r.energy?.other_household_kwh)} kWh</td><td>${n(r.energy?.unknown_kwh)} kWh</td><td>${n(r.energy?.unallocated_discrepancy_kwh)} kWh</td>
         <td>${n(r.energy?.pv_kwh)} kWh</td><td>${n(r.energy?.import_kwh)} kWh</td><td>${n(r.energy?.export_kwh)} kWh</td><td>${n(r.energy?.self_sufficiency_percent)}%</td><td>${this.quality(r)}</td></tr>`).join("")}
     </tbody></table></div>`;
   }
@@ -253,10 +293,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const status = isToday ? (this.overviewData?.stale ? `Partial/stale — ${this.refreshError || "hourly coverage incomplete"}` : "Actual through latest completed hour") : "Validated selected-period summary";
     const metric = (label, object) => label === "Whole-House Electricity" ? object?.household_kwh : label === "Heating Electricity" ? object?.space_heating_kwh : label === "DHW Electricity" ? object?.dhw_kwh : label === "Heating + DHW" ? object?.heating_and_dhw_kwh : label === "Cooling Electricity" ? object?.cooling_kwh : label === "PV Generation" ? object?.pv_kwh : object?.self_sufficiency_percent;
     return `${this.periodControls()}<div class="toolbar"><div><b>${esc(this.selectedPeriod?.label || "Today")} <span class="quality ${this.historyCoverage?.complete?"good":"partial"}">${this.historyCoverage?.complete?"Complete":"Partial"}</span></b><span>${esc(status)}${isToday?` · ${n(hourlyCoverage?.coverage_percent,0)}% hourly coverage · cutoff ${esc(this.overviewData?.cutoff_local || "—")} (${esc(this.overviewData?.timezone || "HA timezone")})`:""} · updated ${esc(selected?.updated_at || "—")}</span>${isToday&&hourlyCoverage?.missing_intervals?.length?`<span class="warning">Missing: ${hourlyCoverage.missing_intervals.map((item)=>esc(item.start)).join(", ")}</span>`:""}</div><button class="refresh">Refresh now</button></div>
-    <section class="kpis">${this.kpis().map(([icon, label, value, color, unit = "kWh", known]) => `
+    <section class="kpis">${this.kpis().map(([icon, label, value, color, unit = "kWh", known]) => {const shown=value??known;return `
       <article class="card kpi"><div class="kpi-icon ${color}"><ha-icon icon="${icon}"></ha-icon></div>
-      <div><span>${label}</span><strong>${n(value)} ${value == null ? "" : unit}</strong>
-      ${value==null&&known!=null?`<small>Known partial subtotal: ${n(known)} ${unit}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`).join("")}</section>
+      <div><span>${label}</span><strong>${n(shown)} ${shown == null ? "" : unit}</strong>
+      ${value==null&&known!=null?`<small><b>Known/provisional subtotal</b> · complete total unavailable</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
     <section class="grid top-grid">
       <article class="card wide"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Heating Energy vs Outdoor Temperature</h2>${this.scatterChart()}</article>
       <article class="card"><h2><ha-icon icon="mdi:chart-box-outline"></ha-icon>Daily Energy Split</h2>${this.splitChart()}</article>
@@ -296,7 +336,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return `<article class="card temperature-card"><h2><ha-icon icon="${role === "indoor" ? "mdi:home-thermometer" : "mdi:thermometer-lines"}"></ha-icon>Representative ${label} Temperature</h2>
       <div class="temperature">${n(today?.latest_value)}${today?.latest_value == null ? "" : " °C"}</div>
       <p class="muted">Source: ${esc(source.entity_id || source.source_id)} · latest valid: ${esc(today?.latest_timestamp || "unavailable")} · ${esc(explanation)}</p>
-      <div class="mini-stats"><span>Period mean <b>${n(today?.mean)} °C</b></span>${this.historyPreset==="today"?`<span>Yesterday mean <b>${n(yesterday?.mean)} °C</b></span>`:""}<span>Min / max <b>${n(today?.minimum)} / ${n(today?.maximum)} °C</b></span><span>Coverage <b>${today?.coverage_percent==null?"Unavailable":n(today.coverage_percent,0)+"%"}</b></span><span>Quality <b>${esc(today?.quality || diagnostic.pipeline_stage || "missing").replaceAll("_"," ")}</b></span></div>${today?.mean==null?`<p class="warning">Pipeline: ${esc(diagnostic.pipeline_stage||"not yet diagnosed").replaceAll("_"," ")} · live ${esc(diagnostic.live_state??"unavailable")} ${esc(diagnostic.live_unit||"")} · last update ${esc(diagnostic.live_last_updated||"unavailable")} · persisted hourly summaries ${n(diagnostic.persisted_hourly_summaries,0)}</p>`:""}${this.historyPreset === "today" ? this.temperatureTimeline(role) : this.historyTemperatureTimeline(role)}</article>`;
+      <div class="mini-stats"><span>Period mean <b>${n(today?.mean)} °C</b></span>${this.historyPreset==="today"?`<span>Yesterday mean <b>${n(yesterday?.mean)} °C</b></span>`:""}<span>Min / max <b>${n(today?.minimum)} / ${n(today?.maximum)} °C</b></span><span>Coverage <b>${today?.coverage_percent==null?"Unavailable":n(today.coverage_percent,0)+"%"}</b></span><span>Quality <b>${esc(today ? this.temperatureQualityLabel(today) : (diagnostic.pipeline_stage || "missing"))}</b></span></div>${today?.mean==null?`<p class="warning">Pipeline: ${esc(diagnostic.pipeline_stage||"not yet diagnosed").replaceAll("_"," ")} · live ${esc(diagnostic.live_state??"unavailable")} ${esc(diagnostic.live_unit||"")} · last update ${esc(diagnostic.live_last_updated||"unavailable")} · persisted hourly summaries ${n(diagnostic.persisted_hourly_summaries,0)}</p>`:""}${this.temperatureTimeline(role)}</article>`;
   }
 
   comparisonText(today, same, full, unit) {
@@ -306,20 +346,46 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   temperatureTimeline(role = null) {
-    const timeline = this.overviewData?.temperature_timeline || [];
-    const representative = role ? this.representativeSource(role) : null;
-    const sources = role ? (representative ? [representative] : [])
-      : this.temperatureSources.filter((source) => ["indoor", "outdoor", "supply", "return"].includes(source.role));
-    const values = timeline.flatMap((row) => sources.map((source) => row.temperatures?.[source.source_id]?.mean).filter((value) => value != null));
-    if (!timeline.length || !values.length) return `<p class="muted">No validated hourly temperature timeline yet.</p>`;
+    const source = role ? this.representativeSource(role) : null;
+    if (role && !source) return `<div class="empty">No representative source configured.</div>`;
+    const timeline = this.temperatureTimelineData;
+    if (this.temperatureTimelineError) return `<div class="empty">Temperature timeline unavailable: ${esc(this.temperatureTimelineError)}</div>`;
+    if (!timeline) return `<div class="empty">Temperature timeline has not loaded.</div>`;
+    const sourceIds = role ? [source.source_id] : timeline.source_ids;
+    const sourceById = Object.fromEntries((timeline.sources || []).map((item) => [item.source_id, item]));
+    const values = timeline.intervals.flatMap((row) => sourceIds.map((sourceId) => row.temperatures?.[sourceId]?.mean).filter((value) => value != null));
+    if (!values.length) {
+      const daily = role ? this.selectedRecord()?.temperatures?.[source.source_id] : null;
+      const explanation = timeline.resolution === "hourly" && daily?.mean != null
+        ? "Daily summary available, but hourly temperature history has not been archived/backfilled. Use Settings diagnostics and bounded temperature-only backfill after verifying historical mappings."
+        : "No validated temperature measurements are archived for this period.";
+      return `<div class="empty">${esc(explanation)}</div>`;
+    }
     const low = Math.min(...values), high = Math.max(...values), span = Math.max(1, high-low);
-    const lines = sources.map((source, index) => {
+    const rangeStart = Date.parse(timeline.range_start_utc), rangeEnd = Date.parse(timeline.range_end_utc);
+    const xFor = (timestamp) => 10 + 280 * (Date.parse(timestamp)-rangeStart) / Math.max(1, rangeEnd-rangeStart);
+    const yFor = (value) => 72-(value-low)*60/span;
+    const rendered = sourceIds.map((sourceId, sourceIndex) => {
       const segments=[]; let points=[];
-      timeline.forEach((row, x) => { const value=row.temperatures?.[source.source_id]?.mean; if(value==null){if(points.length){segments.push(points);points=[];}}else points.push(`${10+x*280/Math.max(1,timeline.length-1)},${75-(value-low)*65/span}`); });
-      if(points.length) segments.push(points);
-      return segments.map((segment) => `<polyline points="${segment.join(" ")}" class="temp-line t${index%4}"><title>${esc(source.display_name)}</title></polyline>`).join("");
+      timeline.intervals.forEach((row) => {
+        const item=row.temperatures?.[sourceId];
+        if(item?.mean==null){if(points.length){segments.push(points);points=[];}return;}
+        points.push(`${xFor(row.start_utc)},${yFor(item.mean)}`);
+      });
+      if(points.length)segments.push(points);
+      const sourceInfo=sourceById[sourceId]||{};
+      const markers=timeline.intervals.map((row) => {
+        const item=row.temperatures?.[sourceId];if(item?.mean==null)return "";
+        const x=xFor(row.start_utc),y=yFor(item.mean);
+        const detail=`${row.local_label} ${timeline.timezone} · ${n(item.mean)} °C · min ${n(item.minimum)} · max ${n(item.maximum)} · coverage ${n(item.coverage_percent,1)}% (${n(item.valid_seconds,0)}/${n(item.expected_seconds,0)} s) · ${this.temperatureQualityLabel(item)} · ${sourceInfo.display_name||sourceId} · ${sourceInfo.entity_id||sourceId}`;
+        const range=item.minimum!=null&&item.maximum!=null?`<line class="temp-range t${sourceIndex%4}" x1="${x}" x2="${x}" y1="${yFor(item.minimum)}" y2="${yFor(item.maximum)}"></line>`:"";
+        return `${range}<g tabindex="0" role="button" aria-label="${esc(detail)}"><circle class="temp-hit" cx="${x}" cy="${y}" r="8"></circle><circle class="temp-point t${sourceIndex%4}" cx="${x}" cy="${y}" r="3"><title>${esc(detail)}</title></circle></g>`;
+      }).join("");
+      return `${segments.map((segment)=>segment.length>1?`<polyline points="${segment.join(" ")}" class="temp-line t${sourceIndex%4}"></polyline>`:"").join("")}${markers}`;
     }).join("");
-    return `<svg class="temp-chart" viewBox="0 0 300 95" role="img" aria-label="Validated hourly temperature timelines">${lines}<text x="10" y="92">${esc(timeline[0]?.start?.slice(11,16))}</text><text x="260" y="92">${esc(timeline.at(-1)?.end?.slice(11,16))}</text></svg>`;
+    const ticks=(timeline.axis_ticks||[]).map((tick,index,array)=>`<text x="${Math.max(10,Math.min(282,xFor(tick.timestamp_utc)))}" y="94" text-anchor="${index===0?"start":index===array.length-1?"end":"middle"}">${esc(tick.label)}</text>`).join("");
+    const label=`${timeline.start_date}${timeline.start_date===timeline.end_date?"":`–${timeline.end_date}`} · ${timeline.timezone} · ${timeline.resolution}`;
+    return `<svg class="temp-chart" viewBox="0 0 300 98" role="img" aria-label="Validated ${esc(timeline.resolution)} temperature timeline for ${esc(label)}">${rendered}${ticks}</svg><p class="muted">${esc(label)} · ${timeline.available_interval_count}/${timeline.expected_interval_count} intervals contain validated evidence. Gaps are not interpolated. Focus or tap a point for source, min/max, coverage and quality.</p>`;
   }
 
   roadmap(title, version, text) {
@@ -345,16 +411,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   historyTemperatureTimeline(role) {
-    const source = this.representativeSource(role);
-    if (!source) return `<div class="empty">No representative source configured.</div>`;
-    const records=[...this.history].reverse();
-    const values=records.map((record) => record.temperatures?.[source.source_id]?.mean);
-    const valid=values.filter((value) => value!=null);
-    if(!valid.length) return `<div class="empty">No validated measurements in this period.</div>`;
-    const low=Math.min(...valid), high=Math.max(...valid), span=Math.max(1,high-low); const segments=[]; let points=[]; const firstDay=Date.parse(records[0].local_date+"T00:00:00Z"),lastDay=Date.parse(records.at(-1).local_date+"T00:00:00Z"),daySpan=Math.max(1,Math.round((lastDay-firstDay)/86400000)); let priorDay=null;
-    values.forEach((value,index)=>{const day=Math.round((Date.parse(records[index].local_date+"T00:00:00Z")-firstDay)/86400000);if(value==null||(priorDay!=null&&day-priorDay>1)){if(points.length){segments.push(points);points=[];}}if(value!=null){points.push(`${10+day*280/daySpan},${75-(value-low)*65/span}`);priorDay=day;}}); if(points.length)segments.push(points);
-    const markers=records.map((record)=>{const item=record.temperatures?.[source.source_id];if(item?.mean==null)return "";const day=Math.round((Date.parse(record.local_date+"T00:00:00Z")-firstDay)/86400000),x=10+day*280/daySpan,y=75-(item.mean-low)*65/span;return `<circle cx="${x}" cy="${y}" r="2.5" class="t${role==='indoor'?0:1}"><title>${esc(record.local_date)} · mean ${n(item.mean)} °C · min ${n(item.minimum)} · max ${n(item.maximum)} · coverage ${n(item.coverage_percent,0)}% · ${esc(item.quality)}</title></circle>`;}).join("");
-    return `<svg class="temp-chart" viewBox="0 0 300 95" role="img" aria-label="${esc(role)} daily time-weighted temperature means">${segments.map((segment)=>`<polyline points="${segment.join(" ")}" class="temp-line t${role==="indoor"?0:1}"></polyline>`).join("")}${markers}<text x="10" y="92">${esc(records[0]?.local_date || "")}</text><text x="235" y="92">${esc(records.at(-1)?.local_date || "")}</text></svg><p class="muted">Daily means are elapsed-time weighted; hover for min/max and coverage. Missing days are gaps. Period mean ${n(this.historySummary?.temperatures?.[source.source_id]?.mean)} °C.</p>`;
+    return this.temperatureTimeline(role);
   }
 
   pvHistoryChart() {
@@ -382,14 +439,26 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if (!this.settings) return `<section class="card page-card"><h2>Administrator access required</h2><p>Overview and History remain available. Integration mappings and database details are restricted to administrators.</p></section>`;
     if (!this.settings.configured) return `<section class="card page-card"><h2>Setup required</h2><p>Add the integration from Settings → Devices & services.</p></section>`;
     const representative=(role)=>{const source=this.representativeSource(role);const item=source?this.selectedRecord()?.temperatures?.[source.source_id]:null;return source?`${esc(source.display_name)} · ${n(item?.latest_value)}${item?.latest_value==null?"":" °C"} · ${esc(item?.quality||"unavailable")} · ${esc(item?.latest_timestamp||"no validated timestamp")}`:"Not configured";};
-    const diagnosticRows=(this.temperatureDiagnostics?.sources||[]).map((row)=>`<tr><td>${esc(row.display_name)}<br>${row.configured&&row.enabled?"configured · enabled":"disabled or unavailable"}</td><td><code>${esc(row.source_id)}</code><br><code>${esc(row.entity_id)}</code><br>${row.attribute?`attribute <code>${esc(row.attribute)}</code>`:"entity state"}</td><td>${esc(row.live_state??"unavailable")} ${esc(row.live_unit||"")}<br>${esc(row.live_last_updated||"no update")}<br>${row.attribute_available?"attribute valid":"attribute unavailable"} · ${esc(row.unit_validation||"unknown unit")}</td><td>${row.recorder_state_rows||0} states / ${row.recorder_statistics_rows||0} statistics<br>${esc(row.available_start||"—")}–${esc(row.available_end||"—")}</td><td>${row.persisted_valid_hourly_summaries||0} hourly / ${row.persisted_valid_daily_summaries||0} daily<br>${n(row.persisted_hourly_coverage_percent,1)}% · ${row.missing_interval_count||0} missing</td><td>${esc(row.pipeline_stage).replaceAll("_"," ")}</td><td>${esc((row.invalid_reasons||[]).join(", ")||"—")}<br>${esc((row.rejected_samples||[]).map((item)=>item.reason).join(", ")||"—")}</td></tr>`).join("");
+    const diagnosticRows=(this.temperatureDiagnostics?.sources||[]).map((row)=>`<tr><td>${esc(row.display_name)}<br>${row.configured&&row.enabled?"configured · enabled":"disabled or unavailable"}</td><td><code>${esc(row.source_id)}</code><br><code>${esc(row.entity_id)}</code><br>${row.attribute?`attribute <code>${esc(row.attribute)}</code>`:"entity state"}</td><td>${esc(row.live_state??"unavailable")} ${esc(row.live_unit||"")}<br>${esc(row.live_last_updated||"no update")}<br>${row.attribute_available?"attribute valid":"attribute unavailable"} · ${esc(row.unit_validation||"unknown unit")}</td><td>${row.recorder_state_rows||0} states / ${row.recorder_statistics_rows||0} statistics<br>${esc(row.available_start||"—")}–${esc(row.available_end||"—")}<br>${n(row.validated_coverage_seconds,0)} validated seconds</td><td>${row.persisted_valid_hourly_summaries||0} hourly / ${row.persisted_valid_daily_summaries||0} daily<br>${row.temperature_only_hourly_summaries||0} / ${row.temperature_only_daily_summaries||0} temperature-only<br>${n(row.persisted_hourly_coverage_percent,1)}% · ${row.missing_interval_count||0} missing</td><td>${esc(row.pipeline_stage).replaceAll("_"," ")}<br>${esc(row.mapping_eligibility?.reason||"mapping checked").replaceAll("_"," ")}<br>${row.recoverable_missing_interval_count||0} recoverable / ${row.nonrecoverable_interval_count||0} blocked</td><td>${esc((row.invalid_reasons||[]).join(", ")||"—")}<br>${esc((row.rejected_samples||[]).map((item)=>item.reason).join(", ")||"—")}</td></tr>`).join("");
     const diagnosticSetup=this.temperatureDiagnostics?.configuration_status==="not_configured"?'<p class="warning">No temperature source is configured. <a href="/config/integrations/integration/home_energy_intelligence">Open integration options</a> to add one; no source will be inferred.</p>':"";
+    const localToday=String(this.overviewData?.cutoff_local||"").slice(0,10);
+    const startDefault=this.temperatureBackfillJob?.start_date||this.temperatureDiagnostics?.requested_start||localToday;
+    const endDefault=this.temperatureBackfillJob?.end_date||this.temperatureDiagnostics?.requested_end||localToday;
+    const job=this.temperatureBackfillJob; const jobDetails=job?.details||job||{};
+    const jobOutcome=jobDetails.outcome||job?.status;
+    const jobOutcomeLabel={records_recovered:"Records recovered",no_changes_needed:"No changes needed",no_records_recovered_action_required:"No records recovered — action required",preview_no_recoverable_records_action_required:"No recoverable records in preview — action required",preview_ready:"Preview ready"}[jobOutcome]||String(jobOutcome||"queued").replaceAll("_"," ");
+    const jobClass=["records_recovered","no_changes_needed","completed"].includes(jobOutcome)?"good":["failed","no_records_recovered_action_required","preview_no_recoverable_records_action_required"].includes(jobOutcome)?"missing":"partial";
+    const reasonRows=(jobDetails.skip_reasons||[]).slice(-25).map((row)=>`<li>${esc(row.date||row.interval_start_utc||"interval")} · ${esc(row.source_id||"source")} · ${esc(row.reason||row.error||"skipped").replaceAll("_"," ")}</li>`).join("");
+    const repairChanges=Number(this.temperatureRepairResult?.changed_hourly_records||0)+Number(this.temperatureRepairResult?.changed_daily_records||0);
+    const repairOutstanding=(this.temperatureDiagnostics?.sources||[]).reduce((total,row)=>total+Number(row.missing_interval_count||0),0);
+    const repairActionRequired=Boolean(this.temperatureRepairResult&&repairChanges===0&&repairOutstanding>0);
+    const jobResult=job?`<div class="backfill-result"><p class="quality ${jobClass}">${esc(jobOutcomeLabel)}</p><p>Status ${esc(job.status||"unknown")}${job.cancel_requested?" · cancellation requested":""} · processed ${jobDetails.processed_days||0} day(s) · ${job.dry_run?"would insert":"inserted"} ${jobDetails.inserted_hourly||0} hourly / ${jobDetails.inserted_daily||0} daily · ${job.dry_run?"would update":"updated"} ${jobDetails.updated_hourly||0} / ${jobDetails.updated_daily||0} · unchanged ${jobDetails.unchanged_hourly||0} / ${jobDetails.unchanged_daily||0} · skipped ${jobDetails.skipped||0} · failed ${jobDetails.failed||0}.</p><p>Before ${esc(JSON.stringify(jobDetails.temperature_summaries_before||{}))} · after ${esc(JSON.stringify(jobDetails.temperature_summaries_after||{}))} · net ${esc(JSON.stringify(jobDetails.net_new_temperature_summaries||{}))}.</p>${reasonRows?`<details><summary>Skipped and blocked intervals</summary><ul>${reasonRows}</ul></details>`:""}${["queued","running"].includes(job.status)&&!job.cancel_requested?'<button class="primary temperature-backfill-cancel">Cancel backfill</button>':""}</div>`:"";
     return `<section class="settings-grid">
       <article class="card page-card"><h2>Processing</h2><dl><dt>Time zone</dt><dd>${esc(this.settings.timezone)}</dd><dt>Cycle</dt><dd>${esc(this.settings.cycle_hours)} hours</dd><dt>Floor area</dt><dd>${n(this.settings.floor_area_m2, 0)} m²</dd><dt>Database</dt><dd>${n(this.settings.database_size_bytes / 1024, 0)} KiB</dd><dt>Schema</dt><dd>v${esc(this.settings.storage?.schema_version)} / v${esc(this.settings.storage?.target_schema_version)}</dd><dt>Startup compaction</dt><dd>${this.settings.storage?.startup_vacuum_enabled ? "Enabled" : "Disabled"}</dd><dt>Backup policy</dt><dd>Protected SQLite backup recommended before migration</dd><dt>InfluxDB backfill</dt><dd>${this.settings.influx_enabled ? "Enabled (read-only)" : "Disabled"}</dd></dl>
       <a class="primary" href="/config/integrations/integration/home_energy_intelligence">Open integration options</a></article>
       <article class="card page-card"><h2>Entity mapping</h2><div class="mapping">${this.settings.mapping.map((row) => `<div><span>${esc(row.label)}</span><code>${row.entity_id ? esc(row.entity_id) : "Not selected"}</code></div>`).join("")}</div></article>
       <article class="card page-card notice"><h2>Representative temperatures</h2><p><b>Indoor:</b> ${representative("indoor")}</p><p><b>Measured outdoor:</b> ${representative("outdoor")}</p><p class="muted">Selections are independent. A weather provider or water-circuit sensor is never substituted.</p></article>
-      <article class="card page-card notice"><h2>Temperature pipeline diagnostics</h2><p>Bounded to the last 31 local days. Recorder and SQLite are read-only during diagnosis.</p><p><button class="primary temperature-diagnostics">Load diagnostics</button> <button class="primary temperature-repair">Repair missing summaries</button></p>${this.temperatureRepairResult?`<p class="quality ${this.temperatureRepairResult.error_count?"partial":"good"}">Processed ${this.temperatureRepairResult.processed_days} day(s); updated ${this.temperatureRepairResult.changed_hourly_records} hourly and ${this.temperatureRepairResult.changed_daily_records} daily record(s); skipped ${this.temperatureRepairResult.sources_skipped_complete||0} complete source/day(s); ${this.temperatureRepairResult.error_count||0} error(s).</p>`:""}${diagnosticSetup}${this.temperatureDiagnostics?`<div class="table-wrap"><table><thead><tr><th>Source</th><th>IDs</th><th>Live</th><th>Recorder range</th><th>Persisted</th><th>Stage</th><th>Invalid/rejected</th></tr></thead><tbody>${diagnosticRows}</tbody></table></div><p class="muted">Missing interval details are retained by the diagnostic API (up to 200 per source). Diagnostics never fabricate or repair data.</p>`:'<p class="muted">Load diagnostics to locate the first missing stage without rebuilding the database.</p>'}</article>
+      <article class="card page-card notice"><h2>Temperature pipeline diagnostics and recovery</h2><p>Choose 1–31 local dates. Diagnosis is read-only. “Repair existing summaries” only updates energy records that already exist; temperature-only backfill can create independent temperature history without creating electricity.</p><div class="backfill-controls"><label>Start <input class="temperature-start" type="date" value="${esc(startDefault)}"></label><label>End <input class="temperature-end" type="date" value="${esc(endDefault)}"></label><label><input class="temperature-attest" type="checkbox"> I attest the current source mapping applied throughout this range</label></div><p><button class="primary temperature-diagnostics">Diagnose</button> <button class="primary temperature-repair">Repair existing summaries</button> <button class="primary temperature-backfill-preview">Preview temperature-only backfill</button> <button class="primary temperature-backfill-start">Start temperature-only backfill</button></p>${this.temperatureRepairResult?`<p class="quality ${repairActionRequired||this.temperatureRepairResult.error_count?"missing":this.temperatureRepairResult.skipped_repair_count?"partial":"good"}">${repairActionRequired?"No records recovered — action required. ":""}Processed ${this.temperatureRepairResult.processed_days} day(s); updated ${this.temperatureRepairResult.changed_hourly_records} hourly and ${this.temperatureRepairResult.changed_daily_records} daily record(s); skipped ${this.temperatureRepairResult.sources_skipped_complete||0} complete source/day(s); blocked ${this.temperatureRepairResult.skipped_repair_count||0}; ${this.temperatureRepairResult.error_count||0} error(s).</p>`:""}${jobResult}${diagnosticSetup}${this.temperatureDiagnostics?`<div class="table-wrap"><table><thead><tr><th>Source</th><th>IDs</th><th>Live</th><th>Recorder evidence</th><th>Persisted</th><th>Stage / mapping</th><th>Invalid/rejected</th></tr></thead><tbody>${diagnosticRows}</tbody></table></div><p class="muted">Expected ${this.temperatureDiagnostics.expected_hourly_intervals||0} completed intervals; Recorder queries ${this.temperatureDiagnostics.estimated_recorder_query_count||0}; energy rows ${esc(JSON.stringify(this.temperatureDiagnostics.energy_history_records||{}))}; temperature-only rows ${esc(JSON.stringify(this.temperatureDiagnostics.temperature_only_history_records||{}))}. Missing details are capped at 200 displayed intervals per source. Future hours are never counted.</p>`:'<p class="muted">Diagnose to locate the first missing stage before writing any summaries.</p>'}</article>
        <article class="card page-card notice"><h2>Data guarantees</h2><p>Recorder is read-only. Unknown heat-pump operation is reported as assumed heating, idle remains separate, gaps remain gaps, and unrelated circuit sensors are never substituted.</p></article>
     </section>`;
   }
@@ -422,6 +491,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelector(".previous")?.addEventListener("click", () => { this.historyOffset = Math.max(0, this.historyOffset - 90); this.loadPeriod(); });
     this.shadowRoot.querySelector(".temperature-diagnostics")?.addEventListener("click", () => this.loadTemperatureDiagnostics());
     this.shadowRoot.querySelector(".temperature-repair")?.addEventListener("click", () => this.repairTemperatureHistory());
+    this.shadowRoot.querySelector(".temperature-backfill-preview")?.addEventListener("click", () => this.startTemperatureBackfill(true));
+    this.shadowRoot.querySelector(".temperature-backfill-start")?.addEventListener("click", () => this.startTemperatureBackfill(false));
+    this.shadowRoot.querySelector(".temperature-backfill-cancel")?.addEventListener("click", () => this.cancelTemperatureBackfill());
   }
 
   async loadPeriod() {
@@ -439,7 +511,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       this.historyTotal = response.total || 0;
       this.historyCoverage = response.period_coverage;
       this.responseProfileData = response.response_profile;
-      this.selectedPeriod = response.selected_period; this.refreshError=null; this.render();
+      this.selectedPeriod = response.selected_period;
+      await this.loadTemperatureTimeline(response, this.overviewData, false);
+      this.refreshError=null; this.render();
     } catch(error) { this.refreshError=error?.message || String(error); this.render(); }
   }
 
@@ -449,12 +523,52 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   async loadTemperatureDiagnostics() {
-    try { this.temperatureDiagnostics=await this._hass.callWS({type:"home_energy_intelligence/temperature_diagnostics"});this.refreshError=null;this.render(); }
+    const range=this.temperatureRecoveryRange();
+    try { this.temperatureDiagnostics=await this._hass.callWS({type:"home_energy_intelligence/temperature_diagnostics",...range});this.refreshError=null;this.render(); }
     catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
   async repairTemperatureHistory() {
-    try { this.temperatureRepairResult=await this._hass.callWS({type:"home_energy_intelligence/reprocess_temperature_history"});this.temperatureDiagnostics=null;await this.load(false);await this.loadTemperatureDiagnostics(); }
+    const range=this.temperatureRecoveryRange();
+    try { this.temperatureRepairResult=await this._hass.callWS({type:"home_energy_intelligence/reprocess_temperature_history",...range});this.temperatureDiagnostics=null;await this.load(false);await this.loadTemperatureDiagnostics(); }
+    catch(error){this.refreshError=error?.message||String(error);this.render();}
+  }
+
+  temperatureRecoveryRange() {
+    return {
+      start_date:this.shadowRoot.querySelector(".temperature-start")?.value,
+      end_date:this.shadowRoot.querySelector(".temperature-end")?.value,
+    };
+  }
+
+  async startTemperatureBackfill(dryRun) {
+    const range=this.temperatureRecoveryRange();
+    const attest=Boolean(this.shadowRoot.querySelector(".temperature-attest")?.checked);
+    try {
+      this.temperatureBackfillJob=await this._hass.callWS({
+        type:`home_energy_intelligence/temperature_backfill_${dryRun?"preview":"start"}`,
+        ...range,attest_current_mapping:attest,
+      });
+      this.refreshError=null;this.render();this.pollTemperatureBackfill();
+    } catch(error){this.refreshError=error?.message||String(error);this.render();}
+  }
+
+  async pollTemperatureBackfill() {
+    if(!this.temperatureBackfillJob?.job_id)return;
+    try {
+      const job=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_status",job_id:this.temperatureBackfillJob.job_id});
+      this.temperatureBackfillJob=job;this.render();
+      if(["queued","running","interrupted"].includes(job.status)){
+        this.temperatureBackfillPolling=window.setTimeout(()=>this.pollTemperatureBackfill(),1000);
+      }else{
+        this.temperatureDiagnostics=null;await this.load(false);await this.loadTemperatureDiagnostics();
+      }
+    }catch(error){this.refreshError=error?.message||String(error);this.render();}
+  }
+
+  async cancelTemperatureBackfill() {
+    if(!this.temperatureBackfillJob?.job_id)return;
+    try { this.temperatureBackfillJob=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_cancel",job_id:this.temperatureBackfillJob.job_id});this.render(); }
     catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
@@ -469,8 +583,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   static styles = `
     :host{display:block;background:var(--primary-background-color,#f4f7fb);color:var(--primary-text-color,#17233b);min-height:100%;font-family:var(--paper-font-body1_-_font-family,Inter,system-ui,sans-serif)}
     *{box-sizing:border-box} main{max-width:1600px;margin:auto;padding:24px 26px 40px} header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:14px}.brand{display:flex;align-items:center;gap:18px}.brand>ha-icon{--mdc-icon-size:62px;color:#0984d8}.brand h1{font-size:34px;line-height:1;margin:0;color:var(--primary-text-color,#111827)}.brand p{margin:6px 0 0;font-size:18px;color:var(--secondary-text-color,#65728a)}.connection{display:flex;align-items:center;gap:10px}.connection i{width:12px;height:12px;border-radius:50%;background:#20a35a}.connection div{display:flex;flex-direction:column}.connection span{font-size:12px;color:var(--secondary-text-color,#65728a);margin-top:4px}
-    .tabs{display:flex;gap:20px;border-bottom:1px solid var(--divider-color,#dce4ee);overflow-x:auto}.tab{display:flex;align-items:center;gap:10px;border:0;border-bottom:3px solid transparent;background:none;color:var(--secondary-text-color,#41506a);padding:18px 14px;font-size:15px;white-space:nowrap;cursor:pointer}.tab.active{color:var(--primary-color,#0785db);border-bottom-color:var(--primary-color,#0785db);font-weight:700}.content{padding-top:22px}.toolbar,.period,.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.toolbar>div{display:flex;flex-direction:column}.toolbar span{font-size:12px;color:var(--secondary-text-color,#65728a)}.period{justify-content:flex-start;flex-wrap:wrap;padding:12px;background:var(--secondary-background-color,#f2f6fa);border-radius:8px}.period label{display:flex;gap:6px;align-items:center}.card{background:var(--card-background-color,#fff);border:1px solid var(--divider-color,#e0e7ef);border-radius:12px;box-shadow:0 3px 12px rgba(35,65,100,.05);padding:18px;min-width:0}.card h2{display:flex;align-items:center;gap:10px;font-size:17px;margin:0 0 16px}.card h2 ha-icon{color:#233b5b}.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:18px}.kpi{display:flex;gap:13px;align-items:flex-start}.kpi-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:50%;flex:none}.kpi-icon.blue{color:#0785db;background:#e7f4fe}.kpi-icon.red{color:#ef4444;background:#fff0f0}.kpi-icon.orange{color:#f59e0b;background:#fff6e5}.kpi-icon.amber{color:#f6a800;background:#fff8df}.kpi-icon.green{color:#159b5b;background:#eaf9f1}.kpi-icon ha-icon{--mdc-icon-size:27px}.kpi>div:last-child{display:flex;flex-direction:column;min-width:0}.kpi span{font-size:14px;line-height:1.3}.kpi strong{font-size:24px;margin-top:3px;white-space:nowrap}.kpi small{color:var(--secondary-text-color,#65728a);margin-top:7px}.grid{display:grid;gap:14px;margin-bottom:14px}.top-grid{grid-template-columns:1.3fr 1fr .85fr}.bottom-grid{grid-template-columns:1fr .95fr 1.35fr}.wide{min-width:0}.chart{width:100%;height:220px}.chart line{stroke:var(--divider-color,#dbe4ee);stroke-width:1}.chart text{font-size:11px;fill:var(--secondary-text-color,#66758d)}.chart circle{fill:#46a4ef;stroke:#fff;stroke-width:2}.temp-chart{width:100%;height:85px;margin-top:10px}.temp-line{fill:none;stroke-width:2}.temp-line.t0{stroke:#ef4444}.temp-line.t1{stroke:#238ee8}.temp-line.t2{stroke:#f59e0b}.temp-line.t3{stroke:#159b5b}.bars{height:185px;border-bottom:1px solid var(--divider-color,#dbe4ee);display:flex;align-items:flex-end;justify-content:space-around;gap:10px;padding:10px 10px 0}.bar-col{height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px;font-size:11px;color:var(--secondary-text-color,#65728a)}.bar{width:26px;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px 3px 0 0;overflow:hidden;background:#eef2f6}.seg{display:block;width:100%}.heat{background:#ef4444}.dhw{background:#f59e0b}.cool{background:#238ee8}.idle{background:#8b9bb0}.other{background:#91c788}.unknown{background:#8b5cf6}.legend{display:flex;justify-content:center;align-items:center;gap:7px;font-size:12px;margin-top:12px;flex-wrap:wrap}.dot{width:10px;height:10px;border-radius:2px;margin-left:8px}.upcoming{min-height:150px;border-radius:10px;background:linear-gradient(145deg,#f1f8ff,#e9f4fc);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px;color:#2269a5;padding:18px}.upcoming span{font-size:13px;color:#496980}.temperature{font-size:34px;font-weight:700;margin:12px 0}.muted{color:var(--secondary-text-color,#65728a);font-size:13px}.mini-stats{display:flex;gap:20px;border-top:1px solid var(--divider-color,#e0e7ef);padding-top:14px}.mini-stats span{display:flex;flex-direction:column;color:var(--secondary-text-color,#65728a);font-size:12px}.mini-stats b{color:var(--primary-text-color,#17233b);margin-top:4px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{background:var(--secondary-background-color,#f2f6fa);text-align:left}th,td{padding:9px 8px;border-bottom:1px solid var(--divider-color,#e4eaf0);white-space:nowrap}.quality{display:inline-flex;padding:3px 7px;border-radius:12px;background:#eef2f6;text-transform:capitalize}.quality.good{background:#e5f7ed;color:#08743d}.quality.partial,.quality.filtered{background:#fff4d6;color:#8a5900}.quality.missing,.quality.unreconciled{background:#ffe9e8;color:#a82e28}.empty{min-height:150px;display:grid;place-items:center;text-align:center;color:var(--secondary-text-color,#65728a);padding:20px}.status-card{min-width:0}.roadmap{max-width:720px;margin:50px auto;text-align:center;padding:54px}.roadmap>ha-icon{--mdc-icon-size:64px;color:var(--primary-color,#0785db)}.roadmap h2{display:block;font-size:28px;margin-top:18px}.roadmap b{color:var(--primary-color,#0785db)}.roadmap p{color:var(--secondary-text-color,#65728a)}.page-card{padding:24px}.section-head{display:flex;justify-content:space-between;align-items:center}.section-head p{margin:4px 0 18px;color:var(--secondary-text-color,#65728a)}button.refresh,button.csv,button.apply-period,button.previous,button.next,.primary{border:0;border-radius:8px;background:var(--primary-color,#0785db);color:#fff;padding:10px 15px;text-decoration:none;cursor:pointer}.settings-grid{display:grid;grid-template-columns:1fr 1.6fr;gap:16px}.notice{grid-column:1/-1}dl{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px}dt{color:var(--secondary-text-color,#65728a)}dd{margin:0;text-align:right;font-weight:600}.mapping{display:grid;gap:1px;background:var(--divider-color,#e0e7ef);border:1px solid var(--divider-color,#e0e7ef);border-radius:8px;overflow:hidden}.mapping>div{display:grid;grid-template-columns:1fr 1.25fr;gap:12px;background:var(--card-background-color,#fff);padding:10px}.mapping code{color:var(--secondary-text-color,#65728a);overflow-wrap:anywhere}.loading{display:grid;place-items:center;gap:12px;padding:100px}.error{padding:18px;border-radius:10px;background:#ffe9e8;color:#a82e28}
-    .other-hvac{background:#14b8a6}.missing{color:#a82e28;background:#ffe9e8}.not-configured{font-size:24px;font-weight:700;color:var(--secondary-text-color,#65728a);margin:22px 0}.warning,.discrepancy{color:#b45309}.split-quality{display:flex;flex-direction:column;gap:3px;align-items:center}.quality.temperature-missing{background:#eef2f6;color:#56657a}.quality.unknown{background:#eef2f6;color:#56657a}.quality-layers{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:0 0 14px}.quality-layers>span{white-space:nowrap}.equipment-charts{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px}.device-bars>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 65px;gap:10px;align-items:center;margin:8px 0}.device-bars i{height:12px;background:#eef2f6;border-radius:6px;overflow:hidden}.device-bars i b{display:block;height:100%}.pv-chart{width:100%;height:220px}.pv-chart .pv{fill:#f6a800}.pv-chart .grid-import{fill:#238ee8}.pv-chart .grid-export{fill:#8b5cf6}.pv-chart .self-use{fill:#159b5b}.pv-chart .household{fill:#8b9bb0}
+    .tabs{display:flex;gap:20px;border-bottom:1px solid var(--divider-color,#dce4ee);overflow-x:auto}.tab{display:flex;align-items:center;gap:10px;border:0;border-bottom:3px solid transparent;background:none;color:var(--secondary-text-color,#41506a);padding:18px 14px;font-size:15px;white-space:nowrap;cursor:pointer}.tab.active{color:var(--primary-color,#0785db);border-bottom-color:var(--primary-color,#0785db);font-weight:700}.content{padding-top:22px}.toolbar,.period,.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.toolbar>div{display:flex;flex-direction:column}.toolbar span{font-size:12px;color:var(--secondary-text-color,#65728a)}.period{justify-content:flex-start;flex-wrap:wrap;padding:12px;background:var(--secondary-background-color,#f2f6fa);border-radius:8px}.period label{display:flex;gap:6px;align-items:center}.card{background:var(--card-background-color,#fff);border:1px solid var(--divider-color,#e0e7ef);border-radius:12px;box-shadow:0 3px 12px rgba(35,65,100,.05);padding:18px;min-width:0}.card h2{display:flex;align-items:center;gap:10px;font-size:17px;margin:0 0 16px}.card h2 ha-icon{color:#233b5b}.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:18px}.kpi{display:flex;gap:13px;align-items:flex-start}.kpi-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:50%;flex:none}.kpi-icon.blue{color:#0785db;background:#e7f4fe}.kpi-icon.red{color:#ef4444;background:#fff0f0}.kpi-icon.orange{color:#f59e0b;background:#fff6e5}.kpi-icon.amber{color:#f6a800;background:#fff8df}.kpi-icon.green{color:#159b5b;background:#eaf9f1}.kpi-icon ha-icon{--mdc-icon-size:27px}.kpi>div:last-child{display:flex;flex-direction:column;min-width:0}.kpi span{font-size:14px;line-height:1.3}.kpi strong{font-size:24px;margin-top:3px;white-space:nowrap}.kpi small{color:var(--secondary-text-color,#65728a);margin-top:7px}.grid{display:grid;gap:14px;margin-bottom:14px}.top-grid{grid-template-columns:1.3fr 1fr .85fr}.bottom-grid{grid-template-columns:1fr .95fr 1.35fr}.wide{min-width:0}.chart{width:100%;height:220px}.chart line{stroke:var(--divider-color,#dbe4ee);stroke-width:1}.chart text{font-size:11px;fill:var(--secondary-text-color,#66758d)}.chart circle{fill:#46a4ef;stroke:#fff;stroke-width:2}.temp-chart{width:100%;height:98px;margin-top:10px;overflow:visible}.temp-chart text{font-size:9px;fill:var(--secondary-text-color,#66758d)}.temp-line{fill:none;stroke-width:2}.temp-line.t0,.temp-point.t0,.temp-range.t0{stroke:#ef4444}.temp-line.t1,.temp-point.t1,.temp-range.t1{stroke:#238ee8}.temp-line.t2,.temp-point.t2,.temp-range.t2{stroke:#f59e0b}.temp-line.t3,.temp-point.t3,.temp-range.t3{stroke:#159b5b}.temp-point{fill:var(--card-background-color,#fff);stroke-width:2}.temp-range{stroke-width:1;opacity:.65}.temp-hit{fill:transparent;stroke:transparent;pointer-events:all}.temp-chart g:focus .temp-hit{stroke:var(--primary-color,#0785db);stroke-width:1;outline:none}.bars{height:185px;border-bottom:1px solid var(--divider-color,#dbe4ee);display:flex;align-items:flex-end;justify-content:space-around;gap:10px;padding:10px 10px 0}.bar-col{height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px;font-size:11px;color:var(--secondary-text-color,#65728a)}.bar{width:26px;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px 3px 0 0;overflow:hidden;background:#eef2f6}.seg{display:block;width:100%}.heat{background:#ef4444}.dhw{background:#f59e0b}.cool{background:#238ee8}.idle{background:#8b9bb0}.other{background:#91c788}.unknown{background:#8b5cf6}.legend{display:flex;justify-content:center;align-items:center;gap:7px;font-size:12px;margin-top:12px;flex-wrap:wrap}.dot{width:10px;height:10px;border-radius:2px;margin-left:8px}.upcoming{min-height:150px;border-radius:10px;background:linear-gradient(145deg,#f1f8ff,#e9f4fc);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px;color:#2269a5;padding:18px}.upcoming span{font-size:13px;color:#496980}.temperature{font-size:34px;font-weight:700;margin:12px 0}.muted{color:var(--secondary-text-color,#65728a);font-size:13px}.mini-stats{display:flex;gap:20px;border-top:1px solid var(--divider-color,#e0e7ef);padding-top:14px}.mini-stats span{display:flex;flex-direction:column;color:var(--secondary-text-color,#65728a);font-size:12px}.mini-stats b{color:var(--primary-text-color,#17233b);margin-top:4px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{background:var(--secondary-background-color,#f2f6fa);text-align:left}th,td{padding:9px 8px;border-bottom:1px solid var(--divider-color,#e4eaf0);white-space:nowrap}.quality{display:inline-flex;padding:3px 7px;border-radius:12px;background:#eef2f6;text-transform:capitalize}.quality.good{background:#e5f7ed;color:#08743d}.quality.partial,.quality.filtered{background:#fff4d6;color:#8a5900}.quality.missing,.quality.unreconciled{background:#ffe9e8;color:#a82e28}.empty{min-height:150px;display:grid;place-items:center;text-align:center;color:var(--secondary-text-color,#65728a);padding:20px}.status-card{min-width:0}.roadmap{max-width:720px;margin:50px auto;text-align:center;padding:54px}.roadmap>ha-icon{--mdc-icon-size:64px;color:var(--primary-color,#0785db)}.roadmap h2{display:block;font-size:28px;margin-top:18px}.roadmap b{color:var(--primary-color,#0785db)}.roadmap p{color:var(--secondary-text-color,#65728a)}.page-card{padding:24px}.section-head{display:flex;justify-content:space-between;align-items:center}.section-head p{margin:4px 0 18px;color:var(--secondary-text-color,#65728a)}button.refresh,button.csv,button.apply-period,button.previous,button.next,.primary{border:0;border-radius:8px;background:var(--primary-color,#0785db);color:#fff;padding:10px 15px;text-decoration:none;cursor:pointer}.settings-grid{display:grid;grid-template-columns:1fr 1.6fr;gap:16px}.notice{grid-column:1/-1}dl{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px}dt{color:var(--secondary-text-color,#65728a)}dd{margin:0;text-align:right;font-weight:600}.mapping{display:grid;gap:1px;background:var(--divider-color,#e0e7ef);border:1px solid var(--divider-color,#e0e7ef);border-radius:8px;overflow:hidden}.mapping>div{display:grid;grid-template-columns:1fr 1.25fr;gap:12px;background:var(--card-background-color,#fff);padding:10px}.mapping code{color:var(--secondary-text-color,#65728a);overflow-wrap:anywhere}.loading{display:grid;place-items:center;gap:12px;padding:100px}.error{padding:18px;border-radius:10px;background:#ffe9e8;color:#a82e28}
+    .other-hvac{background:#14b8a6}.missing{color:#a82e28;background:#ffe9e8}.not-configured{font-size:24px;font-weight:700;color:var(--secondary-text-color,#65728a);margin:22px 0}.warning,.discrepancy{color:#b45309}.split-quality{display:flex;flex-direction:column;gap:3px;align-items:center}.quality.temperature-missing{background:#eef2f6;color:#56657a}.quality.unknown{background:#eef2f6;color:#56657a}.quality-layers{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:0 0 14px}.quality-layers>span{white-space:nowrap}.equipment-charts{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px}.device-bars>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 65px;gap:10px;align-items:center;margin:8px 0}.device-bars i{height:12px;background:#eef2f6;border-radius:6px;overflow:hidden}.device-bars i b{display:block;height:100%}.pv-chart{width:100%;height:220px}.pv-chart .pv{fill:#f6a800}.pv-chart .grid-import{fill:#238ee8}.pv-chart .grid-export{fill:#8b5cf6}.pv-chart .self-use{fill:#159b5b}.pv-chart .household{fill:#8b9bb0}.backfill-controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:12px;background:var(--secondary-background-color,#f2f6fa);border-radius:8px}.backfill-controls label{display:flex;align-items:center;gap:7px}.backfill-result{border-left:4px solid var(--primary-color,#0785db);padding:4px 14px;margin:12px 0}.backfill-result p{margin:8px 0;overflow-wrap:anywhere}
     @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.top-grid,.bottom-grid{grid-template-columns:1fr 1fr}.status-card,.bottom-grid .wide{grid-column:1/-1}}
     .period .conditional{display:none}.period .conditional.visible{display:flex}button:disabled{opacity:.45;cursor:not-allowed}
     @media(max-width:800px){main{padding:12px 9px}.brand>ha-icon{--mdc-icon-size:42px}.brand h1{font-size:23px}.brand p{font-size:13px}.connection{display:none}.tabs{gap:2px}.tab{padding:13px 11px;min-height:44px}.tab span{display:none}.kpis{grid-template-columns:1fr}.top-grid,.bottom-grid,.settings-grid,.equipment-charts{grid-template-columns:1fr}.status-card,.bottom-grid .wide,.notice{grid-column:auto}.section-head{align-items:flex-start}.mapping>div{grid-template-columns:1fr}.mini-stats{flex-wrap:wrap}.device-bars>div{grid-template-columns:1fr}.period{align-items:stretch;flex-direction:column}.period label{justify-content:space-between}.period input,.period select,.period button,.toolbar button,.pager button,.primary{min-height:44px}.card{padding:14px}.chart,.pv-chart{height:180px}.bars{height:120px}.empty,.upcoming{min-height:72px}.table-wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.table-wrap th:first-child,.table-wrap td:first-child{position:sticky;left:0;background:var(--card-background-color,#fff);z-index:1}.table-wrap th:first-child{background:var(--secondary-background-color,#f2f6fa)}.pager{flex-wrap:wrap}.pager span{order:-1;width:100%;text-align:center}}

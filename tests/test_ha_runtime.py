@@ -107,6 +107,113 @@ async def test_temperature_only_collector_never_requests_energy_mode_pv_or_grid(
 
 
 @pytest.mark.asyncio
+async def test_one_physical_temperature_entity_can_serve_multiple_logical_roles_once(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+
+    start = datetime(2026, 10, 29, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    row = SimpleNamespace(last_updated=start, state="21", attributes={
+        "unit_of_measurement": "°C",
+    })
+    source_records = [{
+        "source_id": source_id, "display_name": source_id,
+        "role": role, "entity_id": "sensor.shared_temperature", "enabled": True,
+        "quality": {"minimum": -50, "maximum": 80,
+                    "invalid_values": [-55, 155],
+                    "maximum_change_per_minute": 8,
+                    "freshness_minutes": 360, "missing_after_minutes": 360},
+    } for source_id, role in (("room", "indoor"), ("equipment", "equipment_room"))]
+    entry = SimpleNamespace(entry_id="entry", data={
+        "mapping_effective_at": "2026-01-01T00:00:00+00:00",
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps(source_records),
+    }, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, SimpleNamespace())
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.shared_temperature": [row]}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    collected = await coordinator._async_collect_temperatures(start, end)
+    requested = coordinator.reader.async_history.await_args.args[0]
+    assert requested == ["sensor.shared_temperature"]
+    assert set(collected.temperatures) == {"room", "equipment"}
+    assert collected.temperature_roles == {
+        "room": "indoor", "equipment": "equipment_room",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day,expected_hours", [
+    (date(2024, 3, 31), 23), (date(2024, 10, 27), 25),
+])
+async def test_temperature_only_backfill_creates_no_energy_and_retries_idempotently(
+    hass, tmp_path, day, expected_hours,
+):
+    from custom_components.home_energy_intelligence.configuration import mapping_revision
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+
+    start, end = local_day_bounds(day, "Europe/Ljubljana")
+    row = SimpleNamespace(last_updated=start, state="5", attributes={
+        "unit_of_measurement": "°C",
+    })
+    data = {
+        "mapping_effective_at": "2019-01-01T00:00:00+00:00",
+        "equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([{
+            "source_id": "outdoor", "display_name": "Outdoor", "role": "outdoor",
+            "entity_id": "sensor.outdoor", "enabled": True,
+            "quality": {"minimum": -50, "maximum": 60,
+                        "invalid_values": [-55, 155],
+                        "maximum_change_per_minute": 8,
+                        "freshness_minutes": 2000, "missing_after_minutes": 2000},
+        }]),
+    }
+    database = EnergyDatabase(tmp_path / "backfill.sqlite3")
+    database.initialize()
+    registered = database.ensure_mapping_revision(mapping_revision(data))
+    entry = SimpleNamespace(entry_id="entry", data=data, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered)
+    coordinator.timezone = "Europe/Ljubljana"
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.outdoor": [row]}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    first_id = database.create_temperature_backfill_job(
+        day.isoformat(), day.isoformat(), dry_run=False,
+    )
+    first = await coordinator._async_execute_temperature_backfill(first_id)
+    assert first["status"] == "completed"
+    assert first["outcome"] == "records_recovered"
+    assert first["inserted_hourly"] == expected_hours
+    assert first["inserted_daily"] == 1
+    assert database.daily(day.isoformat())["temperature_only"] is True
+    assert database.daily(day.isoformat())["household_kwh"] is None
+
+    second_id = database.create_temperature_backfill_job(
+        day.isoformat(), day.isoformat(), dry_run=False,
+    )
+    second = await coordinator._async_execute_temperature_backfill(second_id)
+    assert second["outcome"] == "no_changes_needed"
+    assert second["unchanged_hourly"] == expected_hours
+    assert second["unchanged_daily"] == 1
+    assert database.temperature_history_counts(
+        start, end, None,
+    ) == {"hourly": expected_hours, "daily": 1}
+    coordinator.reader = SimpleNamespace(
+        async_history=AsyncMock(return_value={"sensor.outdoor": []}),
+        async_statistics=AsyncMock(return_value={}),
+    )
+    preview_id = database.create_temperature_backfill_job(
+        day.isoformat(), day.isoformat(), dry_run=True,
+    )
+    preview = await coordinator._async_execute_temperature_backfill(preview_id)
+    assert preview["outcome"] == "preview_no_recoverable_records_action_required"
+    assert preview["net_new_temperature_summaries"] == {"hourly": 0, "daily": 0}
+
+
+@pytest.mark.asyncio
 async def test_temperature_fallback_uses_validated_coverage_not_row_count(hass):
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
 
@@ -679,6 +786,35 @@ async def test_options_flow_preserves_stable_ids_and_existing_mappings(
     assert "representative_outdoor_source_id" not in result["data"]
 
 
+def test_energy_season_controls_are_localized_visible_and_preserve_170_m2():
+    from custom_components.home_energy_intelligence.config_wizard import (
+        _general, _season_preview,
+    )
+
+    en = _general({"locale": "en", "floor_area_m2": 170,
+                   "energy_season_start_month": 7, "energy_season_start_day": 1})
+    sl = _general({"locale": "sl", "floor_area_m2": 170,
+                   "energy_season_start_month": 7, "energy_season_start_day": 1})
+    en_month = next(
+        validator for marker, validator in en.schema.items()
+        if marker.schema == "energy_season_start_month"
+    )
+    sl_month = next(
+        validator for marker, validator in sl.schema.items()
+        if marker.schema == "energy_season_start_month"
+    )
+    assert [item["label"] for item in en_month.config["options"]][6] == "July"
+    assert [item["label"] for item in sl_month.config["options"]][6] == "julij"
+    assert _season_preview({"locale": "en", "energy_season_start_month": 7,
+                            "energy_season_start_day": 1}) == "July 1 – June 30"
+    assert _season_preview({"locale": "sl", "energy_season_start_month": 7,
+                            "energy_season_start_day": 1}) == "1. julij – 30. junij"
+    floor_marker = next(
+        marker for marker in en.schema if marker.schema == "floor_area_m2"
+    )
+    assert floor_marker.default() == 170
+
+
 @pytest.mark.asyncio
 async def test_options_draft_skip_disable_remove_and_validation_are_transactional(hass):
     from custom_components.home_energy_intelligence.config_wizard import OptionsFlow
@@ -803,6 +939,12 @@ async def test_current_day_snapshot_uses_completed_hourly_rows_without_daily_wri
             assert range_end == datetime(2026, 1, 1, tzinfo=UTC)
             return [row]
 
+        def temperature_history_range(self, kind, range_start, range_end):
+            assert kind == "hourly"
+            assert range_start == start
+            assert range_end == datetime(2026, 1, 1, tzinfo=UTC)
+            return []
+
     database = ReadOnlyDatabase()
     coordinator = SimpleNamespace(database=database, timezone="Europe/Ljubljana")
     current, hours, coverage, cutoff, local_day = await _current_day_snapshot(
@@ -815,6 +957,48 @@ async def test_current_day_snapshot_uses_completed_hourly_rows_without_daily_wri
     assert cutoff == datetime(2026, 1, 1, tzinfo=UTC)
     assert local_day.isoformat() == "2026-01-01"
     assert database.daily_writes == 0
+
+
+@pytest.mark.asyncio
+async def test_current_day_snapshot_can_show_temperature_only_without_fake_energy(hass):
+    from custom_components.home_energy_intelligence.websocket import _current_day_snapshot
+
+    start = datetime(2025, 12, 31, 23, tzinfo=UTC)
+    temperature_row = {
+        "local_date": "2026-01-01", "timezone": "Europe/Ljubljana",
+        "period_start_utc": start.isoformat(),
+        "period_end_utc": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        "day_seconds": 3600, "household_kwh": None, "pv_kwh": None,
+        "import_kwh": None, "export_kwh": None, "non_hvac_kwh": None,
+        "quality": "partial", "allocations": {}, "temperature_only": True,
+        "temperatures": {"outdoor": {
+            "mean": 5.0, "minimum": 4.0, "maximum": 6.0,
+            "coverage_seconds": 3600, "period_seconds": 3600,
+            "coverage_percent": 100, "quality": "good",
+        }},
+    }
+
+    class TemperatureOnlyDatabase:
+        def hourly_range(self, _start, _end):
+            return []
+
+        def temperature_history_range(self, kind, _start, _end):
+            assert kind == "hourly"
+            return [temperature_row]
+
+    coordinator = SimpleNamespace(
+        database=TemperatureOnlyDatabase(), timezone="Europe/Ljubljana",
+    )
+    current, hours, coverage, _cutoff, _day = await _current_day_snapshot(
+        hass, coordinator, datetime(2026, 1, 1, tzinfo=UTC),
+        now=datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+    )
+    assert current["temperature_only"] is True
+    assert current["temperatures"]["outdoor"]["mean"] == 5.0
+    assert current["household_kwh"] is None
+    assert current["allocations"] == {}
+    assert coverage["complete"] is False
+    assert hours == [temperature_row]
 
 
 @pytest.mark.asyncio

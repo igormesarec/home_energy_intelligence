@@ -42,11 +42,40 @@ def test_dashboard_role_contract_keeps_settings_admin_only_not_history():
     settings_prefix = source[source.rindex("@websocket_api.websocket_command", 0, source.index("async def ws_settings")):source.index("async def ws_settings")]
     assert "require_admin" not in history_prefix
     assert "require_admin" in settings_prefix
-    for handler in ("ws_temperature_diagnostics", "ws_reprocess_temperature_history"):
+    for handler in (
+        "ws_temperature_diagnostics", "ws_reprocess_temperature_history",
+        "ws_temperature_backfill_preview", "ws_temperature_backfill_start",
+        "ws_temperature_backfill_status", "ws_temperature_backfill_cancel",
+    ):
         prefix = source[source.rindex(
             "@websocket_api.websocket_command", 0, source.index(f"async def {handler}")
         ):source.index(f"async def {handler}")]
         assert "require_admin" in prefix
+
+
+def test_v012_frontend_cache_key_uses_content_hash_and_keeps_sidebar_path():
+    panel = (INTEGRATION / "panel.py").read_text(encoding="utf-8")
+    manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
+    const = (INTEGRATION / "const.py").read_text(encoding="utf-8")
+    assert manifest["version"] == "0.1.2"
+    assert 'VERSION: Final = "0.1.2"' in const
+    assert "sha256" in panel and "frontend_build" in panel
+    assert "?v={VERSION}-{frontend_build}" in panel
+    assert "frontend_url_path=PANEL_URL" in panel
+
+
+def test_temperature_recovery_ui_has_distinct_truthful_admin_actions():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    for label in (
+        "Diagnose", "Repair existing summaries",
+        "Preview temperature-only backfill", "Start temperature-only backfill",
+        "No records recovered",
+    ):
+        assert label.lower() in frontend.lower()
+    assert "no_records_recovered_action_required" in frontend
+    assert "preview_no_recoverable_records_action_required" in frontend
+    assert "temperature_summaries_before" in frontend
+    assert "temperature_summaries_after" in frontend
 
 
 def test_indoor_and_outdoor_cards_share_one_component_contract():
@@ -56,6 +85,35 @@ def test_indoor_and_outdoor_cards_share_one_component_contract():
     assert "latest_value" in source and "latest_timestamp" in source
     assert "coverage_percent" in source
     assert "representative_${role}_source_id" in source
+
+
+def test_single_day_temperature_charts_share_bounded_hourly_endpoint():
+    frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    backend = (INTEGRATION / "websocket.py").read_text(encoding="utf-8")
+    database = (INTEGRATION / "database.py").read_text(encoding="utf-8")
+    assert 'type: "home_energy_intelligence/temperature_timeline"' in frontend
+    assert 'period.start_date === period.end_date ? "hourly" : "daily"' in frontend
+    assert "this.historyPreset === \"today\" ? this.temperatureTimeline" not in frontend
+    assert "return this.temperatureTimeline(role)" in frontend
+    assert "Daily summary available, but hourly temperature history has not been archived/backfilled" in frontend
+    assert "Gaps are not interpolated" in frontend
+    assert 'tabindex="0"' in frontend and "temp-hit" in frontend
+    assert 'f"{DOMAIN}/temperature_timeline"' in backend
+    endpoint_prefix = backend[backend.rindex(
+        "@websocket_api.websocket_command", 0, backend.index("async def ws_temperature_timeline")
+    ):backend.index("async def ws_temperature_timeline")]
+    assert "require_admin" not in endpoint_prefix
+    assert "maximum_days=7 if resolution == \"hourly\" else 3660" in backend
+    assert "result.extend(" in database and "temperature_history_range(\"hourly\"" in database
+
+
+def test_temperature_timeline_refreshes_with_period_and_keeps_mobile_targets_readable():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert source.count("await this.loadTemperatureTimeline(") >= 2
+    assert ".temp-hit{fill:transparent" in source
+    assert 'r="8"' in source
+    assert "height:98px" in source
+    assert "new Date(" not in source
 
 
 def test_all_history_presets_are_backend_resolved_and_refresh_state_is_preserved():

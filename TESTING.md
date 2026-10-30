@@ -67,6 +67,14 @@ Covered acceptance cases include:
 - Temperature quality boundaries cover 0%, 94.99%, 95%, 97%, 99.9% and 100% on ordinary, 23-hour and 25-hour dates, proving that response eligibility and full completeness remain separate.
 - Effective-dated repair tests cover unchanged mappings, remapped entities, changed attributes/roles, mapping transitions, legacy rows and missing provenance while asserting electricity, allocations and checksums remain untouched.
 - Home Assistant runtime fallback tests isolate InfluxDB timeout, connection and malformed-row failures per source, preserve a parallel 100%-validated Recorder source and prove the failed source remains zero-coverage rather than zero-valued or complete.
+- Schema V5 tests recover independent temperature-only hourly/daily summaries with no energy parent, retain null energy fields, preserve V4 energy/checkpoint payloads and checksums, and make a second identical backfill a no-op.
+- Chronological mapping tests cover A→B→A without obsolete effective-date reuse; one physical Recorder entity can serve multiple stable logical temperature roles with one history query.
+- Bounded temperature-only job tests cover preview/action-required truthfulness, before/after counts, 23/25-hour days, idempotence, cancellation/restart metadata and no writes to Recorder or energy tables.
+- Current-cutoff tests reproduce 9.0 kWh household, 3.1 kWh confirmed heat-pump heating and 1.0 kWh selected AC heating as a 4.1 kWh known/provisional total without promoting selected energy to confirmed.
+- Frontend contracts require version 0.1.2, content-hash cache busting, distinct Diagnose/existing-repair/temperature-only actions and a non-green zero-recovery action-required result.
+- Historical timeline regressions use independently defined October 29 hourly fixtures whose elapsed-hour aggregation remains 23.0 °C indoor (22.5/23.2 min/max) and 11.5 °C outdoor (9/17 min/max). Executable Web Component rendering proves 24 points and a 00:00/06:00/12:00/18:00/24:00 local-time axis rather than a daily dot.
+- Timeline tests cover daily-only evidence with an honest backfill-required message, two-hour visible gaps, one truthful isolated point, filtered 100% coverage, bounded daily resolution, and 23/25 elapsed-hour DST days with two offset-distinct fall-back 02:00 intervals.
+- The authenticated timeline API accepts at most seven local days at hourly resolution and eight configured source IDs; ordinary month/year navigation uses compact daily summaries and never performs raw Recorder reads.
 
 ## Responsive layout evidence
 
