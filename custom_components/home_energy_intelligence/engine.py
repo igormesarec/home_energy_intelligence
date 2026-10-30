@@ -229,9 +229,16 @@ class DailyAggregator:
             )
             temperatures[key] = {
                 **serialized, "coverage_percent": result.coverage_percent,
+                "full_temporal_coverage": result.coverage_seconds >= result.period_seconds,
                 "missing_seconds": missing_seconds,
                 "missing_threshold_exceeded": missing_threshold_exceeded,
                 "quality": "missing" if missing_threshold_exceeded else result.quality,
+                "period_start_utc": start.isoformat(),
+                "period_end_utc": end.isoformat(),
+                "source_provenance": (
+                    source.provenance.get("temperature_collection", {}).get(key)
+                    if isinstance(source.provenance, dict) else None
+                ),
             }
 
         quality_flags = [data["quality"] for data in allocations.values()]

@@ -34,6 +34,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.historyOlderMonth = null;
     this.selectedPeriod = null;
     this.historyOffset = 0;
+    this.historyTotal = 0;
+    this.responseProfileData = null;
+    this.temperatureDiagnostics = null;
+    this.temperatureRepairResult = null;
   }
 
   set hass(value) {
@@ -65,8 +69,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       this.equipment = (overview.equipment || []).filter((item) => item.enabled);
       this.temperatureSources = (overview.temperature_sources || []).filter((item) => item.enabled);
       this.history = history.records || [];
+      this.historyTotal = history.total || 0;
       this.historySummary = history.summary;
       this.historyCoverage = history.period_coverage;
+      this.responseProfileData = history.response_profile;
       this.selectedPeriod = history.selected_period;
       this.settings = settings;
     } catch (error) {
@@ -135,7 +141,29 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
 
   quality(record) {
     const value = record?.quality || "missing";
-    return `<span class="quality ${esc(value)}">${esc(value)}</span>`;
+    const stored = record?.stored_quality;
+    const title = record?.quality_basis
+      ? `Derived from independent coverage layers${stored && stored !== value ? `; stored legacy label: ${stored}` : ""}`
+      : "Persisted source quality";
+    return `<span class="quality ${esc(value)}" title="${esc(title)}">${esc(value)}</span>`;
+  }
+
+  evidence(value, known) {
+    if (value != null) return `${n(value)} kWh`;
+    if (known != null) return `${n(known)} kWh <span class="quality partial">known subtotal</span>`;
+    return `<span class="missing">Unavailable</span>`;
+  }
+
+  splitQuality(record) {
+    const labels=[];const energy=record?.energy||{};const devices=energy.equipment||[];
+    if(record?.partial===true||record?.finalized===false)labels.push(["partial","incomplete period"]);
+    if(record?.household_kwh==null)labels.push(["missing","missing meter"]);
+    if(devices.some((row)=>row.available===false||row.classification_complete===false))labels.push(["partial","incomplete classification"]);
+    if(devices.some((row)=>["uncertain","estimated","filtered"].includes(row.quality)||Number(row.assumed_heating_kwh||row.selected_heating_kwh||row.estimated_heating_kwh||row.selected_cooling_kwh||row.estimated_cooling_kwh||row.known_assumed_heating_kwh||row.known_selected_heating_kwh||row.known_estimated_heating_kwh||row.known_selected_cooling_kwh||row.known_estimated_cooling_kwh||0)>0))labels.push(["filtered","estimated allocation"]);
+    const temperatureMissing=["indoor","outdoor"].some((role)=>{const source=this.representativeSource(role);return source&&record?.temperatures?.[source.source_id]?.mean==null;});
+    if(temperatureMissing)labels.push(["temperature-missing","temperature evidence missing"]);
+    if(!labels.length)labels.push(["good","complete"]);
+    return labels.map(([css,label])=>`<b class="quality ${css}">${esc(label)}</b>`).join(" ");
   }
 
   splitChart() {
@@ -145,30 +173,33 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const max = Math.max(1, ...records.map((r) => r.household_kwh ?? r.known_household_kwh ?? 0));
     return `<div class="bars" role="img" aria-label="Daily electricity split">${records.map((r) => {
       const total = r.household_kwh ?? r.known_household_kwh;
-      const heat = r.energy?.space_heating_kwh ?? r.energy?.known_space_heating_kwh ?? 0;
-      const dhw = r.energy?.dhw_kwh ?? r.energy?.known_dhw_kwh ?? 0;
-      const cool = r.energy?.cooling_kwh ?? r.energy?.known_cooling_kwh ?? 0;
-      const idle = r.energy?.idle_kwh ?? r.energy?.known_idle_kwh ?? 0;
-      const otherHvac = r.energy?.other_hvac_kwh ?? r.energy?.known_other_hvac_kwh ?? 0;
-      const other = r.energy?.other_household_kwh ?? 0;
-      const unknown = r.energy?.unknown_kwh ?? 0;
+      const heat = r.energy?.space_heating_kwh ?? r.energy?.known_space_heating_kwh ?? null;
+      const dhw = r.energy?.dhw_kwh ?? r.energy?.known_dhw_kwh ?? null;
+      const cool = r.energy?.cooling_kwh ?? r.energy?.known_cooling_kwh ?? null;
+      const idle = r.energy?.idle_kwh ?? r.energy?.known_idle_kwh ?? null;
+      const otherHvac = r.energy?.other_hvac_kwh ?? r.energy?.known_other_hvac_kwh ?? null;
+      const other = r.energy?.other_household_kwh ?? null;
+      const unknown = r.energy?.unknown_kwh ?? null;
       const discrepancy = r.energy?.unallocated_discrepancy_kwh;
       const scale = 150 / max;
-      const segment=(name,value,css)=>value>0?`<i class="seg ${css}" style="height:${value*scale}px" title="${esc(name)}: ${n(value)} kWh · ${n(total>0?100*value/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}"></i>`:"";
+      const segment=(name,value,css)=>Number.isFinite(value)&&value>0?`<i class="seg ${css}" style="height:${value*scale}px" title="${esc(name)}: ${n(value)} kWh · ${n(total>0?100*value/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}"></i>`:"";
+      const unavailable=[["heating",heat],["DHW",dhw],["cooling",cool],["idle",idle],["other HVAC",otherHvac],["other household",other],["unallocated",unknown]].filter(([,value])=>value==null).map(([name])=>name);
       return `<div class="bar-col" title="${esc(r.local_date)}">
-        <div class="bar" style="height:${Math.max(2,(total||0)*scale)}px">${segment("Unallocated",unknown,"unknown")}${segment("Other household",other,"other")}${segment("Other HVAC (fan/dry)",otherHvac,"other-hvac")}${segment("Idle/standby",idle,"idle")}${segment("Cooling",cool,"cool")}${segment("DHW",dhw,"dhw")}${segment("Space heating",heat,"heat")}</div>
-        ${!r.energy?.complete?`<b class="missing" title="Required meter or allocation data is unavailable">missing</b>`:""}
-        ${discrepancy!=null&&Math.abs(discrepancy)>.05?`<b class="discrepancy" title="Discrepancy: ${n(discrepancy)} kWh · ${n(total?100*discrepancy/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Δ ${n(discrepancy)}</b>`:""}${other<0?`<b class="discrepancy" title="Other household: ${n(other)} kWh · ${n(total?100*other/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Other ${n(other)}</b>`:""}<span>${esc(r.local_date.slice(5))}${r===this.latest||!r.energy?.complete?" partial":""}</span></div>`;
+        <div class="bar" style="height:${Math.max(2,(total||0)*scale)}px">${segment("Unallocated",unknown,"unknown")}${segment("Other household",other,"other")}${segment("Other HVAC (fan/dry)",otherHvac,"other-hvac")}${segment("Idle/standby",idle,"idle")}${segment(r.energy?.cooling_kwh==null&&cool!=null?"Known partial cooling":"Cooling",cool,"cool")}${segment(r.energy?.dhw_kwh==null&&dhw!=null?"Known partial DHW":"DHW",dhw,"dhw")}${segment(r.energy?.space_heating_kwh==null&&heat!=null?"Known partial space heating":"Space heating",heat,"heat")}</div>
+        <div class="split-quality">${this.splitQuality(r)}</div>
+        ${unavailable.length?`<small class="muted" title="Unavailable is not measured zero">Unavailable: ${unavailable.map(esc).join(", ")}</small>`:""}${discrepancy!=null&&Math.abs(discrepancy)>.05?`<b class="discrepancy" title="Discrepancy: ${n(discrepancy)} kWh · ${n(total?100*discrepancy/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Δ ${n(discrepancy)}</b>`:""}${other!=null&&other<0?`<b class="discrepancy" title="Other household: ${n(other)} kWh · ${n(total?100*other/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Other ${n(other)}</b>`:""}<span>${esc(r.local_date.slice(5))}${r.partial===true||r.finalized===false?" partial":""}</span></div>`;
     }).join("")}</div><div class="legend"><i class="dot heat"></i>Heating <i class="dot dhw"></i>DHW <i class="dot cool"></i>Cooling <i class="dot idle"></i>Idle <i class="dot other-hvac"></i>Other HVAC <i class="dot other"></i>Other household <i class="dot unknown"></i>Unallocated <b class="discrepancy">Δ discrepancy (signed)</b></div>`;
   }
 
   scatterChart() {
-    const points = this.history.flatMap((r) => {
-      const temp = this.temperatureForRole(r, "outdoor")?.mean;
-      const heat = r.energy?.space_heating_kwh;
-      return temp == null || heat == null ? [] : [[temp, heat, r.local_date]];
-    });
-    if (!points.length) return `<div class="empty">Needs validated outdoor temperature and heating records.</div>`;
+    const evidence=this.responseProfileData?.points||[];
+    const excluded=evidence.filter((point)=>point.status!=="validated");
+    const points=evidence.filter((point)=>point.status==="validated").map((point)=>[
+      Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh),point.local_date,
+      point.outdoor_coverage_percent,point.equipment_heating||[],
+    ]);
+    const diagnostics=excluded.length?`<details><summary>${excluded.length} excluded day(s) — qualification evidence</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Outdoor</th><th>Coverage</th><th>Heating</th><th>Reason</th></tr></thead><tbody>${excluded.map((point)=>`<tr><td>${esc(point.local_date)}</td><td>${n(point.outdoor_mean_c)} °C</td><td>${point.outdoor_coverage_percent==null?"Unavailable":n(point.outdoor_coverage_percent,2)+"%"}</td><td>${n(point.heating_electricity_kwh)} kWh</td><td>${esc((point.exclusion_reasons||[]).join(", "))}</td></tr>`).join("")}</tbody></table></div></details>`:"";
+    if (!points.length) return `<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
     const xs = points.map((p) => p[0]); const ys = points.map((p) => p[1]);
     const xmin = Math.min(...xs) - 1, xmax = Math.max(...xs) + 1;
     const ymax = Math.max(1, ...ys) * 1.1;
@@ -177,19 +208,38 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return `<svg viewBox="0 0 550 215" class="chart" role="img" aria-label="Heating electricity versus outdoor temperature">
       ${[0, .25, .5, .75, 1].map((v) => `<line x1="42" x2="522" y1="${35 + v * 145}" y2="${35 + v * 145}" />`).join("")}
       <text x="8" y="40">${n(ymax)}</text><text x="22" y="183">0</text>
-      ${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1])} kWh</title></circle>`).join("")}
+      ${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1])} kWh electric · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh`).join(" · ")}</title></circle>`).join("")}
       <text x="42" y="205">${n(xmin)} °C</text><text x="480" y="205">${n(xmax)} °C</text>
-    </svg>`;
+    </svg>${diagnostics}`;
+  }
+
+  responseProfile() {
+    const area=Number(this.overviewData?.floor_area_m2); const source=this.representativeSource("outdoor");
+    if(!source) return `<div class="empty">Configure a representative measured outdoor-air sensor to build the electrical response curve.</div>`;
+    if(!(area>0)) return `<div class="empty">Configure floor area to normalize electrical space-heating demand.</div>`;
+    const evidence=this.responseProfileData?.points||[];const excluded=evidence.filter((record)=>record.status!=="validated");
+    const points=evidence.filter((record)=>record.status==="validated").map((record)=>({x:Number(record.outdoor_mean_c),y:Number(record.normalized_heating_kwh_m2_day),date:record.local_date,coverage:Number(record.outdoor_coverage_percent),hp:Number(record.heat_pump_heating_kwh||0),ac:Number(record.ac_heating_kwh||0),uncertain:Number(record.uncertain_heating_kwh||0)}));
+    const diagnostics=excluded.length?`<details><summary>${excluded.length} excluded day(s) — evidence retained</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Outdoor</th><th>Coverage</th><th>Heating</th><th>Reason</th></tr></thead><tbody>${excluded.map((row)=>`<tr><td>${esc(row.local_date)}</td><td>${n(row.outdoor_mean_c)} °C</td><td>${n(row.outdoor_coverage_percent,0)}%</td><td>${n(row.heating_electricity_kwh)} kWh</td><td>${esc((row.exclusion_reasons||[]).join(", "))}</td></tr>`).join("")}</tbody></table></div></details>`:"";
+    if(!points.length)return `<div class="empty">Insufficient validated data. Daily exclusions remain available below.</div>${diagnostics}`;
+    const bins=new Map();for(const point of points){const key=Math.floor(point.x/2)*2;const bucket=bins.get(key)||{x:0,y:0,hp:0,ac:0,n:0};bucket.x+=point.x;bucket.y+=point.y;bucket.hp+=point.hp;bucket.ac+=point.ac;bucket.n+=1;bins.set(key,bucket);}const series=[...bins.values()].map((bucket)=>({x:bucket.x/bucket.n,y:bucket.y/bucket.n,hp:bucket.hp/bucket.n,ac:bucket.ac/bucket.n,n:bucket.n})).sort((a,b)=>a.x-b.x);
+    const xs=points.map((p)=>p.x),ys=points.map((p)=>p.y),xMean=xs.reduce((a,b)=>a+b,0)/xs.length,yMean=ys.reduce((a,b)=>a+b,0)/ys.length;const denominator=xs.reduce((sum,x)=>sum+(x-xMean)**2,0);const slope=denominator?xs.reduce((sum,x,index)=>sum+(x-xMean)*(ys[index]-yMean),0)/denominator:null;const intercept=slope==null?null:yMean-slope*xMean;const residual=slope==null?null:ys.reduce((sum,y,index)=>sum+(y-(intercept+slope*xs[index]))**2,0);const variance=ys.reduce((sum,y)=>sum+(y-yMean)**2,0);const r2=residual==null||variance===0?null:1-residual/variance;const degreeDays=points.reduce((sum,p)=>sum+Math.max(0,18-p.x),0);const outdoorSpan=Math.max(...xs)-Math.min(...xs);const minimumPoints=Number(this.responseProfileData?.minimum_regression_points||10),minimumSpan=Number(this.responseProfileData?.minimum_outdoor_span_c||8),minimumR2=Number(this.responseProfileData?.minimum_regression_r_squared||.5);const modelValid=points.length>=minimumPoints&&outdoorSpan>=minimumSpan&&r2!=null&&r2>=minimumR2;
+    const maxY=Math.max(.01,...series.map((p)=>p.y))*1.1,minX=Math.min(...series.map((p)=>p.x))-1,maxX=Math.max(...series.map((p)=>p.x))+1,px=(x)=>44+(x-minX)/Math.max(1,maxX-minX)*470,py=(y)=>178-y/maxY*142;
+    const annualReady=this.historyCoverage?.complete&&["this_year","previous_year","current_season","previous_season"].includes(this.historyPreset);const annual=this.historySummary?.energy?.space_heating_kwh;
+    return `<div class="response-evidence"><p><b>Source:</b> ${esc(source.display_name)} · <b>floor area:</b> ${n(area,0)} m² · minimum outdoor coverage ${n(this.responseProfileData?.minimum_temperature_coverage_percent,0)}%</p><svg viewBox="0 0 550 215" class="chart" role="img" aria-label="Whole-house electrical space-heating response"><line x1="44" x2="514" y1="178" y2="178"/>${series.map((p)=>`<circle cx="${px(p.x)}" cy="${py(p.y)}" r="${Math.min(9,4+p.n)}"><title>${n(p.x)} °C · ${n(p.y,3)} kWh/m²/day · HP ${n(p.hp)} kWh/day · AC ${n(p.ac)} kWh/day · ${p.n} day(s)</title></circle>`).join("")}<text x="8" y="38">${n(maxY,3)} kWh/m²/day</text><text x="8" y="181">0</text><text x="44" y="205">${n(minX)} °C</text><text x="462" y="205">${n(maxX)} °C</text></svg><div class="mini-stats"><span>Validated days <b>${points.length}</b></span><span>Observed outdoor span <b>${n(outdoorSpan)} °C</b></span><span>Regression <b>${modelValid?`Validated · R² ${n(r2,3)}`:"Insufficient validated data"}</b></span><span>Observed degree-days (18 °C) <b>${n(degreeDays,1)}</b></span><span>Annual/season electricity <b>${annualReady&&annual!=null?n(annual)+" kWh":"Incomplete period"}</b></span><span>Thermal output / COP <b>Unavailable</b></span><span>Design day <b>Unavailable</b></span></div><p class="muted">Observed electrical demand only. A fit requires at least ${minimumPoints} qualified days, ${n(minimumSpan)} °C outdoor span and R² ≥ ${n(minimumR2,2)}. Confirmed and uncertain heating remain separate in daily evidence. No physical balance point, thermal output, COP, design-day capacity or short-period annual extrapolation is inferred.</p>${diagnostics}</div>`;
+  }
+
+  thermalView() {
+    return `${this.periodControls()}<section class="card page-card"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Whole-House Electrical Heating Response</h2>${this.responseProfile()}</section><section class="grid equipment-charts"><article class="card"><h2>Measured thermal output</h2><div class="empty">Unavailable — no configured measured thermal-energy source. Electricity is not heat output.</div></article><article class="card"><h2>Evidence and uncertainty</h2><p class="muted">Only complete daily allocations and the selected representative outdoor sensor enter the response curve. Missing dates, partial device allocations and invalid temperatures remain excluded and visible through period quality.</p></article></section>`;
   }
 
   recentTable(records = this.history.slice(0, 7)) {
     if (!records.length) return `<div class="empty">No daily records yet. The first close runs at 05:00 local time.</div>`;
-    return `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Whole house</th><th>HP confirmed</th><th>HP assumed</th><th>AC confirmed</th><th>AC selected/estimated</th><th>Total heating</th><th>DHW</th><th>Heating + DHW</th><th>Cooling</th><th>HVAC idle</th><th>Other HVAC</th><th>Other household</th><th>Unallocated / discrepancy</th><th>PV</th><th>Import</th><th>Export</th><th>Self-sufficiency</th><th>Quality</th></tr></thead><tbody>
+    return `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Whole house</th><th>HP confirmed</th><th>HP assumed</th><th>AC confirmed</th><th>AC selected/estimated</th><th>Total heating</th><th>DHW</th><th>Heating + DHW</th><th>Cooling</th><th>HVAC idle</th><th>Other HVAC</th><th>Other household</th><th>Unallocated</th><th>Discrepancy (signed)</th><th>PV</th><th>Import</th><th>Export</th><th>Self-sufficiency</th><th>Quality</th></tr></thead><tbody>
       ${records.map((r) => `<tr><td>${esc(r.local_date)}</td><td>${n(r.energy?.household_kwh)} kWh</td>
         <td>${n(r.energy?.confirmed_heat_pump_heating_kwh)} kWh</td><td>${n(r.energy?.assumed_heat_pump_heating_kwh)} kWh</td>
         <td>${n(r.energy?.confirmed_ac_heating_kwh)} kWh</td><td>${n(addNullable(r.energy?.selected_ac_heating_kwh,r.energy?.estimated_ac_heating_kwh))} kWh</td>
         <td>${n(r.energy?.space_heating_kwh)} kWh</td><td>${n(r.energy?.dhw_kwh)} kWh</td><td>${n(r.energy?.heating_and_dhw_kwh)} kWh</td><td>${n(r.energy?.cooling_kwh)} kWh</td>
-        <td>${n(r.energy?.idle_kwh)} kWh</td><td>${n(r.energy?.other_hvac_kwh)} kWh</td><td>${n(r.energy?.other_household_kwh)} kWh</td><td>${n(addNullable(r.energy?.unknown_kwh,r.energy?.unallocated_discrepancy_kwh))} kWh</td>
+        <td>${n(r.energy?.idle_kwh)} kWh</td><td>${n(r.energy?.other_hvac_kwh)} kWh</td><td>${n(r.energy?.other_household_kwh)} kWh</td><td>${n(r.energy?.unknown_kwh)} kWh</td><td>${n(r.energy?.unallocated_discrepancy_kwh)} kWh</td>
         <td>${n(r.energy?.pv_kwh)} kWh</td><td>${n(r.energy?.import_kwh)} kWh</td><td>${n(r.energy?.export_kwh)} kWh</td><td>${n(r.energy?.self_sufficiency_percent)}%</td><td>${this.quality(r)}</td></tr>`).join("")}
     </tbody></table></div>`;
   }
@@ -222,28 +272,31 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   equipmentBreakdown() {
     const rows = this.selectedRecord()?.energy?.equipment || [];
     if (!rows.length) return `<div class="empty">No enabled equipment data for this period.</div>`;
-    return `<div class="table-wrap"><table><thead><tr><th>Equipment</th><th>Meter</th><th>Confirmed heating</th><th>Assumed/selected/estimated</th><th>DHW</th><th>Cooling confirmed</th><th>Cooling selected</th><th>Cooling estimated</th><th>Idle</th><th>Other HVAC</th><th>Residual</th><th>Coverage</th><th>Quality</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.display_name)}</td><td>${n(r.meter_kwh)} kWh</td><td>${n(r.confirmed_heating_kwh)} kWh</td><td>${n(addNullable(r.assumed_heating_kwh,r.selected_heating_kwh,r.estimated_heating_kwh))} kWh</td><td>${n(r.dhw_kwh)} kWh</td><td>${n(r.confirmed_cooling_kwh)} kWh</td><td>${n(r.selected_cooling_kwh)} kWh</td><td>${n(r.estimated_cooling_kwh)} kWh</td><td>${n(r.idle_kwh)} kWh</td><td>${n(r.other_hvac_kwh)} kWh</td><td>${n(r.residual_kwh)} kWh</td><td>${n(r.coverage_percent,0)}%</td><td>${this.quality(r)}</td></tr>`).join("")}</tbody></table></div><div class="equipment-charts"><article><h3>Heating by equipment</h3>${this.equipmentComparison("heating")}</article><article><h3>Cooling by equipment</h3>${this.equipmentComparison("cooling")}</article></div>`;
+    return `<div class="table-wrap"><table><thead><tr><th>Equipment</th><th>Meter</th><th>Confirmed heating</th><th>Assumed/selected/estimated</th><th>DHW</th><th>Cooling confirmed</th><th>Cooling selected</th><th>Cooling estimated</th><th>Idle</th><th>Other HVAC</th><th>Unknown / residual</th><th>Coverage</th><th>Evidence</th><th>Quality</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.display_name)}</td><td>${this.evidence(r.meter_kwh,null)}</td><td>${this.evidence(r.confirmed_heating_kwh,r.known_confirmed_heating_kwh)}</td><td>${this.evidence(addNullable(r.assumed_heating_kwh,r.selected_heating_kwh,r.estimated_heating_kwh),addNullable(r.known_assumed_heating_kwh,r.known_selected_heating_kwh,r.known_estimated_heating_kwh))}</td><td>${this.evidence(r.dhw_kwh,r.known_dhw_kwh)}</td><td>${this.evidence(r.confirmed_cooling_kwh,r.known_confirmed_cooling_kwh)}</td><td>${this.evidence(r.selected_cooling_kwh,r.known_selected_cooling_kwh)}</td><td>${this.evidence(r.estimated_cooling_kwh,r.known_estimated_cooling_kwh)}</td><td>${this.evidence(r.idle_kwh,r.known_idle_kwh)}</td><td>${this.evidence(r.other_hvac_kwh,r.known_other_hvac_kwh)}</td><td>${n(r.unknown_kwh)} / ${n(r.residual_kwh)} kWh</td><td>${r.coverage_percent==null?"Unknown":n(r.coverage_percent,0)+"%"}</td><td>${esc(r.classification_source||r.source||"Unavailable")}</td><td>${this.quality(r)}</td></tr>`).join("")}</tbody></table></div><div class="equipment-charts"><article><h3>Heating by equipment</h3>${this.equipmentComparison("heating")}</article><article><h3>Cooling by equipment</h3>${this.equipmentComparison("cooling")}</article></div>`;
   }
 
   equipmentComparison(category) {
     const rows=this.selectedRecord()?.energy?.equipment || [];
-    const available=rows.filter((row)=>row.available);
+    const available=rows.filter((row)=>row.available&&row.classification_complete);
+    const incomplete=rows.filter((row)=>row.available&&!row.classification_complete);
     const values=available.map((row)=>category==="heating"?(row.confirmed_heating_kwh||0)+(row.assumed_heating_kwh||0)+(row.selected_heating_kwh||0)+(row.estimated_heating_kwh||0):(row.cooling_kwh||0));
     const max=Math.max(0,...values);
-    if(!available.length||max===0)return `<p class="muted">No validated ${category} allocation.${rows.some((row)=>!row.available)?" Some equipment is unavailable.":""}</p>`;
-    return `<div class="device-bars">${available.map((row,index)=>`<div><span>${esc(row.display_name)} ${this.quality(row)}</span><i><b class="${category==='heating'?'heat':'cool'}" style="width:${100*values[index]/max}%" title="${n(values[index])} kWh · ${esc(row.quality)}"></b></i><strong>${n(values[index])} kWh</strong></div>`).join("")}</div>${rows.some((row)=>!row.available)?'<p class="warning">Unavailable equipment is excluded; total remains partial.</p>':""}`;
+    if(!available.length||max===0)return `<p class="muted">No complete validated ${category} allocation.${incomplete.length?" Partial device meters remain in the evidence table and are not rendered as zero.":""}${rows.some((row)=>!row.available)?" Some equipment is unavailable.":""}</p>`;
+    return `<div class="device-bars">${available.map((row,index)=>`<div><span>${esc(row.display_name)} ${this.quality(row)}</span><i><b class="${category==='heating'?'heat':'cool'}" style="width:${100*values[index]/max}%" title="${n(values[index])} kWh · ${esc(row.quality)}"></b></i><strong>${n(values[index])} kWh</strong></div>`).join("")}</div>${incomplete.length?`<p class="warning">Partial classification excluded from bars: ${incomplete.map((row)=>esc(row.display_name)).join(", ")}. Meter and unknown energy remain in the table.</p>`:""}${rows.some((row)=>!row.available)?'<p class="warning">Unavailable equipment is excluded; total remains partial.</p>':""}`;
   }
 
   temperatureCard(role) {
     const source = this.representativeSource(role);
+    const label = role === "indoor" ? "Indoor" : "Outdoor";
+    if (!source) return `<article class="card temperature-card"><h2><ha-icon icon="${role === "indoor" ? "mdi:home-thermometer" : "mdi:thermometer-lines"}"></ha-icon>Representative ${label} Temperature</h2><div class="not-configured">Not configured</div><p class="muted">Select one ${role === "indoor" ? "indoor location" : "measured outdoor-air sensor"} in Settings → Devices & services → Home Energy Intelligence → Configure. No coverage percentage is inferred.</p></article>`;
     const today = source ? this.selectedRecord()?.temperatures?.[source.source_id] : null;
     const yesterday = source ? this.overviewData?.yesterday_full?.temperatures?.[source.source_id] : null;
-    const label = role === "indoor" ? "Indoor" : "Outdoor";
+    const diagnostic=(this.overviewData?.temperature_pipeline||[]).find((item)=>item.source_id===source.source_id)||{};
     const explanation = role === "indoor" ? "Selected location; not a whole-house mean." : "Selected measured source; not weather-provider data.";
     return `<article class="card temperature-card"><h2><ha-icon icon="${role === "indoor" ? "mdi:home-thermometer" : "mdi:thermometer-lines"}"></ha-icon>Representative ${label} Temperature</h2>
       <div class="temperature">${n(today?.latest_value)}${today?.latest_value == null ? "" : " °C"}</div>
-      <p class="muted">Latest valid: ${esc(today?.latest_timestamp || "unavailable")} · ${esc(explanation)}</p>
-      <div class="mini-stats"><span>Period mean <b>${n(today?.mean)} °C</b></span>${this.historyPreset==="today"?`<span>Yesterday mean <b>${n(yesterday?.mean)} °C</b></span>`:""}<span>Min / max <b>${n(today?.minimum)} / ${n(today?.maximum)} °C</b></span><span>Coverage <b>${n(today?.coverage_percent,0)}%</b></span><span>Quality <b>${esc(today?.quality || "missing")}</b></span></div>${this.historyPreset === "today" ? this.temperatureTimeline(role) : this.historyTemperatureTimeline(role)}</article>`;
+      <p class="muted">Source: ${esc(source.entity_id || source.source_id)} · latest valid: ${esc(today?.latest_timestamp || "unavailable")} · ${esc(explanation)}</p>
+      <div class="mini-stats"><span>Period mean <b>${n(today?.mean)} °C</b></span>${this.historyPreset==="today"?`<span>Yesterday mean <b>${n(yesterday?.mean)} °C</b></span>`:""}<span>Min / max <b>${n(today?.minimum)} / ${n(today?.maximum)} °C</b></span><span>Coverage <b>${today?.coverage_percent==null?"Unavailable":n(today.coverage_percent,0)+"%"}</b></span><span>Quality <b>${esc(today?.quality || diagnostic.pipeline_stage || "missing").replaceAll("_"," ")}</b></span></div>${today?.mean==null?`<p class="warning">Pipeline: ${esc(diagnostic.pipeline_stage||"not yet diagnosed").replaceAll("_"," ")} · live ${esc(diagnostic.live_state??"unavailable")} ${esc(diagnostic.live_unit||"")} · last update ${esc(diagnostic.live_last_updated||"unavailable")} · persisted hourly summaries ${n(diagnostic.persisted_hourly_summaries,0)}</p>`:""}${this.historyPreset === "today" ? this.temperatureTimeline(role) : this.historyTemperatureTimeline(role)}</article>`;
   }
 
   comparisonText(today, same, full, unit) {
@@ -279,7 +332,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       ${this.periodSummary()}
       <article class="card pv-history"><h2>PV and grid history</h2>${this.pvHistoryChart()}</article>
       <div class="grid temperature-history"><article class="card"><h2>Indoor temperature history</h2>${this.historyTemperatureTimeline("indoor")}</article><article class="card"><h2>Outdoor temperature history</h2>${this.historyTemperatureTimeline("outdoor")}</article></div>
-      ${this.recentTable(this.history)}<div class="pager"><button class="previous">Previous</button><span>Showing ${this.historyOffset + 1}–${this.historyOffset + this.history.length}</span><button class="next">Next</button></div></section>`;
+      ${this.recentTable(this.history)}<div class="pager"><button class="previous" ${this.historyOffset===0?"disabled":""}>Previous</button><span>Showing ${this.history.length?this.historyOffset+1:0}–${this.historyOffset+this.history.length} of ${this.historyTotal}</span><button class="next" ${this.historyOffset+this.history.length>=this.historyTotal?"disabled":""}>Next</button></div></section>`;
   }
 
   periodOptions() {
@@ -288,7 +341,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   periodControls() {
-    return `<div class="period"><label>Period <select class="period-select">${this.periodOptions()}</select></label><label>Older month <input class="older-month" type="month" value="${esc(this.historyOlderMonth || "")}"></label><label>From <input class="start-date" type="date" value="${esc(this.historyStart || "")}"></label><label>To <input class="end-date" type="date" value="${esc(this.historyEnd || "")}"></label><button class="apply-period">Apply</button></div>`;
+    return `<div class="period"><label>Period <select class="period-select">${this.periodOptions()}</select></label><label class="conditional ${this.historyPreset==="older_month"?"visible":""}">Older month <input class="older-month" type="month" value="${esc(this.historyOlderMonth || "")}"></label><label class="conditional ${this.historyPreset==="custom"?"visible":""}">From <input class="start-date" type="date" value="${esc(this.historyStart || "")}"></label><label class="conditional ${this.historyPreset==="custom"?"visible":""}">To <input class="end-date" type="date" value="${esc(this.historyEnd || "")}"></label><button class="apply-period">Apply</button></div>`;
   }
 
   historyTemperatureTimeline(role) {
@@ -317,8 +370,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const energy = this.historySummary?.energy;
     const coverage=this.historyCoverage || this.historySummary?.period_coverage;
     const dates=coverage?.date_coverage; const meter=coverage?.meter_coverage; const allocation=coverage?.allocation_coverage;
-    const temperatureLayers=Object.values(coverage?.temperature_coverage || {}); const temperatureCoverage=temperatureLayers.length?Math.min(...temperatureLayers.map((item)=>Number(item.coverage_percent||0))):null;
-    const heading=`<p><b>${esc(this.selectedPeriod?.label || "Selected period")}</b> · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")} · dates ${n(dates?.coverage_percent ?? coverage?.coverage_percent,0)}% · meter ${n(meter?.coverage_percent,0)}% · allocation ${n(allocation?.coverage_percent,0)}% · temperature ${n(temperatureCoverage,0)}% ${coverage?.complete?'<span class="quality good">Complete</span>':'<span class="quality partial">Partial</span>'}</p>`;
+    const representativeCoverage=(role)=>{const source=this.representativeSource(role);if(!source)return "Not configured";const item=coverage?.temperature_coverage?.[source.source_id];return item?`${n(item.coverage_percent,0)}%` : "Unavailable";};
+    const layer=(name,item,percent)=>`<span>${esc(name)} ${percent} <b class="quality ${esc(item?.quality || (item?.complete?"good":"partial"))}">${esc(item?.quality || (item?.complete?"good":"partial"))}</b></span>`;
+    const temperatureLayer=(role)=>{const source=this.representativeSource(role);if(!source)return `<span>${esc(role)} not configured</span>`;const item=coverage?.temperature_coverage?.[source.source_id];return layer(role,item,representativeCoverage(role));};
+    const heading=`<div class="quality-layers"><b>${esc(this.selectedPeriod?.label || "Selected period")}</b><span>${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}</span>${layer("dates",dates,n(dates?.coverage_percent ?? coverage?.coverage_percent,0)+"%")}${layer("meter",meter,n(meter?.coverage_percent,0)+"%")}${layer("allocation",allocation,allocation?.coverage_percent==null?"unknown":n(allocation.coverage_percent,0)+"%")} ${temperatureLayer("indoor")} ${temperatureLayer("outdoor")} ${this.quality({quality:coverage?.quality||"missing",quality_basis:coverage?.quality_basis})}</div>`;
     if(!energy)return `${heading}<div class="empty">No complete daily records in the selected period.</div>`;
     return `${heading}<div class="mini-stats period-summary"><span>Household <b>${n(energy.household_kwh)} kWh</b><small>Known ${n(this.historySummary?.known_household_kwh)} kWh</small></span><span>Heating <b>${n(energy.space_heating_kwh)} kWh</b><small>Known ${n(energy.known_space_heating_kwh)} kWh</small></span><span>DHW <b>${n(energy.dhw_kwh)} kWh</b></span><span>Heating + DHW <b>${n(energy.heating_and_dhw_kwh)} kWh</b></span><span>Cooling <b>${n(energy.cooling_kwh)} kWh</b></span><span>PV <b>${n(energy.pv_kwh)} kWh</b></span><span>Import / export <b>${n(energy.import_kwh)} / ${n(energy.export_kwh)} kWh</b></span></div>${coverage?.missing_dates?.length?`<p class="warning">Missing dates: ${coverage.missing_dates.map(esc).join(", ")}</p>`:""}`;
   }
@@ -326,10 +381,15 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   settingsView() {
     if (!this.settings) return `<section class="card page-card"><h2>Administrator access required</h2><p>Overview and History remain available. Integration mappings and database details are restricted to administrators.</p></section>`;
     if (!this.settings.configured) return `<section class="card page-card"><h2>Setup required</h2><p>Add the integration from Settings → Devices & services.</p></section>`;
+    const representative=(role)=>{const source=this.representativeSource(role);const item=source?this.selectedRecord()?.temperatures?.[source.source_id]:null;return source?`${esc(source.display_name)} · ${n(item?.latest_value)}${item?.latest_value==null?"":" °C"} · ${esc(item?.quality||"unavailable")} · ${esc(item?.latest_timestamp||"no validated timestamp")}`:"Not configured";};
+    const diagnosticRows=(this.temperatureDiagnostics?.sources||[]).map((row)=>`<tr><td>${esc(row.display_name)}<br>${row.configured&&row.enabled?"configured · enabled":"disabled or unavailable"}</td><td><code>${esc(row.source_id)}</code><br><code>${esc(row.entity_id)}</code><br>${row.attribute?`attribute <code>${esc(row.attribute)}</code>`:"entity state"}</td><td>${esc(row.live_state??"unavailable")} ${esc(row.live_unit||"")}<br>${esc(row.live_last_updated||"no update")}<br>${row.attribute_available?"attribute valid":"attribute unavailable"} · ${esc(row.unit_validation||"unknown unit")}</td><td>${row.recorder_state_rows||0} states / ${row.recorder_statistics_rows||0} statistics<br>${esc(row.available_start||"—")}–${esc(row.available_end||"—")}</td><td>${row.persisted_valid_hourly_summaries||0} hourly / ${row.persisted_valid_daily_summaries||0} daily<br>${n(row.persisted_hourly_coverage_percent,1)}% · ${row.missing_interval_count||0} missing</td><td>${esc(row.pipeline_stage).replaceAll("_"," ")}</td><td>${esc((row.invalid_reasons||[]).join(", ")||"—")}<br>${esc((row.rejected_samples||[]).map((item)=>item.reason).join(", ")||"—")}</td></tr>`).join("");
+    const diagnosticSetup=this.temperatureDiagnostics?.configuration_status==="not_configured"?'<p class="warning">No temperature source is configured. <a href="/config/integrations/integration/home_energy_intelligence">Open integration options</a> to add one; no source will be inferred.</p>':"";
     return `<section class="settings-grid">
-      <article class="card page-card"><h2>Processing</h2><dl><dt>Time zone</dt><dd>${esc(this.settings.timezone)}</dd><dt>Cycle</dt><dd>${esc(this.settings.cycle_hours)} hours</dd><dt>Floor area</dt><dd>${n(this.settings.floor_area_m2, 0)} m²</dd><dt>Database</dt><dd>${n(this.settings.database_size_bytes / 1024, 0)} KiB</dd><dt>InfluxDB backfill</dt><dd>${this.settings.influx_enabled ? "Enabled (read-only)" : "Disabled"}</dd></dl>
+      <article class="card page-card"><h2>Processing</h2><dl><dt>Time zone</dt><dd>${esc(this.settings.timezone)}</dd><dt>Cycle</dt><dd>${esc(this.settings.cycle_hours)} hours</dd><dt>Floor area</dt><dd>${n(this.settings.floor_area_m2, 0)} m²</dd><dt>Database</dt><dd>${n(this.settings.database_size_bytes / 1024, 0)} KiB</dd><dt>Schema</dt><dd>v${esc(this.settings.storage?.schema_version)} / v${esc(this.settings.storage?.target_schema_version)}</dd><dt>Startup compaction</dt><dd>${this.settings.storage?.startup_vacuum_enabled ? "Enabled" : "Disabled"}</dd><dt>Backup policy</dt><dd>Protected SQLite backup recommended before migration</dd><dt>InfluxDB backfill</dt><dd>${this.settings.influx_enabled ? "Enabled (read-only)" : "Disabled"}</dd></dl>
       <a class="primary" href="/config/integrations/integration/home_energy_intelligence">Open integration options</a></article>
       <article class="card page-card"><h2>Entity mapping</h2><div class="mapping">${this.settings.mapping.map((row) => `<div><span>${esc(row.label)}</span><code>${row.entity_id ? esc(row.entity_id) : "Not selected"}</code></div>`).join("")}</div></article>
+      <article class="card page-card notice"><h2>Representative temperatures</h2><p><b>Indoor:</b> ${representative("indoor")}</p><p><b>Measured outdoor:</b> ${representative("outdoor")}</p><p class="muted">Selections are independent. A weather provider or water-circuit sensor is never substituted.</p></article>
+      <article class="card page-card notice"><h2>Temperature pipeline diagnostics</h2><p>Bounded to the last 31 local days. Recorder and SQLite are read-only during diagnosis.</p><p><button class="primary temperature-diagnostics">Load diagnostics</button> <button class="primary temperature-repair">Repair missing summaries</button></p>${this.temperatureRepairResult?`<p class="quality ${this.temperatureRepairResult.error_count?"partial":"good"}">Processed ${this.temperatureRepairResult.processed_days} day(s); updated ${this.temperatureRepairResult.changed_hourly_records} hourly and ${this.temperatureRepairResult.changed_daily_records} daily record(s); skipped ${this.temperatureRepairResult.sources_skipped_complete||0} complete source/day(s); ${this.temperatureRepairResult.error_count||0} error(s).</p>`:""}${diagnosticSetup}${this.temperatureDiagnostics?`<div class="table-wrap"><table><thead><tr><th>Source</th><th>IDs</th><th>Live</th><th>Recorder range</th><th>Persisted</th><th>Stage</th><th>Invalid/rejected</th></tr></thead><tbody>${diagnosticRows}</tbody></table></div><p class="muted">Missing interval details are retained by the diagnostic API (up to 200 per source). Diagnostics never fabricate or repair data.</p>`:'<p class="muted">Load diagnostics to locate the first missing stage without rebuilding the database.</p>'}</article>
        <article class="card page-card notice"><h2>Data guarantees</h2><p>Recorder is read-only. Unknown heat-pump operation is reported as assumed heating, idle remains separate, gaps remain gaps, and unrelated circuit sensors are never substituted.</p></article>
     </section>`;
   }
@@ -340,7 +400,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if (this.active === "overview") return this.overview();
     if (this.active === "history") return this.historyView();
     if (this.active === "settings") return this.settingsView();
-    if (this.active === "thermal") return this.roadmap("House Thermal Profile", "Planned for V0.2", "Building-level response curves will combine Ecodan and AC space heating while excluding DHW.");
+    if (this.active === "thermal") return this.thermalView();
     if (this.active === "cop") return this.roadmap("COP & Efficiency", "Planned for V0.2", "COP requires separately measured or entered thermal energy; it is not calculated from electricity alone.");
     return this.roadmap("Forecasts", "Planned for V0.3", "Weather-dependent energy forecasts and uncertainty bands are intentionally deferred.");
   }
@@ -354,8 +414,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelector(".refresh")?.addEventListener("click", () => this.refreshNow());
     this.shadowRoot.querySelector(".csv")?.addEventListener("click", () => this.exportCsv());
     this.shadowRoot.querySelector(".apply-period")?.addEventListener("click", () => { this.historyOffset=0; this.loadPeriod(); });
+    this.shadowRoot.querySelector(".period-select")?.addEventListener("change", (event) => { this.historyPreset=event.target.value; this.render(); });
+    this.shadowRoot.querySelector(".older-month")?.addEventListener("input", (event) => { this.historyOlderMonth=event.target.value; });
+    this.shadowRoot.querySelector(".start-date")?.addEventListener("input", (event) => { this.historyStart=event.target.value; });
+    this.shadowRoot.querySelector(".end-date")?.addEventListener("input", (event) => { this.historyEnd=event.target.value; });
     this.shadowRoot.querySelector(".next")?.addEventListener("click", () => { this.historyOffset += 90; this.loadPeriod(); });
     this.shadowRoot.querySelector(".previous")?.addEventListener("click", () => { this.historyOffset = Math.max(0, this.historyOffset - 90); this.loadPeriod(); });
+    this.shadowRoot.querySelector(".temperature-diagnostics")?.addEventListener("click", () => this.loadTemperatureDiagnostics());
+    this.shadowRoot.querySelector(".temperature-repair")?.addEventListener("click", () => this.repairTemperatureHistory());
   }
 
   async loadPeriod() {
@@ -365,8 +431,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.historyOlderMonth = this.shadowRoot.querySelector(".older-month")?.value || null;
     try {
       const response = await this._hass.callWS(this.historyRequest());
+      if ((response.total || 0) > 0 && !response.records?.length && this.historyOffset > 0) {
+        this.historyOffset=Math.floor(((response.total||1)-1)/90)*90;
+        return this.loadPeriod();
+      }
       this.history = response.records || []; this.historySummary = response.summary;
+      this.historyTotal = response.total || 0;
       this.historyCoverage = response.period_coverage;
+      this.responseProfileData = response.response_profile;
       this.selectedPeriod = response.selected_period; this.refreshError=null; this.render();
     } catch(error) { this.refreshError=error?.message || String(error); this.render(); }
   }
@@ -374,6 +446,16 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   async refreshNow() {
     try { await this._hass.callWS({type:"home_energy_intelligence/refresh"}); this.refreshError=null; await this.load(); }
     catch(error) { this.refreshError=error?.message || String(error); if(this.overviewData)this.overviewData.stale=true; this.loading=false; this.render(); }
+  }
+
+  async loadTemperatureDiagnostics() {
+    try { this.temperatureDiagnostics=await this._hass.callWS({type:"home_energy_intelligence/temperature_diagnostics"});this.refreshError=null;this.render(); }
+    catch(error){this.refreshError=error?.message||String(error);this.render();}
+  }
+
+  async repairTemperatureHistory() {
+    try { this.temperatureRepairResult=await this._hass.callWS({type:"home_energy_intelligence/reprocess_temperature_history"});this.temperatureDiagnostics=null;await this.load(false);await this.loadTemperatureDiagnostics(); }
+    catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
   async exportCsv() {
@@ -388,9 +470,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     :host{display:block;background:var(--primary-background-color,#f4f7fb);color:var(--primary-text-color,#17233b);min-height:100%;font-family:var(--paper-font-body1_-_font-family,Inter,system-ui,sans-serif)}
     *{box-sizing:border-box} main{max-width:1600px;margin:auto;padding:24px 26px 40px} header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:14px}.brand{display:flex;align-items:center;gap:18px}.brand>ha-icon{--mdc-icon-size:62px;color:#0984d8}.brand h1{font-size:34px;line-height:1;margin:0;color:var(--primary-text-color,#111827)}.brand p{margin:6px 0 0;font-size:18px;color:var(--secondary-text-color,#65728a)}.connection{display:flex;align-items:center;gap:10px}.connection i{width:12px;height:12px;border-radius:50%;background:#20a35a}.connection div{display:flex;flex-direction:column}.connection span{font-size:12px;color:var(--secondary-text-color,#65728a);margin-top:4px}
     .tabs{display:flex;gap:20px;border-bottom:1px solid var(--divider-color,#dce4ee);overflow-x:auto}.tab{display:flex;align-items:center;gap:10px;border:0;border-bottom:3px solid transparent;background:none;color:var(--secondary-text-color,#41506a);padding:18px 14px;font-size:15px;white-space:nowrap;cursor:pointer}.tab.active{color:var(--primary-color,#0785db);border-bottom-color:var(--primary-color,#0785db);font-weight:700}.content{padding-top:22px}.toolbar,.period,.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.toolbar>div{display:flex;flex-direction:column}.toolbar span{font-size:12px;color:var(--secondary-text-color,#65728a)}.period{justify-content:flex-start;flex-wrap:wrap;padding:12px;background:var(--secondary-background-color,#f2f6fa);border-radius:8px}.period label{display:flex;gap:6px;align-items:center}.card{background:var(--card-background-color,#fff);border:1px solid var(--divider-color,#e0e7ef);border-radius:12px;box-shadow:0 3px 12px rgba(35,65,100,.05);padding:18px;min-width:0}.card h2{display:flex;align-items:center;gap:10px;font-size:17px;margin:0 0 16px}.card h2 ha-icon{color:#233b5b}.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:18px}.kpi{display:flex;gap:13px;align-items:flex-start}.kpi-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:50%;flex:none}.kpi-icon.blue{color:#0785db;background:#e7f4fe}.kpi-icon.red{color:#ef4444;background:#fff0f0}.kpi-icon.orange{color:#f59e0b;background:#fff6e5}.kpi-icon.amber{color:#f6a800;background:#fff8df}.kpi-icon.green{color:#159b5b;background:#eaf9f1}.kpi-icon ha-icon{--mdc-icon-size:27px}.kpi>div:last-child{display:flex;flex-direction:column;min-width:0}.kpi span{font-size:14px;line-height:1.3}.kpi strong{font-size:24px;margin-top:3px;white-space:nowrap}.kpi small{color:var(--secondary-text-color,#65728a);margin-top:7px}.grid{display:grid;gap:14px;margin-bottom:14px}.top-grid{grid-template-columns:1.3fr 1fr .85fr}.bottom-grid{grid-template-columns:1fr .95fr 1.35fr}.wide{min-width:0}.chart{width:100%;height:220px}.chart line{stroke:var(--divider-color,#dbe4ee);stroke-width:1}.chart text{font-size:11px;fill:var(--secondary-text-color,#66758d)}.chart circle{fill:#46a4ef;stroke:#fff;stroke-width:2}.temp-chart{width:100%;height:85px;margin-top:10px}.temp-line{fill:none;stroke-width:2}.temp-line.t0{stroke:#ef4444}.temp-line.t1{stroke:#238ee8}.temp-line.t2{stroke:#f59e0b}.temp-line.t3{stroke:#159b5b}.bars{height:185px;border-bottom:1px solid var(--divider-color,#dbe4ee);display:flex;align-items:flex-end;justify-content:space-around;gap:10px;padding:10px 10px 0}.bar-col{height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px;font-size:11px;color:var(--secondary-text-color,#65728a)}.bar{width:26px;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px 3px 0 0;overflow:hidden;background:#eef2f6}.seg{display:block;width:100%}.heat{background:#ef4444}.dhw{background:#f59e0b}.cool{background:#238ee8}.idle{background:#8b9bb0}.other{background:#91c788}.unknown{background:#8b5cf6}.legend{display:flex;justify-content:center;align-items:center;gap:7px;font-size:12px;margin-top:12px;flex-wrap:wrap}.dot{width:10px;height:10px;border-radius:2px;margin-left:8px}.upcoming{min-height:150px;border-radius:10px;background:linear-gradient(145deg,#f1f8ff,#e9f4fc);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px;color:#2269a5;padding:18px}.upcoming span{font-size:13px;color:#496980}.temperature{font-size:34px;font-weight:700;margin:12px 0}.muted{color:var(--secondary-text-color,#65728a);font-size:13px}.mini-stats{display:flex;gap:20px;border-top:1px solid var(--divider-color,#e0e7ef);padding-top:14px}.mini-stats span{display:flex;flex-direction:column;color:var(--secondary-text-color,#65728a);font-size:12px}.mini-stats b{color:var(--primary-text-color,#17233b);margin-top:4px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{background:var(--secondary-background-color,#f2f6fa);text-align:left}th,td{padding:9px 8px;border-bottom:1px solid var(--divider-color,#e4eaf0);white-space:nowrap}.quality{display:inline-flex;padding:3px 7px;border-radius:12px;background:#eef2f6;text-transform:capitalize}.quality.good{background:#e5f7ed;color:#08743d}.quality.partial,.quality.filtered{background:#fff4d6;color:#8a5900}.quality.missing,.quality.unreconciled{background:#ffe9e8;color:#a82e28}.empty{min-height:150px;display:grid;place-items:center;text-align:center;color:var(--secondary-text-color,#65728a);padding:20px}.status-card{min-width:0}.roadmap{max-width:720px;margin:50px auto;text-align:center;padding:54px}.roadmap>ha-icon{--mdc-icon-size:64px;color:var(--primary-color,#0785db)}.roadmap h2{display:block;font-size:28px;margin-top:18px}.roadmap b{color:var(--primary-color,#0785db)}.roadmap p{color:var(--secondary-text-color,#65728a)}.page-card{padding:24px}.section-head{display:flex;justify-content:space-between;align-items:center}.section-head p{margin:4px 0 18px;color:var(--secondary-text-color,#65728a)}button.refresh,button.csv,button.apply-period,button.previous,button.next,.primary{border:0;border-radius:8px;background:var(--primary-color,#0785db);color:#fff;padding:10px 15px;text-decoration:none;cursor:pointer}.settings-grid{display:grid;grid-template-columns:1fr 1.6fr;gap:16px}.notice{grid-column:1/-1}dl{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px}dt{color:var(--secondary-text-color,#65728a)}dd{margin:0;text-align:right;font-weight:600}.mapping{display:grid;gap:1px;background:var(--divider-color,#e0e7ef);border:1px solid var(--divider-color,#e0e7ef);border-radius:8px;overflow:hidden}.mapping>div{display:grid;grid-template-columns:1fr 1.25fr;gap:12px;background:var(--card-background-color,#fff);padding:10px}.mapping code{color:var(--secondary-text-color,#65728a);overflow-wrap:anywhere}.loading{display:grid;place-items:center;gap:12px;padding:100px}.error{padding:18px;border-radius:10px;background:#ffe9e8;color:#a82e28}
-    .other-hvac{background:#14b8a6}.missing{color:#a82e28;background:#ffe9e8}.warning,.discrepancy{color:#b45309}.equipment-charts{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px}.device-bars>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 65px;gap:10px;align-items:center;margin:8px 0}.device-bars i{height:12px;background:#eef2f6;border-radius:6px;overflow:hidden}.device-bars i b{display:block;height:100%}.pv-chart{width:100%;height:220px}.pv-chart .pv{fill:#f6a800}.pv-chart .grid-import{fill:#238ee8}.pv-chart .grid-export{fill:#8b5cf6}.pv-chart .self-use{fill:#159b5b}.pv-chart .household{fill:#8b9bb0}
+    .other-hvac{background:#14b8a6}.missing{color:#a82e28;background:#ffe9e8}.not-configured{font-size:24px;font-weight:700;color:var(--secondary-text-color,#65728a);margin:22px 0}.warning,.discrepancy{color:#b45309}.split-quality{display:flex;flex-direction:column;gap:3px;align-items:center}.quality.temperature-missing{background:#eef2f6;color:#56657a}.quality.unknown{background:#eef2f6;color:#56657a}.quality-layers{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:0 0 14px}.quality-layers>span{white-space:nowrap}.equipment-charts{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px}.device-bars>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr 65px;gap:10px;align-items:center;margin:8px 0}.device-bars i{height:12px;background:#eef2f6;border-radius:6px;overflow:hidden}.device-bars i b{display:block;height:100%}.pv-chart{width:100%;height:220px}.pv-chart .pv{fill:#f6a800}.pv-chart .grid-import{fill:#238ee8}.pv-chart .grid-export{fill:#8b5cf6}.pv-chart .self-use{fill:#159b5b}.pv-chart .household{fill:#8b9bb0}
     @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.top-grid,.bottom-grid{grid-template-columns:1fr 1fr}.status-card,.bottom-grid .wide{grid-column:1/-1}}
-    @media(max-width:760px){main{padding:16px 12px}.brand>ha-icon{--mdc-icon-size:42px}.brand h1{font-size:23px}.brand p{font-size:13px}.connection{display:none}.tabs{gap:2px}.tab{padding:13px 11px}.tab span{display:none}.kpis{grid-template-columns:1fr}.top-grid,.bottom-grid,.settings-grid,.equipment-charts{grid-template-columns:1fr}.status-card,.bottom-grid .wide,.notice{grid-column:auto}.section-head{align-items:flex-start}.mapping>div{grid-template-columns:1fr}.mini-stats{flex-wrap:wrap}.device-bars>div{grid-template-columns:1fr}.period{align-items:stretch}.period label{justify-content:space-between}}
+    .period .conditional{display:none}.period .conditional.visible{display:flex}button:disabled{opacity:.45;cursor:not-allowed}
+    @media(max-width:800px){main{padding:12px 9px}.brand>ha-icon{--mdc-icon-size:42px}.brand h1{font-size:23px}.brand p{font-size:13px}.connection{display:none}.tabs{gap:2px}.tab{padding:13px 11px;min-height:44px}.tab span{display:none}.kpis{grid-template-columns:1fr}.top-grid,.bottom-grid,.settings-grid,.equipment-charts{grid-template-columns:1fr}.status-card,.bottom-grid .wide,.notice{grid-column:auto}.section-head{align-items:flex-start}.mapping>div{grid-template-columns:1fr}.mini-stats{flex-wrap:wrap}.device-bars>div{grid-template-columns:1fr}.period{align-items:stretch;flex-direction:column}.period label{justify-content:space-between}.period input,.period select,.period button,.toolbar button,.pager button,.primary{min-height:44px}.card{padding:14px}.chart,.pv-chart{height:180px}.bars{height:120px}.empty,.upcoming{min-height:72px}.table-wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.table-wrap th:first-child,.table-wrap td:first-child{position:sticky;left:0;background:var(--card-background-color,#fff);z-index:1}.table-wrap th:first-child{background:var(--secondary-background-color,#f2f6fa)}.pager{flex-wrap:wrap}.pager span{order:-1;width:100%;text-align:center}}
   `;
 }
 

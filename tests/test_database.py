@@ -1,8 +1,43 @@
 from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 import sqlite3
+from threading import Barrier
+import time
+import tracemalloc
 
+import pytest
+
+from custom_components.home_energy_intelligence.analytics import heating_response_profile
 from custom_components.home_energy_intelligence.database import EnergyDatabase, protected_export_path
 from custom_components.home_energy_intelligence.models import DailyRecord
+
+
+def logical_daily_checksum(db, local_date):
+    payload = db.daily(local_date)
+    payload.pop("revision", None)
+    payload.pop("updated_at", None)
+    serialized = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def make_v3_inline_database(db, daily_payload):
+    """Convert a test v4 database to the inline temperature shape used by v3."""
+    serialized = json.dumps(
+        daily_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    checksum = hashlib.sha256(serialized.encode()).hexdigest()
+    with db.connect() as connection:
+        connection.execute("DELETE FROM temperature_summaries")
+        connection.execute("DELETE FROM hourly_temperature_rejections")
+        connection.execute(
+            "UPDATE daily_records SET payload_json=?,checksum=? WHERE local_date=?",
+            (serialized, checksum, daily_payload["local_date"]),
+        )
+        connection.execute("UPDATE schema_version SET version=3")
 
 
 def record(value=10.0):
@@ -33,6 +68,364 @@ def test_corrupt_database_is_preserved_and_recovered(tmp_path):
     assert recovered is not None and recovered.exists()
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    large_value = "x" * 1_000_000
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "minimum": -2.0, "maximum": 9.0,
+        "coverage_seconds": 89900, "period_seconds": 90000,
+        "coverage_percent": 99.888, "quality": "filtered", "rejected_count": 1,
+        "rejections": [{
+            "timestamp": "2026-10-25T01:00:00+00:00", "value": large_value,
+            "reason": "invalid_sentinel", "duration_seconds": 100,
+            "source": "recorder",
+        }],
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }, "indoor-unit": {
+        "mean": None, "minimum": None, "maximum": None,
+        "coverage_seconds": 0, "period_seconds": 90000,
+        "coverage_percent": 0, "quality": "missing", "rejected_count": 1,
+        "rejected_reasons": ["incompatible_temperature_unit:72"],
+        "rejections": [],
+        "source_provenance": {"entity_id": "sensor.indoor", "source_id": "indoor-unit"},
+    }}
+    assert db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    with db.connect() as connection:
+        revision_rows = connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]
+        rejection_rows = connection.execute(
+            "SELECT COUNT(*) FROM rejected_readings"
+        ).fetchone()[0]
+    make_v3_inline_database(db, logical)
+
+    db.initialize()
+    migrated = db.daily(item.local_date)
+    migrated.pop("revision")
+    migrated.pop("updated_at")
+    assert migrated == logical
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        raw = connection.execute("SELECT payload_json FROM daily_records").fetchone()[0]
+        assert "temperatures" not in json.loads(raw)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == revision_rows
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rejected_readings"
+        ).fetchone()[0] == rejection_rows
+    logical_bytes = len(json.dumps(logical, separators=(",", ":")).encode())
+    # Startup intentionally does not VACUUM.  The live DB plus WAL may briefly
+    # retain old pages, but migration remains bounded and does not duplicate the
+    # logical payload without limit.
+    assert db.size_bytes() < logical_bytes * 3
+    before = db.size_bytes()
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"] == logical["temperatures"]
+    assert db.size_bytes() == before
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_every_supported_legacy_schema_upgrades_losslessly_and_idempotently(
+    tmp_path, legacy_version,
+):
+    db = EnergyDatabase(tmp_path / f"v{legacy_version}.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 6.5, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        if legacy_version < 3:
+            connection.execute("DROP TABLE hourly_records")
+        if legacy_version == 1:
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN source")
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN duration_seconds")
+        connection.execute("UPDATE schema_version SET version=?", (legacy_version,))
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 6.5
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+    before = db.size_bytes()
+    db.initialize()
+    assert db.size_bytes() == before
+
+
+def test_v4_migration_streams_thousands_of_daily_and_hourly_rows(tmp_path):
+    db = EnergyDatabase(tmp_path / "large-v3.sqlite3")
+    db.initialize()
+    base = datetime(2020, 1, 1, tzinfo=UTC)
+    with db.connect() as connection:
+        now = datetime.now(UTC).isoformat()
+        for index in range(1200):
+            stamp = base + timedelta(days=index)
+            local_date = stamp.date().isoformat()
+            payload = {
+                "local_date": local_date, "timezone": "UTC",
+                "period_start_utc": stamp.isoformat(),
+                "period_end_utc": (stamp + timedelta(days=1)).isoformat(),
+                "day_seconds": 86400, "household_kwh": 1.0,
+                "temperatures": {"outdoor": {
+                    "mean": 5.0, "coverage_seconds": 86400,
+                    "period_seconds": 86400, "coverage_percent": 100,
+                    "quality": "good", "rejections": [],
+                    "source_provenance": {"entity_id": "sensor.outdoor"},
+                }}, "allocations": {}, "provenance": {}, "quality": "good",
+            }
+            serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            connection.execute(
+                "INSERT INTO daily_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (local_date, "UTC", stamp.isoformat(),
+                 (stamp + timedelta(days=1)).isoformat(), 86400, 1.0,
+                 None, None, None, None, "good", serialized,
+                 hashlib.sha256(serialized.encode()).hexdigest(), 1, now),
+            )
+            hour = stamp + timedelta(hours=1)
+            hour_payload = {
+                **payload, "period_start_utc": hour.isoformat(),
+                "period_end_utc": (hour + timedelta(hours=1)).isoformat(),
+                "day_seconds": 3600,
+            }
+            hour_serialized = json.dumps(
+                hour_payload, separators=(",", ":"), sort_keys=True
+            )
+            connection.execute(
+                "INSERT INTO hourly_records VALUES (?,?,?,?,?,?,?,?)",
+                (hour.isoformat(), (hour + timedelta(hours=1)).isoformat(),
+                 local_date, "UTC", hour_serialized,
+                 hashlib.sha256(hour_serialized.encode()).hexdigest(), "good", now),
+            )
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        connection.execute("UPDATE schema_version SET version=3")
+    tracemalloc.start()
+    db.initialize()
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024
+    with db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 2400
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+
+
+def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_v4 BEFORE INSERT ON temperature_summaries
+            BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="injected migration failure"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        raw = json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+        assert raw["temperatures"]["outdoor"]["mean"] == 5.0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_v4_schema_creation_failure_rolls_back_new_tables_and_version(
+    tmp_path, monkeypatch, legacy_version,
+):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / f"failed-v{legacy_version}.sqlite3")
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("DROP TABLE hourly_temperature_rejections")
+        connection.execute("DROP TABLE temperature_summaries")
+        if legacy_version < 3:
+            connection.execute("DROP TABLE hourly_records")
+        if legacy_version == 1:
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN source")
+            connection.execute("ALTER TABLE rejected_readings DROP COLUMN duration_seconds")
+        connection.execute("UPDATE schema_version SET version=?", (legacy_version,))
+    monkeypatch.setattr(
+        database_module, "MIGRATION_4",
+        database_module.MIGRATION_4 + "\nCREATE TABL deliberately_invalid;",
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == legacy_version
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('temperature_summaries','hourly_temperature_rejections')"
+        ).fetchone()[0] == 0
+        if legacy_version < 3:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hourly_records'"
+            ).fetchone()[0] == 0
+
+
+def test_v4_failure_before_version_bump_rolls_back_payload_conversion(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    with db.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_version BEFORE UPDATE OF version ON schema_version
+            BEGIN SELECT RAISE(ABORT, 'version bump failed'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="version bump failed"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert "temperatures" in json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+        assert connection.execute(
+            "SELECT COUNT(*) FROM temperature_summaries"
+        ).fetchone()[0] == 0
+
+
+def test_v4_disk_full_failure_is_retryable_and_preserves_v3(tmp_path, monkeypatch):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.outdoor"},
+    }}
+    db.upsert_daily(item)
+    logical = db.daily(item.local_date)
+    logical.pop("revision")
+    logical.pop("updated_at")
+    make_v3_inline_database(db, logical)
+    original = database_module._store_normalized_temperatures
+    monkeypatch.setattr(
+        database_module, "_store_normalized_temperatures",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database or disk is full")
+        ),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert "temperatures" in json.loads(connection.execute(
+            "SELECT payload_json FROM daily_records"
+        ).fetchone()[0])
+    monkeypatch.setattr(database_module, "_store_normalized_temperatures", original)
+    db.initialize()
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 5.0
+
+
+def test_locked_database_is_not_renamed_as_corrupt(tmp_path, monkeypatch):
+    path = tmp_path / "energy.sqlite3"
+    db = EnergyDatabase(path)
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("UPDATE schema_version SET version=3")
+    monkeypatch.setattr(EnergyDatabase, "CONNECT_TIMEOUT_SECONDS", 0.01)
+    blocker = sqlite3.connect(path)
+    blocker.execute("PRAGMA journal_mode=WAL")
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db.initialize()
+        assert path.exists()
+        assert not list(tmp_path.glob("*.corrupt-*.sqlite3"))
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_storage_status_discloses_safe_maintenance_policy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    status = db.storage_status()
+    assert status["schema_version"] == 4
+    assert status["migration_required"] is False
+    assert status["startup_vacuum_enabled"] is False
+    assert status["backup_method"] == "protected_sqlite_online_backup"
+
+
+def test_temperature_repair_immediately_qualifies_response_without_energy_rebuild(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.quality = "partial"
+    item.allocations = {"hp": {
+        "meter_kwh": 4.0, "categories": {"confirmed_heating": 4.0},
+        "covered_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good",
+    }}
+    db.upsert_daily(item)
+    equipment = [{
+        "equipment_id": "hp", "display_name": "Heat pump",
+        "kind": "heat_pump", "enabled": True,
+    }]
+    before = heating_response_profile(
+        [db.daily(item.local_date)], equipment, outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+    )["points"][0]
+    assert before["status"] == "excluded"
+    assert "outdoor_temperature_unavailable" in before["exclusion_reasons"]
+    summary = {
+        "mean": 5.0, "minimum": 2.0, "maximum": 8.0,
+        "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    assert db.merge_daily_temperatures(
+        item.local_date, {"outdoor": summary}, {"source": "test"}
+    )
+    after = heating_response_profile(
+        [db.daily(item.local_date)], equipment, outdoor_source_id="outdoor",
+        outdoor_source_is_measured_air=True, floor_area_m2=180,
+    )["points"][0]
+    assert after["status"] == "validated"
+    assert after["heating_electricity_kwh"] == 4.0
 
 
 def test_compact_growth_for_ten_years(tmp_path):
@@ -101,6 +494,119 @@ def test_mapping_revisions_preserve_source_replacement_history(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM mapping_revisions").fetchone()[0] == 2
 
 
+def test_temperature_mapping_applicability_verifies_entity_attribute_role_and_interval(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    old = {
+        "effective_at": "2026-01-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor_old",
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }],
+    }
+    new = {
+        "effective_at": "2026-02-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor_new",
+            "attribute": "temperature", "role": "outdoor", "enabled": True,
+        }],
+    }
+    assert db.store_mapping_revision(old)
+    assert db.store_mapping_revision(new)
+    old_identity = {
+        "entity_id": "sensor.outdoor_old", "attribute": None, "role": "outdoor",
+    }
+    valid = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 15, tzinfo=UTC),
+        datetime(2026, 1, 16, tzinfo=UTC), old_identity,
+    )
+    assert valid["eligible"] is True
+    assert valid["mapping_effective_end"] == "2026-02-01T00:00:00+00:00"
+    crossing = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 31, tzinfo=UTC),
+        datetime(2026, 2, 2, tzinfo=UTC), old_identity,
+    )
+    assert crossing["reason"] == "mapping_changes_within_interval"
+    remapped = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), old_identity,
+    )
+    assert remapped["reason"] == "mapping_entity_id_changed"
+    changed_attribute = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor_new", "attribute": None, "role": "outdoor",
+        },
+    )
+    assert changed_attribute["reason"] == "mapping_attribute_changed"
+    changed_role = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 2, tzinfo=UTC),
+        datetime(2026, 2, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor_new", "attribute": "temperature", "role": "indoor",
+        },
+    )
+    assert changed_role["reason"] == "mapping_role_changed"
+
+
+def test_legacy_mapping_without_attribute_cannot_authorize_historical_repair(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.store_mapping_revision({
+        "effective_at": "2026-01-01T00:00:00+00:00", "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": "sensor.outdoor",
+            "role": "outdoor", "enabled": True,
+        }],
+    })
+    result = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 2, tzinfo=UTC),
+        datetime(2026, 1, 3, tzinfo=UTC), {
+            "entity_id": "sensor.outdoor", "attribute": None, "role": "outdoor",
+        },
+    )
+    assert result["eligible"] is False
+    assert result["reason"] == "historical_mapping_attribute_unknown"
+
+
+def test_unverified_mapping_cannot_fill_absent_summary_or_change_energy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    db.upsert_daily(item)
+    with db.connect() as connection:
+        before = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records WHERE local_date=?",
+            (item.local_date,),
+        ).fetchone()
+        allocations_before = connection.execute(
+            "SELECT COUNT(*) FROM allocations WHERE local_date=?", (item.local_date,)
+        ).fetchone()[0]
+    candidate = {
+        "mean": 5.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {
+            "entity_id": "sensor.current", "attribute": None, "role": "outdoor",
+            "mapping_effective_at": "2026-10-26T00:00:00+00:00",
+        },
+    }
+    assert not db.merge_daily_temperatures(
+        item.local_date, {"outdoor": candidate},
+        {"mapping_applicability": {}},
+    )
+    with db.connect() as connection:
+        after = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records WHERE local_date=?",
+            (item.local_date,),
+        ).fetchone()
+        allocations_after = connection.execute(
+            "SELECT COUNT(*) FROM allocations WHERE local_date=?", (item.local_date,)
+        ).fetchone()[0]
+    assert tuple(after) == tuple(before)
+    assert allocations_after == allocations_before
+
+
 def test_realistic_ten_year_checkpoint_volume_remains_compact(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
@@ -159,7 +665,7 @@ def test_hourly_records_are_idempotent_bounded_and_dst_safe(tmp_path):
     rows = db.hourly_range(start, start + timedelta(hours=25))
     assert len(rows) == 25
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_bounded_history_pagination(tmp_path):
@@ -196,6 +702,374 @@ def test_poor_hour_can_be_reprocessed_after_late_recorder_data(tmp_path):
     assert db.upsert_hourly(corrected)
     assert not db.hourly_needs_reprocess(start, end, include_partial=True)
     assert db.hourly_range(start, end)[0]["household_kwh"] == 2.5
+
+
+def test_temperature_history_repair_is_idempotent_and_preserves_energy(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {
+        "indoor": {"mean": 21.2, "coverage_seconds": 90000, "quality": "good"},
+    }
+    assert db.upsert_daily(item)
+    start = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    hourly = {
+        "local_date": "2026-10-25", "timezone": "Europe/Ljubljana",
+        "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+        "day_seconds": 3600, "household_kwh": 1.2, "quality": "partial",
+        "temperatures": {}, "allocations": {}, "provenance": {},
+    }
+    assert db.upsert_hourly(hourly)
+    recovered = {
+        "indoor": {"mean": 99, "coverage_seconds": 100, "quality": "partial"},
+        "outdoor": {
+            "mean": 8.2, "minimum": 7.8, "maximum": 8.7,
+            "coverage_seconds": 90000, "period_seconds": 90000,
+            "coverage_percent": 100, "latest_value": 8.4,
+            "latest_timestamp": "2026-10-25T22:00:00+00:00", "quality": "good",
+            "rejections": [], "period_start_utc": item.period_start_utc,
+            "period_end_utc": item.period_end_utc,
+            "source_provenance": {
+                "entity_id": "sensor.outdoor", "source_id": "outdoor",
+                "attribute": None, "role": "outdoor",
+            },
+        },
+    }
+    assert db.merge_daily_temperatures("2026-10-25", recovered, {"source": "test"})
+    repaired = db.daily("2026-10-25")
+    assert repaired["household_kwh"] == 42.631
+    assert repaired["allocations"]["ecodan"]["categories"]["confirmed_heating"] == 4
+    assert repaired["temperatures"]["indoor"]["mean"] == 21.2
+    assert repaired["temperatures"]["outdoor"]["mean"] == 8.2
+    assert not db.merge_daily_temperatures("2026-10-25", recovered, {"source": "test"})
+
+    hourly_temperature = {
+        "mean": 8.1, "coverage_seconds": 3600, "period_seconds": 3600,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    assert db.merge_hourly_temperatures(
+        start, end, {"outdoor": hourly_temperature}, {"source": "test"}
+    )
+    repaired_hour = db.hourly_range(start, end)[0]
+    assert repaired_hour["household_kwh"] == 1.2
+    assert repaired_hour["temperatures"]["outdoor"]["mean"] == 8.1
+    assert not db.merge_hourly_temperatures(
+        start, end, {"outdoor": hourly_temperature}, {"source": "test"}
+    )
+
+
+def test_temperature_repair_does_not_route_through_general_daily_upsert_or_touch_auxiliary_rows(
+    tmp_path, monkeypatch,
+):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {"indoor": {
+        "mean": 21, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+    }}
+    item.allocations["ecodan"]["rejected_count"] = 2
+    db.upsert_daily(item)
+    with db.connect() as connection:
+        allocations_before = [tuple(row) for row in connection.execute(
+            "SELECT * FROM allocations ORDER BY device,category"
+        )]
+        connection.execute(
+            "INSERT INTO rejected_readings(local_date,entity_key,reason) VALUES (?,?,?)",
+            (item.local_date, "ecodan", "equipment_power_rejected"),
+        )
+        rejections_before = [tuple(row) for row in connection.execute(
+            "SELECT local_date,entity_key,reason FROM rejected_readings ORDER BY id"
+        )]
+    monkeypatch.setattr(db, "upsert_daily", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("temperature repair must not call general upsert_daily")
+    ))
+    assert db.merge_daily_temperatures(item.local_date, {"outdoor": {
+        "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }}, {"source": "test"})
+    with db.connect() as connection:
+        allocations_after = [tuple(row) for row in connection.execute(
+            "SELECT * FROM allocations ORDER BY device,category"
+        )]
+        rejections_after = [tuple(row) for row in connection.execute(
+            "SELECT local_date,entity_key,reason FROM rejected_readings ORDER BY id"
+        )]
+        revision = connection.execute(
+            "SELECT reason FROM revisions ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert allocations_after == allocations_before
+    assert rejections_after == rejections_before
+    assert revision == "temperature_history_repair"
+
+
+def test_atomic_temperature_repair_preserves_checksum_revision_and_mapping_meaning(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record(42.631)
+    item.temperatures = {"outdoor": {
+        "mean": 5, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "source_provenance": {"entity_id": "sensor.original", "source_id": "outdoor"},
+    }}
+    db.upsert_daily(item)
+    with db.connect() as connection:
+        before = connection.execute(
+            "SELECT revision,updated_at,checksum,payload_json FROM daily_records"
+        ).fetchone()
+    assert not db.merge_daily_temperatures(item.local_date, {"new-source": {
+        "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": "2026-10-23T22:00:00+00:00",
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.new", "source_id": "new-source"},
+    }}, {"source": "test"})
+    # Lower quality cannot overwrite a complete validated summary, even with more duration.
+    assert not db.merge_daily_temperatures(item.local_date, {"outdoor": {
+        "mean": 6, "coverage_seconds": 99999, "period_seconds": 99999,
+        "coverage_percent": 100, "quality": "filtered", "rejections": [],
+        "period_start_utc": item.period_start_utc, "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.original", "source_id": "outdoor"},
+    }}, {"source": "test"})
+    # A remapped entity never rewrites the historical meaning of the stable source ID.
+    assert not db.merge_daily_temperatures(item.local_date, {"outdoor": {
+        "mean": 7, "coverage_seconds": 100000, "period_seconds": 100000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc, "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.replacement", "source_id": "outdoor"},
+    }}, {"source": "test"})
+    with db.connect() as connection:
+        after = connection.execute(
+            "SELECT revision,updated_at,checksum,payload_json FROM daily_records"
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+    assert after["checksum"] == logical_daily_checksum(db, item.local_date)
+
+
+def test_legacy_temperature_without_entity_provenance_is_not_rewritten_by_current_mapping(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    item = record()
+    item.temperatures = {"outdoor": {
+        "mean": 4.0, "coverage_seconds": 45000, "period_seconds": 90000,
+        "coverage_percent": 50, "quality": "partial", "rejections": [],
+    }}
+    db.upsert_daily(item)
+    assert not db.merge_daily_temperatures(item.local_date, {"outdoor": {
+        "mean": 9.0, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": item.period_start_utc,
+        "period_end_utc": item.period_end_utc,
+        "source_provenance": {"entity_id": "sensor.current_outdoor"},
+    }}, {"source": "repair"})
+    assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 4.0
+
+
+def test_temperature_repair_replaces_only_changed_source_rejections_without_duplicates(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record(42.631))
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO rejected_readings(local_date,entity_key,reason) VALUES (?,?,?)",
+            ("2026-10-25", "outdoor", "out_of_range:155"),
+        )
+        connection.execute(
+            "INSERT INTO rejected_readings(local_date,entity_key,reason) VALUES (?,?,?)",
+            ("2026-10-25", "ecodan", "equipment_power_rejected"),
+        )
+    rejection = {
+        "timestamp": "2026-10-25T12:00:00+00:00", "value": -55,
+        "reason": "invalid_sentinel", "duration_seconds": 300,
+        "source": "sensor.outdoor",
+    }
+    assert db.merge_daily_temperatures("2026-10-25", {"outdoor": {
+        "mean": 8, "coverage_seconds": 89700, "period_seconds": 90000,
+        "coverage_percent": 99.67, "quality": "filtered",
+        "period_start_utc": record().period_start_utc,
+        "period_end_utc": record().period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+        "rejections": [rejection, dict(rejection)],
+    }}, {"source": "test"})
+    with db.connect() as connection:
+        outdoor = [tuple(row) for row in connection.execute(
+            """SELECT reason,source,value FROM rejected_readings
+            WHERE local_date=? AND entity_key=?""", ("2026-10-25", "outdoor"),
+        )]
+        equipment = connection.execute(
+            """SELECT reason FROM rejected_readings
+            WHERE local_date=? AND entity_key=?""", ("2026-10-25", "ecodan"),
+        ).fetchone()[0]
+    assert outdoor == [("invalid_sentinel", "sensor.outdoor", "-55")]
+    assert equipment == "equipment_power_rejected"
+
+
+def test_atomic_temperature_repair_rolls_back_payload_and_revision_on_write_failure(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record(42.631))
+    with db.connect() as connection:
+        before = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records"
+        ).fetchone()
+        revision_count = connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]
+        connection.execute("""CREATE TRIGGER reject_temperature_repair
+            BEFORE UPDATE OF payload_json ON daily_records
+            BEGIN SELECT RAISE(ABORT, 'simulated repair failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="simulated repair failure"):
+        db.merge_daily_temperatures("2026-10-25", {"outdoor": {
+            "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+            "coverage_percent": 100, "quality": "good", "rejections": [],
+            "period_start_utc": record().period_start_utc,
+            "period_end_utc": record().period_end_utc,
+            "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+        }}, {"source": "test"})
+    with db.connect() as connection:
+        after = connection.execute(
+            "SELECT payload_json,checksum,revision FROM daily_records"
+        ).fetchone()
+        assert connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == revision_count
+    assert tuple(after) == tuple(before)
+    with db.connect() as connection:
+        connection.execute("DROP TRIGGER reject_temperature_repair")
+    candidate = {
+        "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": record().period_start_utc,
+        "period_end_utc": record().period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    assert db.merge_daily_temperatures("2026-10-25", {"outdoor": candidate}, {"source": "retry"})
+    assert not db.merge_daily_temperatures(
+        "2026-10-25", {"outdoor": candidate}, {"source": "retry"}
+    )
+
+
+def test_competing_temperature_repairs_serialize_and_best_evidence_wins(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record(42.631))
+    barrier = Barrier(2)
+
+    def repair(mean, coverage, quality):
+        barrier.wait()
+        return db.merge_daily_temperatures("2026-10-25", {"outdoor": {
+            "mean": mean, "coverage_seconds": coverage, "period_seconds": 90000,
+            "coverage_percent": coverage / 900, "quality": quality, "rejections": [],
+            "period_start_utc": record().period_start_utc,
+            "period_end_utc": record().period_end_utc,
+            "source_provenance": {
+                "entity_id": "sensor.outdoor", "source_id": "outdoor",
+                "attribute": None, "role": "outdoor",
+            },
+        }}, {"source": "concurrent"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda args: repair(*args), [(7.0, 45000, "partial"), (8.0, 90000, "good")]
+        ))
+    repaired = db.daily("2026-10-25")
+    assert any(results)
+    assert repaired["temperatures"]["outdoor"]["mean"] == 8.0
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT payload_json,checksum FROM daily_records WHERE local_date='2026-10-25'"
+        ).fetchone()
+    assert row["checksum"] == logical_daily_checksum(db, "2026-10-25")
+
+
+def test_temperature_repair_and_normal_daily_hourly_writers_do_not_lose_evidence(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record(42.631))
+    candidate = {
+        "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": record().period_start_utc,
+        "period_end_utc": record().period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    daily_barrier = Barrier(2)
+
+    def repair_daily():
+        daily_barrier.wait()
+        return db.merge_daily_temperatures(
+            "2026-10-25", {"outdoor": candidate}, {"source": "concurrent"}
+        )
+
+    def write_daily():
+        daily_barrier.wait()
+        return db.upsert_daily(record(43.0), reason="concurrent_daily")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda function: function(), (repair_daily, write_daily)))
+    daily = db.daily("2026-10-25")
+    assert daily["household_kwh"] == 43.0
+    assert daily["temperatures"]["outdoor"]["mean"] == 8
+
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    base_hour = {
+        "local_date": "2026-10-25", "timezone": "UTC",
+        "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+        "day_seconds": 3600, "household_kwh": 1.0, "quality": "partial",
+        "temperatures": {}, "allocations": {}, "provenance": {},
+    }
+    db.upsert_hourly(base_hour)
+    hour_candidate = {**candidate, "coverage_seconds": 3600, "period_seconds": 3600,
+                      "period_start_utc": start.isoformat(),
+                      "period_end_utc": end.isoformat()}
+    hourly_barrier = Barrier(2)
+
+    def repair_hour():
+        hourly_barrier.wait()
+        return db.merge_hourly_temperatures(
+            start, end, {"outdoor": hour_candidate}, {"source": "concurrent"}
+        )
+
+    def write_hour():
+        hourly_barrier.wait()
+        return db.upsert_hourly({**base_hour, "household_kwh": 2.0, "quality": "good"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda function: function(), (repair_hour, write_hour)))
+    hourly = db.hourly_range(start, end)[0]
+    assert hourly["household_kwh"] == 2.0
+    assert hourly["temperatures"]["outdoor"]["mean"] == 8
+
+
+def test_temperature_repair_waits_for_bounded_sqlite_writer_contention(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record(42.631))
+    candidate = {
+        "mean": 8, "coverage_seconds": 90000, "period_seconds": 90000,
+        "coverage_percent": 100, "quality": "good", "rejections": [],
+        "period_start_utc": record().period_start_utc,
+        "period_end_utc": record().period_end_utc,
+        "source_provenance": {"entity_id": "sensor.outdoor", "source_id": "outdoor"},
+    }
+    locker = sqlite3.connect(db.path)
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                db.merge_daily_temperatures, "2026-10-25",
+                {"outdoor": candidate}, {"source": "contention"},
+            )
+            time.sleep(0.1)
+            assert not future.done()
+            locker.commit()
+            assert future.result(timeout=3) is True
+    finally:
+        locker.close()
+    assert db.daily("2026-10-25")["temperatures"]["outdoor"]["mean"] == 8
 
 
 def test_authoritative_full_year_is_not_limited_by_history_page(tmp_path):

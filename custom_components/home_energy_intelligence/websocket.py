@@ -16,6 +16,7 @@ from .configuration import (
 )
 from .analytics import (
     attach_canonical, combine_daily_records, combine_interval_records, daily_coverage,
+    derive_record_quality, heating_response_profile,
     interval_coverage, replace_with_partial_day,
 )
 from .const import DOMAIN
@@ -29,6 +30,8 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_settings)
     websocket_api.async_register_command(hass, ws_refresh)
     websocket_api.async_register_command(hass, ws_csv)
+    websocket_api.async_register_command(hass, ws_temperature_diagnostics)
+    websocket_api.async_register_command(hass, ws_reprocess_temperature_history)
 
 
 def _coordinator(hass):
@@ -54,6 +57,24 @@ def _temperatures(coordinator):
         if (item.entity_id, item.role) not in seen
     ]
     return explicit + generated
+
+
+def _representative_temperature_source_ids(coordinator) -> list[str]:
+    """Return only enabled, role-compatible sources that affect overall quality."""
+    configured = {
+        "indoor": coordinator.config.get("representative_indoor_source_id"),
+        "outdoor": coordinator.config.get("representative_outdoor_source_id"),
+    }
+    sources = {item.source_id: item for item in _temperatures(coordinator)}
+    return [
+        source_id for role, source_id in configured.items()
+        if source_id and source_id in sources and sources[source_id].enabled
+        and sources[source_id].role == role
+    ]
+
+
+def _response_temperature_coverage_minimum(coordinator) -> float:
+    return float(coordinator.config.get("response_temperature_coverage_minimum", 95))
 
 
 async def _current_day_snapshot(
@@ -105,6 +126,17 @@ async def ws_overview(hass, connection, msg):
     yesterday_full = await hass.async_add_executor_job(
         coordinator.database.daily, yesterday.isoformat()
     )
+    required_temperature_ids = _representative_temperature_source_ids(coordinator)
+    if yesterday_full:
+        yesterday_full = derive_record_quality(
+            yesterday_full,
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
+        )
     latest_hour_end = today_hours[-1]["period_end_utc"] if today_hours else None
     temperatures = [
         {
@@ -112,9 +144,50 @@ async def ws_overview(hass, connection, msg):
             "display_name": item.display_name,
             "role": item.role,
             "enabled": item.enabled,
+            "entity_id": item.entity_id,
+            "attribute": item.attribute,
         }
         for item in _temperatures(coordinator)
     ]
+    current_temperatures = (current or {}).get("temperatures", {})
+    temperature_pipeline = []
+    for item in _temperatures(coordinator):
+        state = hass.states.get(item.entity_id)
+        summary = current_temperatures.get(item.source_id)
+        if not item.enabled:
+            stage = "disabled"
+        elif state is None:
+            stage = "live_entity_unavailable"
+        elif not today_hours:
+            stage = "hourly_processing_missing"
+        elif not isinstance(summary, dict):
+            stage = "temperature_summary_not_persisted"
+        elif summary.get("mean") is None:
+            stage = "temperature_rejected_or_uncovered"
+        else:
+            stage = "available"
+        temperature_pipeline.append({
+            "source_id": item.source_id, "entity_id": item.entity_id,
+            "configured": True, "enabled": item.enabled, "attribute": item.attribute,
+            "pipeline_stage": stage,
+            "live_state": ((state.attributes.get(item.attribute) if item.attribute else state.state)
+                           if state is not None else None),
+            "live_last_updated": state.last_updated.isoformat() if state is not None else None,
+            "live_unit": ((state.attributes.get("unit_of_measurement")
+                           or state.attributes.get("temperature_unit"))
+                          if state is not None else None),
+            "persisted_hourly_summaries": sum(
+                1 for row in today_hours
+                if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+            ),
+            "latest_quality": summary.get("quality") if isinstance(summary, dict) else None,
+            "latest_coverage_percent": (
+                summary.get("coverage_percent") if isinstance(summary, dict) else None
+            ),
+            "rejected_samples": (
+                summary.get("rejections", []) if isinstance(summary, dict) else []
+            ),
+        })
     connection.send_result(msg["id"], {
         "configured": True,
         "latest": attach_canonical(current, equipment) if current else None,
@@ -131,6 +204,7 @@ async def ws_overview(hass, connection, msg):
         "yesterday_interval_coverage": comparison_coverage,
         "energy_season_start_month": int(coordinator.config.get("energy_season_start_month", 7)),
         "energy_season_start_day": int(coordinator.config.get("energy_season_start_day", 1)),
+        "floor_area_m2": coordinator.config.get("floor_area_m2"),
         "equipment": equipment,
         "temperature_sources": temperatures,
         "representative_indoor_source_id": coordinator.config.get(
@@ -144,6 +218,7 @@ async def ws_overview(hass, connection, msg):
              "temperatures": row.get("temperatures", {})}
             for row in today_hours
         ],
+        "temperature_pipeline": temperature_pipeline,
     })
 
 
@@ -165,6 +240,7 @@ async def ws_history(hass, connection, msg):
         connection.send_result(msg["id"], {"records": []})
         return
     equipment = _equipment(coordinator)
+    equipment_ids = [item["equipment_id"] for item in equipment if item["enabled"]]
     start_date, end_date = msg.get("start_date"), msg.get("end_date")
     selected_label = None
     if preset := msg.get("preset"):
@@ -227,12 +303,26 @@ async def ws_history(hass, connection, msg):
         )
         total = len(records)
     temperature_source_ids = [item.source_id for item in _temperatures(coordinator) if item.enabled]
+    required_temperature_ids = _representative_temperature_source_ids(coordinator)
     if start_date and end_date:
         combined = combine_daily_records(
             period_records, start_date, end_date,
             temperature_source_ids=temperature_source_ids,
+            required_temperature_source_ids=required_temperature_ids,
+            equipment_ids=equipment_ids, timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
-        selected_coverage = daily_coverage(period_records, start_date, end_date)
+        selected_coverage = daily_coverage(
+            period_records, start_date, end_date,
+            equipment_ids=equipment_ids,
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
+        )
         if combined:
             selected_coverage = combined["period_coverage"]
     elif records:
@@ -241,14 +331,43 @@ async def ws_history(hass, connection, msg):
         combined = combine_daily_records(
             records, min(page_dates), max(page_dates),
             temperature_source_ids=temperature_source_ids,
+            required_temperature_source_ids=required_temperature_ids,
+            equipment_ids=equipment_ids, timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
         )
         selected_coverage = combined["period_coverage"] if combined else None
     else:
         period_records = []
         combined = None
         selected_coverage = None
+    representative_outdoor_id = coordinator.config.get(
+        "representative_outdoor_source_id"
+    )
+    representative_outdoor = next((
+        item for item in _temperatures(coordinator)
+        if item.source_id == representative_outdoor_id
+    ), None)
+    response_profile = heating_response_profile(
+        period_records, equipment,
+        outdoor_source_id=representative_outdoor_id,
+        outdoor_source_is_measured_air=bool(
+            representative_outdoor and representative_outdoor.enabled
+            and representative_outdoor.role == "outdoor"
+        ),
+        floor_area_m2=coordinator.config.get("floor_area_m2"),
+        minimum_temperature_coverage=_response_temperature_coverage_minimum(coordinator),
+    )
     connection.send_result(msg["id"], {
-        "records": [attach_canonical(record, equipment) for record in records],
+        "records": [attach_canonical(derive_record_quality(
+            record, equipment_ids=equipment_ids,
+            temperature_source_ids=required_temperature_ids,
+            timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
+        ), equipment) for record in records],
         "summary": attach_canonical(combined, equipment) if combined else None,
         "total": total, "offset": msg["offset"], "limit": msg["limit"],
         "summary_record_count": len(period_records),
@@ -260,6 +379,7 @@ async def ws_history(hass, connection, msg):
         "cutoff_local": (history_cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat()
                          if history_cutoff else None),
         "timezone": coordinator.timezone,
+        "response_profile": response_profile,
     })
 
 
@@ -272,6 +392,60 @@ async def ws_refresh(hass, connection, msg):
         return
     changed = await coordinator.async_refresh_hourly(reprocess_poor=True)
     connection.send_result(msg["id"], {"changed_intervals": changed})
+
+
+def _diagnostic_dates(coordinator, msg):
+    today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    try:
+        start = datetime.fromisoformat(msg.get("start_date") or (
+            today - timedelta(days=30)
+        ).isoformat()).date()
+        end = datetime.fromisoformat(msg.get("end_date") or today.isoformat()).date()
+    except ValueError as error:
+        raise ValueError("Dates must use YYYY-MM-DD") from error
+    if end < start or (end - start).days > 30:
+        raise ValueError("Range must be ordered and at most 31 days")
+    return start, end
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/temperature_diagnostics",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_temperature_diagnostics(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_temperature_diagnostics(start, end)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/reprocess_temperature_history",
+    vol.Optional("start_date"): str, vol.Optional("end_date"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_reprocess_temperature_history(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_reprocess_temperature_history(start, end)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range", str(error))
+        return
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.websocket_command({
@@ -321,14 +495,45 @@ async def ws_csv(hass, connection, msg):
               "unallocated_discrepancy_kwh", "known_space_heating_kwh", "known_dhw_kwh",
               "known_cooling_kwh", "known_idle_kwh", "known_other_hvac_kwh",
               "pv_kwh", "import_kwh", "export_kwh",
-              "complete", "quality"]
+              "complete", "quality", "partial", "finalized", "cutoff_utc",
+              "date_coverage_percent", "meter_coverage_percent",
+              "allocation_coverage_percent", "allocation_coverage_known"]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for record in reversed(records):
+        record = derive_record_quality(
+            record,
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=_representative_temperature_source_ids(coordinator),
+            timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
+        )
         energy = attach_canonical(record, equipment)["energy"] or {}
+        row_coverage = daily_coverage(
+            [record], record["local_date"], record["local_date"],
+            equipment_ids=[item["equipment_id"] for item in equipment if item["enabled"]],
+            temperature_source_ids=_representative_temperature_source_ids(coordinator),
+            timezone=coordinator.timezone,
+            response_temperature_coverage_minimum=(
+                _response_temperature_coverage_minimum(coordinator)
+            ),
+        )
+        allocation_coverage = row_coverage["allocation_coverage"]
         writer.writerow({"date": record["local_date"], **{
-            key: energy.get(key) for key in fields if key not in {"date", "quality"}
-        }, "quality": record.get("quality")})
+            key: energy.get(key) for key in fields if key not in {
+                "date", "quality", "partial", "finalized", "cutoff_utc",
+                "date_coverage_percent", "meter_coverage_percent",
+                "allocation_coverage_percent", "allocation_coverage_known",
+            }
+        }, "quality": record.get("quality"), "partial": record.get("partial", False),
+           "finalized": record.get("finalized", True),
+           "cutoff_utc": record.get("period_end_utc"),
+           "date_coverage_percent": row_coverage["date_coverage"]["coverage_percent"],
+           "meter_coverage_percent": row_coverage["meter_coverage"]["coverage_percent"],
+           "allocation_coverage_percent": allocation_coverage["coverage_percent"],
+           "allocation_coverage_known": allocation_coverage["coverage_known"]})
     connection.send_result(msg["id"], {
         "filename": "home-energy-intelligence.csv", "csv": output.getvalue(),
         "record_count": len(records), "start_date": start_date, "end_date": end_date,
@@ -355,6 +560,7 @@ async def ws_settings(hass, connection, msg):
     for item in temperatures_from_config(config):
         mapping.append({"key": f"temperature.{item.source_id}", "label": item.display_name,
                         "entity_id": item.entity_id, "enabled": item.enabled})
+    storage = await hass.async_add_executor_job(coordinator.database.storage_status)
     connection.send_result(msg["id"], {
         "configured": True,
         "entry_id": coordinator.entry.entry_id,
@@ -363,5 +569,6 @@ async def ws_settings(hass, connection, msg):
         "cycle_hours": config.get("cycle_hours", 6),
         "influx_enabled": bool(config.get("influx_enabled", False)),
         "mapping": mapping,
-        "database_size_bytes": await hass.async_add_executor_job(coordinator.database.size_bytes),
+        "database_size_bytes": storage["database_size_bytes"],
+        "storage": storage,
     })

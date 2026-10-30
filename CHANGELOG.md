@@ -2,6 +2,22 @@
 
 ## V0.1.1 — draft
 
+- Required representative-temperature completeness now means exactly 100% validated elapsed coverage on normal and 23/25-hour dates; the independently configurable 95% threshold remains only a heating-response admission rule.
+- Historical temperature repair now registers effective-dated source identity at setup, verifies entity ID, attribute, role, enabled state and the entire mapping interval before querying, preserves unidentifiable legacy summaries and reports every skipped mapping reason.
+- Read-only InfluxDB fallback failures are isolated per temperature source. Timeouts, connection errors and malformed rows retain validated Recorder evidence, expose non-secret query-error provenance and leave uncovered time missing.
+- Replaced temperature fallback row-count heuristics with canonical validated-duration checks in both normal and repair collectors. A carry-in state can be complete; invalid/unavailable rows can fall back to Recorder statistics and optional read-only InfluxDB; partial valid raw evidence remains authoritative and uncovered time remains missing.
+- Hardened Schema V4 for constrained Home Assistant hosts: V1/V2/V3 upgrades are transactional through the version bump, conversion is keyset-batched, startup `VACUUM` was removed, lock/busy errors are not corruption, disk/schema/version-bump failures roll back and retry safely, and Settings exposes non-secret backup/migration status.
+- Separated configurable 95% electrical-response admission from 100% temporal completeness and prevented current mappings from rewriting legacy temperature summaries whose historical entity identity is unknown.
+- Replaced legacy stored row-quality trust with one read-time derivation shared by History, Overview completed days, sensors and CSV; date, household meter, equipment allocation and selected representative-temperature layers remain independently inspectable, while the old label is provenance only.
+- Added explicit `unknown` quality for legacy classification rows whose elapsed coverage cannot be proven, and allowed a fully evidenced temperature repair to promote derived period quality without rebuilding energy.
+- Added SQLite schema V4 normalization for temperature summaries and rejection audits, including atomic forward migration, injected-failure rollback, idempotent reopen and an approximately 1 MB storage-amplification bound.
+- Added repair query/sample metrics and 2-/31-day bounded HA runtime benchmarks; the collector remains temperature-only and skips complete sources before Recorder reads.
+- Exposed each derived quality layer and the disclosed electrical-response admission thresholds in the dashboard without adding thermal/COP/forecast claims.
+- Made the backend `heating_response_profile()` the single qualification source for both Overview and House Thermal Profile; the frontend no longer derives a second point set from History rows.
+- Replaced temperature repair's read/rebuild/generic-upsert sequence with interval-checked `BEGIN IMMEDIATE` merges that update only temperature payload evidence, checksum/revision metadata and affected-source rejection audits.
+- Added a temperature-only bounded Recorder collector. It never requests equipment energy, power, modes, PV or grid entities; complete sources are skipped before any Recorder query, repairs are serialized and startup failures cannot block hourly/checkpoint/daily recovery.
+- Strengthened diagnostics with live entity/attribute/unit state, Recorder query errors/range, persisted coverage seconds/percentage and representative stable-source IDs.
+- Kept unavailable Energy Split categories null and visibly unavailable instead of converting them to display zeroes.
 - Added idempotent completed-hour aggregation, restart recovery and an additive SQLite schema V3 migration.
 - Made the backend canonical energy contract authoritative for Overview, History and authenticated CSV export.
 - Added today-through-last-completed-hour actuals, yesterday same-cutoff/full-day comparisons, freshness labels and manual/hourly refresh.
@@ -20,6 +36,20 @@
 - Split period quality into date availability, household-meter, HVAC-allocation and per-source temperature coverage so unrelated temperature gaps no longer erase valid meter totals.
 - Counted absent local dates, including 23/25-hour days, in period temperature coverage while retaining duration-weighted valid means and validated min/max.
 - Added the shared Home Assistant-timezone period selector to Overview and made representative-source charts honor only the configured stable source ID.
+- Removed silent first-source representative defaults, added an in-flow representative-source preview/test, and made unconfigured indoor/outdoor cards explicitly unavailable instead of showing inferred 100% coverage.
+- Changed allocation coverage from binary good-day counts to classified elapsed seconds across every enabled equipment ID; partial device meters and classification evidence remain visible without promoting unknown categories to zero.
+- Added an evidence-bound whole-house **electrical** heating-response profile normalized by floor area while explicitly withholding unmeasured thermal output, COP and design-day claims.
+- Added mobile period-control disclosure, bounded pager state, compact empty states, touch-sized controls and horizontally scrollable evidence tables for 360–430 px layouts.
+- Added explicit PV/grid balance evidence (`PV − export`, `self-use + import`) without overwriting measured household electricity.
+- Made Options Flow transactional: skip preserves queued mappings, disable retains the complete stable-ID record, remove is explicit and failed validation restores the draft unchanged.
+- Made absent legacy allocation-coverage metadata unknown rather than complete; independent meter totals and known partial subtotals remain visible without exposing complete categories.
+- Replaced calendar-row date coverage with DST-aware elapsed local-day seconds, including partial current-day date availability and completed-hour processing coverage.
+- Qualified the electrical heating-response profile with configurable representative-outdoor coverage (95% default), complete enabled-device classification, reconciliation, 10 days, 8 °C observed span and R² ≥ 0.5; excluded dates and reasons remain visible.
+- Prevented partial equipment allocations from rendering as zero-height confirmed comparison bars and added 360/390/430 px responsive layout evidence.
+- Added end-to-end representative-temperature pipeline diagnostics (mapping/live state/unit/Recorder range/rejections/hourly and daily persistence/missing intervals) and administrator-only bounded repair.
+- Added idempotent temperature-only recovery for the latest two local days at startup and up to 31 selected days on demand; valid energy, allocation and stronger temperature summaries are preserved.
+- Replaced the Daily Energy Split's ambiguous simultaneous `missing`/`partial` labels with independent incomplete-period, missing-meter, incomplete-classification, estimated-allocation and missing-temperature-evidence indicators.
+- Separated canonical electricity quality from temperature quality so missing temperature evidence cannot downgrade a complete metered and classified energy result.
 
 ## V0.1.0 — draft
 

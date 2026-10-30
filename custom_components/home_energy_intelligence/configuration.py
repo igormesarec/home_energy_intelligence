@@ -86,6 +86,8 @@ def temperatures_from_config(config: dict[str, Any]) -> list[TemperatureMapping]
     for source_record in parse_json_records(config.get("temperature_sources")):
         record = dict(source_record)
         quality = TemperatureQuality(**record.pop("quality", {}))
+        if not record.get("attribute") and str(record.get("entity_id", "")).startswith("climate."):
+            record["attribute"] = "current_temperature"
         result.append(TemperatureMapping(**record, quality=quality))
     return result
 
@@ -107,22 +109,34 @@ def equipment_temperature_mappings(equipment: list[EquipmentMapping]) -> list[Te
                 result.append(TemperatureMapping(
                     source_id=f"{item.equipment_id}_{role}",
                     display_name=f"{item.display_name} {role.replace('_', ' ')}",
-                    entity_id=entity_id, role=role, quality=quality,
+                    entity_id=entity_id, role=role,
+                    attribute=("current_temperature"
+                               if role == "equipment_room" and entity_id.startswith("climate.")
+                               else None),
+                    quality=quality,
                 ))
     return result
 
 
 def mapping_revision(config: dict[str, Any], *, effective_at: datetime | None = None) -> dict[str, Any]:
     """Non-secret provenance stored with derived records."""
+    equipment = equipment_from_config(config)
+    explicit = list(temperatures_from_config(config))
+    explicit_keys = {(item.entity_id, item.role) for item in explicit}
+    temperature_mappings = explicit + [
+        item for item in equipment_temperature_mappings(equipment)
+        if (item.entity_id, item.role) not in explicit_keys
+    ]
     return {
         "effective_at": config.get("mapping_effective_at") or (effective_at or datetime.now(UTC)).isoformat(),
         "equipment": [
             asdict(item)
-            for item in equipment_from_config(config)
+            for item in equipment
         ],
         "temperatures": [
-            {"source_id": item.source_id, "entity_id": item.entity_id, "role": item.role}
-            for item in temperatures_from_config(config)
+            {"source_id": item.source_id, "entity_id": item.entity_id,
+             "attribute": item.attribute, "role": item.role, "enabled": item.enabled}
+            for item in temperature_mappings
         ],
     }
 

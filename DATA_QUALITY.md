@@ -31,3 +31,89 @@ Representative indoor and outdoor cards both use `time_weighted_temperature()`. 
 - `poor`: less than half of the period classified.
 - `missing`: no defensible value.
 - `unreconciled`: derived totals contradict source totals.
+- `unknown`: legacy evidence exists, but its coverage metadata is insufficient to prove completeness.
+
+## Coverage layers
+
+- **Date availability** is elapsed local-date duration present in the compact archive; DST days contribute their actual 23-, 24- or 25-hour duration.
+- **Meter coverage** is elapsed duration with each required authoritative counter available. It does not depend on a temperature sensor.
+- **Allocation coverage** is classified elapsed duration across every enabled equipment ID. A device with 18 classified hours in a 24-hour day contributes 75%, not 0% or 100%; no configured equipment is reported as unavailable rather than full coverage.
+- Missing allocation-coverage metadata is **unknown**, never a compatibility alias for 100%. Legacy meter totals and known subtotals remain visible, while complete category values remain unavailable until explicit evidence exists.
+- **Temperature coverage** is valid elapsed duration for each source independently. A representative card with no explicit selection says **Not configured** and never reports 100%.
+
+Full temperature completeness requires 100% validated temporal coverage. The
+separate response-analysis gate is configurable and defaults to 95%; passing it
+never changes a 95–99.99% source from partial to complete. This distinction is
+applied to 23-, 24- and 25-hour local dates and to multi-day periods.
+
+These layers are intentionally independent. A complete household meter can remain complete when an indoor sensor is missing, while a partial HVAC classifier keeps its meter total and raw residual evidence without promoting missing categories to confirmed zero.
+
+Public daily/period quality is recalculated from these layers on every read; the
+old stored row label is retained only as `stored_quality` provenance. Required
+temperature quality includes only the explicitly selected, enabled,
+role-compatible representative indoor/outdoor sources. Optional equipment or
+temperature mappings cannot silently downgrade unrelated meter evidence. A
+temperature-only repair can therefore turn a formerly stored `partial` label
+into derived `good` when date, household meter, every enabled-device allocation
+and every selected representative source are all demonstrably complete.
+
+Canonical electricity quality uses meter, classification and reconciliation
+evidence only. Overall record quality may still be partial because a temperature
+source is missing; the Energy Split displays that as separate temperature
+evidence rather than calling the electricity missing.
+
+## Temperature pipeline recovery
+
+The administrator diagnostic reads at most 31 local days and reports the first
+observable missing stage: disabled/unavailable live entity, Recorder history
+unavailable, incompatible/invalid samples, missing hourly processing, absent
+temperature payload, or rejected/uncovered persisted payload. It includes raw
+availability bounds, units, rejection reasons and caused missing intervals.
+
+Repair re-runs the canonical time-weighted calculation from bounded Recorder (or
+configured read-only InfluxDB fallback) evidence. It adds a source only when no
+summary exists or replaces it only when the recovered valid duration is greater.
+It never fills a gap, overwrites a stronger valid measurement, creates a finalized
+day, or changes electricity/allocation fields.
+
+Before a historical query, repair proves that the recorded mapping applicable to
+the entire UTC interval matches the current stable source's entity ID, attribute,
+role and enabled state. A mapping transition inside the interval, a newer remap,
+or legacy provenance missing any identity field is skipped with an explicit
+reason. Existing legacy summaries remain immutable when their historical identity
+cannot be proven. Per-source InfluxDB errors are retained in provenance and do not
+erase validated Recorder evidence or fill uncovered seconds.
+
+The repair collector requests only enabled temperature entities. Before querying
+Recorder it skips source/day combinations only when they have 100% valid
+coverage and non-partial quality. Every candidate must identify the exact UTC
+period and mapped entity. A dedicated `BEGIN IMMEDIATE` transaction re-reads the
+latest payload under the write lock, compares quality/coverage/provenance, and
+updates only the JSON temperature map, checksum/revision metadata and rejection
+rows belonging to changed temperature sources. A retry with identical evidence
+is a no-op. Overlapping repairs are rejected and a failed startup repair is logged
+without blocking hourly, checkpoint or daily recovery.
+
+For an in-progress local date, date availability uses completed elapsed seconds
+against that date's full 23/24/25-hour duration. Meter and allocation coverage use
+the completed-hour processing scope, so a fully processed six-hour cutoff can have
+100% meter coverage while the date is correctly only 25% available.
+
+## Electrical heating-response qualification
+
+Every candidate date is retained as validated or excluded. The default admission
+policy requires 95% representative-outdoor valid duration, complete classification
+for each enabled heat pump and heating-capable AC, known reconciliation within the
+configured tolerance, a finalized valid date and configured floor area. The
+frontend requires at least 10 admitted dates, an observed outdoor span of 8 °C and
+R² ≥ 0.5 before showing a conservative electrical fit. These are evidence-quality
+gates, not a claim of thermal output, COP, physical balance point or design-day
+capacity.
+
+The 95% response-profile threshold is not temporal completeness. Each candidate
+exposes separate response-qualification and 100%-coverage flags; a 95–99.99%
+day may qualify for that statistical use while its missing interval remains
+explicit everywhere else.
+
+Overview and House Thermal Profile consume this same backend candidate list and
+the same `validated` status. The panel does not independently admit dates.

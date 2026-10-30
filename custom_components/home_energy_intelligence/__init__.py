@@ -19,6 +19,7 @@ from .const import (
     SERVICE_REPROCESS_DATE, SERVICE_REPROCESS_RANGE,
 )
 from .coordinator import HomeEnergyCoordinator
+from .configuration import mapping_revision
 from .database import EnergyDatabase, protected_export_path
 from .panel import async_register_panel, async_remove_panel
 from .websocket import async_register_websocket
@@ -47,7 +48,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if recovered:
         _LOGGER.error("Recovered from corrupt Home Energy Intelligence DB; preserved at %s", recovered)
 
-    coordinator = HomeEnergyCoordinator(hass, entry, database)
+    registered_mapping = await hass.async_add_executor_job(
+        database.ensure_mapping_revision,
+        mapping_revision({**entry.data, **entry.options}),
+    )
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered_mapping)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await async_register_panel(hass)
     if not hass.data[DOMAIN].get("websocket_registered"):

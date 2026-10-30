@@ -41,10 +41,40 @@ Covered acceptance cases include:
 - Contaminated long-term temperature-statistic bounds producing rejected, zero-coverage intervals.
 - History Today replacement from completed hourly rows without daily writes, shared cutoff propagation and Home Assistant-timezone labelling.
 - Separate date/meter/allocation/temperature period quality, missing-date temperature denominators and preservation of valid meter totals when temperature coverage is partial.
+- Elapsed-time allocation coverage for partial equipment, unavailable (not 100%) coverage with no configured equipment, explicit representative-source opt-in and representative live preview evidence.
+- Supplied-site PV/grid rounding balance and heat-pump/partial-AC classification baselines without converting partial classifications into confirmed zeroes.
+- Frontend contracts for the electrical-only normalized heating-response profile, explicit unconfigured representatives, bounded pagination and compact mobile controls.
 - Nonzero Other HVAC fan/dry allocation with zero discrepancy, plus configured representative-source enforcement in frontend charts.
 - Current Home Assistant panel registration API, duplicate prevention, reload re-registration and unload removal.
 - Current Home Assistant read-only Options Flow `config_entry` lifecycle.
 - October 2026 Recorder fixture values and 25 October whole-house equation: 23.732 + 32.620 − 13.721 = 42.631 kWh.
+- Transactional Options Flow with one heat pump, three AC units, three temperature mappings and representative selections: unchanged save, skip, disable, explicit remove and failed validation.
+- Legacy allocations without coverage metadata remaining unknown while preserving the meter and known subtotals; explicit 100% compatibility metadata remains complete.
+- DST-duration date coverage for complete 23/25-hour dates and partial current dates, independently from completed-hour meter coverage.
+- Electrical-response admission and exclusions for low outdoor coverage, incomplete AC classification, missing representative source and −55 °C contamination; frontend guards require 10 dates, 8 °C span and R² ≥ 0.5.
+- Partial equipment rows retained in evidence but excluded from confirmed comparison bars rather than rendered as zero.
+- October 29 blank representative-temperature symptom: Recorder samples retain source/entity/unit/range provenance, missing persisted summaries receive temperature-only repair, stronger existing values and all energy/allocation fields remain unchanged, and retries are idempotent.
+- Temperature diagnostic and repair WebSockets are administrator-only, bounded to 31 days and expose live/Recorder/rejection/hourly/daily/missing-interval stages.
+- Daily Energy Split uses independent incomplete-period, missing-meter, incomplete-classification, estimated-allocation and missing-temperature labels; a current partial day is not also called missing merely because it is partial.
+- Overview and House Thermal Profile consume one backend-qualified response-point set with the exact 95% coverage boundary, dynamic per-device evidence and explicit exclusions.
+- Atomic temperature repair rejects mismatched UTC intervals/entity provenance and quality downgrades, preserves allocations/unrelated rejection audits, keeps checksums valid, is idempotent and rolls back payload/revision changes on a simulated write failure.
+- The lean temperature collector's Recorder entity sets exclude HVAC energy/power/mode, PV and grid sources; a successful raw-state repair performs one bounded history query per queried day, statistics is requested only when validated state coverage is zero, and a complete stored source performs zero queries.
+- Energy Split frontend contracts preserve unavailable category nulls and label them unavailable rather than converting them to confirmed zero segments.
+- Read-time quality recomputation: stored-partial plus complete repaired required layers becomes good; missing representative outdoor evidence remains partial; legacy unknown classification coverage remains unknown; optional unrelated sources do not erase complete meter evidence.
+- Schema V4 migration preserves hydrated daily values, revision history and rejection audits; V1/V2/V3/V4 paths are idempotent; thousands of daily/hourly rows migrate with bounded memory; injected schema, conversion, disk-full and pre-version-bump failures roll back; a locked database is not renamed as corrupt; startup never runs `VACUUM`.
+- Recorder temperature fallback tests cover a single valid carry-in state, multiple invalid sentinel rows with valid statistics, explicit-unavailable gaps, partial raw coverage that must remain a gap, and bounded read-only InfluxDB recovery. Selection is based on validated elapsed seconds, never row count.
+- Temperature-only repair benchmarks exercise 2 and 31 inclusive local days, assert exactly one bounded Recorder call per day when the raw carry state is valid, zero non-temperature entities/Influx calls, bounded peak normalized samples and a 64 MiB runtime allocation ceiling in the HA test harness.
+- Temperature quality boundaries cover 0%, 94.99%, 95%, 97%, 99.9% and 100% on ordinary, 23-hour and 25-hour dates, proving that response eligibility and full completeness remain separate.
+- Effective-dated repair tests cover unchanged mappings, remapped entities, changed attributes/roles, mapping transitions, legacy rows and missing provenance while asserting electricity, allocations and checksums remain untouched.
+- Home Assistant runtime fallback tests isolate InfluxDB timeout, connection and malformed-row failures per source, preserve a parallel 100%-validated Recorder source and prove the failed source remains zero-coverage rather than zero-valued or complete.
+
+## Responsive layout evidence
+
+The release-candidate panel bundle is rendered with mocked WebSocket responses in
+installed Chrome at 360, 390, 430, 768 and 1440 CSS pixels. The automated evidence
+checks page/period-control overflow, scrollable wide evidence tables and disabled
+first/last-page controls. This supplements, but does not replace, a live Home
+Assistant test on physical Android hardware.
 
 ## Home Assistant runtime suite
 

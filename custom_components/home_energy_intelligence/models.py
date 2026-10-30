@@ -60,7 +60,7 @@ class TemperatureResult:
     def quality(self) -> str:
         if self.coverage_seconds == 0:
             return "missing"
-        if self.coverage_percent < 95:
+        if self.coverage_percent < 100:
             return "partial"
         return "good" if self.rejected_count == 0 else "filtered"
 
