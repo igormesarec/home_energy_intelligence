@@ -23,6 +23,20 @@ def test_true_time_weighted_mean_not_observation_average():
     assert result.coverage_percent == 100
 
 
+def test_thousands_of_recorder_updates_do_not_bias_elapsed_time_weighting():
+    dense = [
+        NumericSample(dt() + timedelta(seconds=300 * index / 4657), 10)
+        for index in range(4657)
+    ]
+    result = time_weighted_temperature(
+        [*dense, NumericSample(dt(0, 5), 5)], dt(), dt(1),
+        minimum_valid=-50, maximum_valid=60,
+    )
+    assert len(dense) + 1 == 4658
+    assert result.mean == pytest.approx((10 * 5 + 5 * 55) / 60)
+    assert result.coverage_percent == 100
+
+
 def test_preceding_reading_is_used_and_155_spike_is_rejected():
     result = time_weighted_temperature(
         [

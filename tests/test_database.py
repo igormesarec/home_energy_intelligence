@@ -110,7 +110,7 @@ def test_v4_migration_normalizes_large_temperature_audit_losslessly(tmp_path):
     migrated.pop("updated_at")
     assert migrated == logical
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
         raw = connection.execute("SELECT payload_json FROM daily_records").fetchone()[0]
         assert "temperatures" not in json.loads(raw)
         assert connection.execute(
@@ -160,7 +160,7 @@ def test_every_supported_legacy_schema_upgrades_losslessly_and_idempotently(
     db.initialize()
     assert db.daily(item.local_date)["temperatures"]["outdoor"]["mean"] == 6.5
     with db.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+            assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
     before = db.size_bytes()
     db.initialize()
     assert db.size_bytes() == before
@@ -222,7 +222,7 @@ def test_v4_migration_streams_thousands_of_daily_and_hourly_rows(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM temperature_summaries"
         ).fetchone()[0] == 2400
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
 
 
 def test_v4_migration_failure_rolls_back_data_and_version(tmp_path):
@@ -382,7 +382,7 @@ def test_storage_status_discloses_safe_maintenance_policy(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
     status = db.storage_status()
-    assert status["schema_version"] == 4
+    assert status["schema_version"] == 5
     assert status["migration_required"] is False
     assert status["startup_vacuum_enabled"] is False
     assert status["backup_method"] == "protected_sqlite_online_backup"
@@ -665,7 +665,221 @@ def test_hourly_records_are_idempotent_bounded_and_dst_safe(tmp_path):
     rows = db.hourly_range(start, start + timedelta(hours=25))
     assert len(rows) == 25
     with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+
+
+def _mapping(effective_at, entity_id="sensor.outdoor"):
+    return {
+        "effective_at": effective_at,
+        "equipment": [],
+        "temperatures": [{
+            "source_id": "outdoor", "entity_id": entity_id,
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }],
+    }
+
+
+def _temperature_summary(start, end, entity_id="sensor.outdoor"):
+    return {
+        "mean": 5.5, "minimum": 5.0, "maximum": 6.0,
+        "coverage_seconds": (end - start).total_seconds(),
+        "period_seconds": (end - start).total_seconds(),
+        "coverage_percent": 100.0, "quality": "good", "rejected_count": 0,
+        "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+        "source_provenance": {
+            "source_id": "outdoor", "entity_id": entity_id,
+            "attribute": None, "role": "outdoor",
+            "mapping_effective_at": "2026-01-01T00:00:00+00:00",
+        },
+    }
+
+
+def test_v5_temperature_history_exists_without_energy_parent_and_is_idempotent(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.ensure_mapping_revision(_mapping("2026-01-01T00:00:00+00:00"))
+    start = datetime(2026, 10, 28, tzinfo=UTC)
+    hour_end = start + timedelta(hours=1)
+    day_end = start + timedelta(days=1)
+    hour_mapping = db.temperature_mapping_applicability(
+        "outdoor", start, hour_end, {
+            "source_id": "outdoor", "entity_id": "sensor.outdoor",
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }, allow_historical_identity=True,
+    )
+    day_mapping = db.temperature_mapping_applicability(
+        "outdoor", start, day_end, {
+            "source_id": "outdoor", "entity_id": "sensor.outdoor",
+            "attribute": None, "role": "outdoor", "enabled": True,
+        }, allow_historical_identity=True,
+    )
+    assert db.upsert_temperature_history(
+        "hourly", start, hour_end, "2026-10-28", "UTC", "outdoor",
+        _temperature_summary(start, hour_end), hour_mapping, dry_run=True,
+    ) == "inserted"
+    assert db.temperature_history_counts(start, day_end, None) == {
+        "hourly": 0, "daily": 0,
+    }
+    assert db.upsert_temperature_history(
+        "hourly", start, hour_end, "2026-10-28", "UTC", "outdoor",
+        _temperature_summary(start, hour_end), hour_mapping,
+    ) == "inserted"
+    assert db.upsert_temperature_history(
+        "hourly", start, hour_end, "2026-10-28", "UTC", "outdoor",
+        _temperature_summary(start, hour_end), hour_mapping,
+    ) == "unchanged"
+    assert db.upsert_temperature_history(
+        "daily", start, day_end, "2026-10-28", "UTC", "outdoor",
+        _temperature_summary(start, day_end), day_mapping,
+    ) == "inserted"
+    recovered = db.daily("2026-10-28")
+    assert recovered["temperature_only"] is True
+    assert recovered["household_kwh"] is None
+    assert recovered["temperatures"]["outdoor"]["mean"] == 5.5
+    page, total = db.history_range(
+        start_date="2026-10-28", end_date="2026-10-28", limit=10,
+    )
+    assert total == 1 and page[0]["temperature_only"] is True
+    assert db.temperature_history_counts(start, day_end, None) == {
+        "hourly": 1, "daily": 1,
+    }
+
+
+def test_v5_mapping_events_represent_a_to_b_to_a_chronologically(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    first = db.ensure_mapping_revision(_mapping("2026-01-01T00:00:00+00:00", "sensor.a"))
+    second = db.ensure_mapping_revision(_mapping("2026-02-01T00:00:00+00:00", "sensor.b"))
+    third = db.ensure_mapping_revision(_mapping("2026-03-01T00:00:00+00:00", "sensor.a"))
+    assert len({first["mapping_event_id"], second["mapping_event_id"], third["mapping_event_id"]}) == 3
+    current = {"source_id": "outdoor", "entity_id": "sensor.a", "attribute": None,
+               "role": "outdoor", "enabled": True}
+    january = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 1, 10, tzinfo=UTC),
+        datetime(2026, 1, 11, tzinfo=UTC), current,
+        allow_historical_identity=True,
+    )
+    february = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 2, 10, tzinfo=UTC),
+        datetime(2026, 2, 11, tzinfo=UTC), current,
+        allow_historical_identity=True,
+    )
+    march = db.temperature_mapping_applicability(
+        "outdoor", datetime(2026, 3, 10, tzinfo=UTC),
+        datetime(2026, 3, 11, tzinfo=UTC), current,
+        allow_historical_identity=True,
+    )
+    assert january["entity_id"] == "sensor.a"
+    assert february["entity_id"] == "sensor.b"
+    assert march["entity_id"] == "sensor.a"
+    assert january["mapping_event_id"] != march["mapping_event_id"]
+
+
+def test_temperature_backfill_job_cursor_survives_restart_and_cancellation(tmp_path):
+    path = tmp_path / "energy.sqlite3"
+    db = EnergyDatabase(path)
+    db.initialize()
+    job_id = db.create_temperature_backfill_job(
+        "2026-10-01", "2026-10-03", dry_run=False,
+        details={"processed_days": 1},
+    )
+    db.update_temperature_backfill_job(
+        job_id, status="running", cursor_date="2026-10-02",
+        details={"processed_days": 1, "inserted_hourly": 24},
+    )
+    reopened = EnergyDatabase(path)
+    reopened.initialize()
+    resumable = reopened.resumable_temperature_backfill_jobs()
+    assert [item["id"] for item in resumable] == [job_id]
+    assert resumable[0]["cursor_date"] == "2026-10-02"
+    assert resumable[0]["details"]["inserted_hourly"] == 24
+    assert reopened.request_temperature_backfill_cancel(job_id) is True
+    assert reopened.temperature_backfill_job(job_id)["cancel_requested"] is True
+    assert reopened.resumable_temperature_backfill_jobs() == []
+
+
+def test_v4_to_v5_migration_preserves_energy_and_checkpoint_payloads(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    db.upsert_daily(record())
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    db.upsert_checkpoint(start, start + timedelta(hours=6), "2026-10-25", "hp", {
+        "meter_kwh": 2.5, "categories": {"heating": 2.5},
+    })
+    with db.connect() as connection:
+        daily_before = connection.execute(
+            "SELECT checksum,payload_json FROM daily_records"
+        ).fetchone()
+        checkpoint_before = connection.execute(
+            "SELECT checksum,payload_json FROM checkpoints"
+        ).fetchone()
+        connection.execute("UPDATE schema_version SET version=4")
+    db.initialize()
+    with db.connect() as connection:
+        daily_after = connection.execute(
+            "SELECT checksum,payload_json FROM daily_records"
+        ).fetchone()
+        checkpoint_after = connection.execute(
+            "SELECT checksum,payload_json FROM checkpoints"
+        ).fetchone()
+        assert tuple(daily_after) == tuple(daily_before)
+        assert tuple(checkpoint_after) == tuple(checkpoint_before)
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+
+
+def test_v4_to_v5_migration_failure_rolls_back_schema_and_version(tmp_path, monkeypatch):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("UPDATE schema_version SET version=4")
+        for table in (
+            "temperature_history_records", "temperature_mapping_events",
+            "temperature_mapping_attestations", "temperature_backfill_jobs",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+
+    def fail_after_schema_write(connection):
+        connection.execute("CREATE TABLE v5_partial_write(value INTEGER)")
+        raise sqlite3.OperationalError("injected v5 migration failure")
+
+    monkeypatch.setattr(database_module, "_migrate_temperature_storage_v5", fail_after_schema_write)
+    with pytest.raises(sqlite3.OperationalError, match="injected v5 migration failure"):
+        db.initialize()
+    with db.connect() as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='temperature_history_records'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='v5_partial_write'"
+        ).fetchone() is None
+
+
+def test_v4_to_v5_low_disk_defers_without_modifying_database(tmp_path, monkeypatch):
+    import custom_components.home_energy_intelligence.database as database_module
+
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    with db.connect() as connection:
+        connection.execute("UPDATE schema_version SET version=4")
+        for table in (
+            "temperature_history_records", "temperature_mapping_events",
+            "temperature_mapping_attestations", "temperature_backfill_jobs",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+    monkeypatch.setattr(
+        database_module.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+    with pytest.raises(RuntimeError, match="insufficient free space"):
+        db.initialize()
+    with db.connect() as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='temperature_history_records'"
+        ).fetchone() is None
 
 
 def test_bounded_history_pagination(tmp_path):

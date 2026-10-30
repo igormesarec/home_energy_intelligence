@@ -54,13 +54,19 @@ class TemperatureResult:
 
     @property
     def coverage_percent(self) -> float:
-        return 100.0 * self.coverage_seconds / self.period_seconds if self.period_seconds else 0.0
+        if not self.period_seconds:
+            return 0.0
+        if abs(self.coverage_seconds - self.period_seconds) <= 1e-6:
+            return 100.0
+        return max(0.0, min(
+            100.0, 100.0 * self.coverage_seconds / self.period_seconds
+        ))
 
     @property
     def quality(self) -> str:
         if self.coverage_seconds == 0:
             return "missing"
-        if self.coverage_percent < 100:
+        if self.coverage_seconds + 1e-6 < self.period_seconds:
             return "partial"
         return "good" if self.rejected_count == 0 else "filtered"
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## V0.1.2 — draft
+
+- Added additive Schema V5 temperature-only hourly/daily history so bounded Recorder backfill can recover validated temperatures even when no electricity row exists; energy, PV, HVAC allocations, checkpoints and V4 audits are not rewritten.
+- Added administrator-only Diagnose, existing-record repair, dry-run temperature-only preview, resumable backfill, progress, cancellation, exact skip reasons and before/after coverage counts.
+- Replaced mapping-identity reuse with chronological mapping events, including A→B→A, and added optional explicit bounded historical-identity attestations. Current mappings are never silently projected backward.
+- Made current-day confirmed plus assumed/selected/estimated HVAC electricity visible as a known/provisional through-cutoff total while retaining strict category provenance and calendar-day finalization separately.
+- Preserved full filtered temperature coverage as complete evidence, kept 95% response eligibility separate from 100% completeness, and normalized floating elapsed-time epsilon at true 100%.
+- Replaced energy-season sliders with localized English/Slovenian month choices, a visible 1–28 day field and a season preview while preserving saved mappings, floor area and effective dates.
+- Bumped the integration to 0.1.2 and added a panel JavaScript content hash to the module URL for deterministic HACS/restart cache invalidation.
+- Added V4→V5 preservation, rollback, low-disk, idempotence, DST, shared-entity, current-cutoff heating, no-false-zero and frontend release-safety regressions.
+
 ## V0.1.1 — draft
 
 - Required representative-temperature completeness now means exactly 100% validated elapsed coverage on normal and 23/25-hour dates; the independently configurable 95% threshold remains only a heating-response admission rule.

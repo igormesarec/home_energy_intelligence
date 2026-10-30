@@ -49,6 +49,95 @@ def test_canonical_contract_preserves_uncertain_categories_and_reconciles():
     assert energy["pv_self_consumption_percent"] == 62.5
 
 
+def test_current_cutoff_preserves_uncertain_selected_heating_as_provisional_total():
+    start = datetime(2026, 10, 29, tzinfo=UTC)
+    records = []
+    for index in range(2):
+        interval_start = start + timedelta(hours=index)
+        records.append({
+            "local_date": "2026-10-29", "timezone": "UTC",
+            "period_start_utc": interval_start.isoformat(),
+            "period_end_utc": (interval_start + timedelta(hours=1)).isoformat(),
+            "day_seconds": 3600, "household_kwh": 3.0, "quality": "uncertain",
+            "temperatures": {},
+            "allocations": {"hp-a": {
+                "meter_kwh": 1.5,
+                "categories": {"confirmed_heating": 1.0},
+                "reported_assumed_heating_kwh": 0.5,
+                "covered_seconds": 3600, "period_seconds": 3600,
+                "coverage_percent": 100, "quality": "uncertain",
+                "classification_source": "selected_mode",
+            }},
+        })
+    combined = combine_interval_records(
+        records, expected_start=start, expected_end=start + timedelta(hours=2),
+    )
+    combined.update(partial=True, finalized=False)
+    energy = canonical_energy(combined, [EQUIPMENT[0]])
+    assert energy["space_heating_kwh"] == 3.0
+    assert energy["known_space_heating_kwh"] == 3.0
+    assert energy["quality"] == "uncertain"
+    assert energy["complete_through_cutoff"] is True
+    assert energy["calendar_period_finalized"] is False
+    assert energy["provisional"] is True
+    assert energy["provisional_reason"] == "current_period_in_progress"
+
+
+def test_0800_live_example_shows_confirmed_hp_plus_selected_ac_without_promotion():
+    record = {
+        "household_kwh": 9.0, "partial": True, "finalized": False,
+        "interval_coverage": {
+            "complete": True,
+            "date_coverage": {"complete": True, "coverage_percent": 100},
+            "meter_coverage": {"complete": True, "coverage_percent": 100},
+            "allocation_coverage": {"complete": True, "coverage_percent": 100},
+        },
+        "allocations": {
+            "hp-a": {
+                "meter_kwh": 3.1, "categories": {"confirmed_heating": 3.1},
+                "covered_seconds": 28800, "period_seconds": 28800,
+                "quality": "good", "classification_source": "hvac_action",
+            },
+            "ac-a": {
+                "meter_kwh": 1.0, "categories": {"heating_selected": 1.0},
+                "covered_seconds": 28800, "period_seconds": 28800,
+                "quality": "uncertain", "classification_source": "selected_mode",
+            },
+        },
+    }
+    energy = canonical_energy(record, EQUIPMENT)
+    assert energy["space_heating_kwh"] == pytest.approx(4.1)
+    assert energy["confirmed_heat_pump_heating_kwh"] == pytest.approx(3.1)
+    assert energy["selected_ac_heating_kwh"] == pytest.approx(1.0)
+    assert energy["confirmed_ac_heating_kwh"] == 0
+    assert energy["quality"] == "uncertain"
+    assert energy["complete_through_cutoff"] is True
+    assert energy["calendar_period_finalized"] is False
+
+
+def test_full_coverage_filtered_temperature_stays_complete_but_filtered():
+    start = datetime(2026, 10, 29, tzinfo=UTC)
+    record = {
+        "local_date": "2026-10-29", "timezone": "UTC",
+        "period_start_utc": start.isoformat(),
+        "period_end_utc": (start + timedelta(hours=1)).isoformat(),
+        "day_seconds": 3600, "household_kwh": 1.0, "quality": "filtered",
+        "allocations": {},
+        "temperatures": {"outdoor": {
+            "mean": 5.0, "minimum": 4.0, "maximum": 6.0,
+            "coverage_seconds": 3600, "period_seconds": 3600,
+            "coverage_percent": 100, "quality": "filtered", "rejected_count": 1,
+        }},
+    }
+    combined = combine_interval_records(
+        [record], expected_start=start, expected_end=start + timedelta(hours=1),
+    )
+    assert combined["temperatures"]["outdoor"]["quality"] == "filtered"
+    layer = combined["interval_coverage"]["temperature_coverage"]["outdoor"]
+    assert layer["complete"] is True
+    assert layer["response_eligible"] is True
+
+
 def test_missing_equipment_never_becomes_false_zero():
     energy = canonical_energy({"allocations": {}, "quality": "missing"}, EQUIPMENT)
     assert energy["complete"] is False
@@ -56,7 +145,9 @@ def test_missing_equipment_never_becomes_false_zero():
     assert energy["space_heating_kwh"] is None
     assert energy["dhw_kwh"] is None
     assert energy["cooling_kwh"] is None
-    assert energy["known_space_heating_kwh"] == 0
+    assert energy["known_space_heating_kwh"] is None
+    assert energy["known_dhw_kwh"] is None
+    assert energy["known_cooling_kwh"] is None
     assert all(item["available"] is False for item in energy["equipment"])
 
 

@@ -9,6 +9,10 @@ The dedicated SQLite database uses WAL mode, foreign keys, transactional writes,
 | `checkpoints` | Six-hour UTC interval payloads | Indefinite in V0.1 |
 | `hourly_records` | Completed UTC-hour payloads for live/partial views | Indefinite in V0.1.1 |
 | `temperature_summaries` | Normalized per-source daily/hourly statistics and provenance | Indefinite |
+| `temperature_history_records` | Schema V5 independent hourly/daily temperature summaries keyed by UTC interval and stable source ID | Indefinite |
+| `temperature_mapping_events` | Chronological mapping occurrences; repeated A→B→A identities remain distinct | Indefinite |
+| `temperature_mapping_attestations` | Explicit administrator-approved bounded historical identity intervals | Indefinite |
+| `temperature_backfill_jobs` | Bounded preview/backfill cursor, cancellation, counters and exact skip reasons | Indefinite |
 | `hourly_temperature_rejections` | Deduplicated hourly rejection evidence, separate from compact summaries | Indefinite |
 | `rejected_readings` | Non-destructive rejection audit | Indefinite |
 | `job_runs` | Processing status and diagnostic metadata | Indefinite |
@@ -18,7 +22,9 @@ The dedicated SQLite database uses WAL mode, foreign keys, transactional writes,
 | `model_parameters` | Reserved for versioned model parameters | Future use |
 | `mapping_revisions` | Effective-dated, non-secret source/equipment provenance | Indefinite |
 
-`daily_records.local_date` is unique. `hourly_records` is unique by exact UTC start/end, so both repeated local hours on a DST fallback day remain distinct and retries are idempotent. Upserting unchanged content is a no-op; corrected daily content increments `revision`. Schema V4 keeps the V3 hourly layer and moves repeated temperature summaries/audit arrays out of record blobs. Reads hydrate the same logical payload, so analytics and exports remain compatible. The forward migration uses bounded keyset batches inside an immediate transaction, preserves logical checksums/revisions and auxiliary tables, and updates the version only after conversion. It does not run `VACUUM` during startup. A failed migration leaves the prior version and inline payloads intact and retryable. Lock/busy errors are never treated as corruption. Database integrity is checked at startup. A genuinely corrupt file is preserved with a timestamped `.corrupt-*.sqlite3` name before a new schema is created.
+`daily_records.local_date` is unique. `hourly_records` is unique by exact UTC start/end, so both repeated local hours on a DST fallback day remain distinct and retries are idempotent. Upserting unchanged content is a no-op; corrected daily content increments `revision`. Schema V4 keeps the V3 hourly layer and moves repeated temperature summaries/audit arrays out of record blobs. Schema V5 is additive: independent temperature records can be joined into History and cards without manufacturing an energy parent. The V4→V5 migration does not update daily/hourly/checkpoint payloads or checksums. All forward migrations run transactionally, update the version only after success and never run startup `VACUUM`. A failed migration leaves the prior version retryable. Lock/busy errors are never treated as corruption. Database integrity is checked at startup. A genuinely corrupt file is preserved with a timestamped `.corrupt-*.sqlite3` name before a new schema is created.
+
+Temperature-only rows contain temperature statistics and provenance only. Their energy, PV, import/export, non-HVAC and allocation fields are unavailable (`null`/empty), never zero. Read paths overlay stronger independent temperature summaries onto matching energy dates and expose temperature-only dates where no energy record exists. Heating-response admission still requires separate completed-day electricity evidence.
 
 Overview, History and CSV export receive the same backend `energy` object. It separates confirmed, assumed, selected and estimated classifications; idle; other HVAC (fan/dry); raw residual evidence; unallocated energy; other household use; and signed reconciliation discrepancy. Missing required sources remain `null`, never a manufactured zero.
 

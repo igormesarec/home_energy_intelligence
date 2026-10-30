@@ -4,7 +4,16 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 
 ![Approved dashboard design](docs/design/home_energy_intelligence_dashboard.png)
 
-## V0.1.1 features
+## V0.1.2 features
+
+- Administrator temperature-only backfill can create independent validated hourly and completed-day summaries from Recorder without creating or altering electricity, PV, grid or HVAC measurements. Jobs are bounded to 1–31 local days, previewable, cancellable, restart-safe and idempotent.
+- Diagnostics distinguish raw validated duration, energy history, independent temperature history, mapping eligibility, recoverable/blocked intervals, exact skip reasons, completed-hour cutoff and full-calendar coverage.
+- Current-day heating, DHW and cooling show known/provisional electricity through the latest completed-hour cutoff when evidence exists; assumed/selected/estimated values remain visibly distinct from confirmed values.
+- Schema V5 adds chronological temperature mapping events and independent temperature history. A→B→A is preserved, and historical identity requires recorded evidence or an explicit bounded administrator attestation.
+- English/Slovenian energy-season controls use readable month/day inputs and retain the saved floor area and all unrelated mappings.
+- The 0.1.2 panel URL includes a JavaScript content hash so a HACS update plus Home Assistant restart serves the changed frontend bundle.
+
+## V0.1.1 foundation
 
 - Overview defaults to today's actuals through the latest completed hour, with a same-cutoff yesterday comparison, full-yesterday reference, explicit partial/stale state and manual refresh. Its shared period selector updates KPIs, split, equipment and temperature views together.
 - A single backend energy contract drives Overview, History and authenticated CSV export, including confirmed, assumed, selected, estimated, unknown, residual and discrepancy evidence.
@@ -51,17 +60,18 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 6. In **Data quality**, explicitly choose one representative indoor source and one representative measured outdoor-air source, or leave either as **Not configured**. Use **Test representative sources** to preview the current normalized value, unit validation, quality and last update before saving. A weather entity, supply-water sensor or return-water sensor is never silently selected as outdoor air. The same section configures the minimum outdoor-temperature coverage used by the electrical response profile (95% by default).
 7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
-9. If a previously mapped representative sensor has blank historical cards, open the dashboard **Settings**, load **Temperature pipeline diagnostics**, then run the bounded repair after confirming Recorder still has valid history. Missing Recorder intervals remain gaps.
+9. If a representative sensor has blank history, open dashboard **Settings → Temperature pipeline diagnostics and recovery**. Select 1–31 dates, run **Diagnose**, then **Preview temperature-only backfill**. Start the backfill only after reviewing mapping blocks and query cost. Use the explicit attestation checkbox only when you can prove the displayed current entity/attribute/role applied to the entire selected range. Missing Recorder intervals remain gaps.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
 Before updating an existing installation, create the administrator-only protected
 database backup. Startup integrity-checks the database and transactionally
-migrates V1–V3 storage to schema V4, which normalizes temperature audit data.
+migrates V1–V4 storage to schema V5. V4 normalization remains intact; V5 adds
+independent temperature history, mapping events, attestations and resumable jobs.
 Migration is keyset-batched and never runs `VACUUM` during startup. Dashboard
 Settings discloses current/target schema, free space and the protected-backup
 policy; optional compaction is a separate manual offline maintenance action.
-Do not downgrade an already migrated database to a V3 writer; restore the backup
+Do not downgrade an already migrated database to a V4 or older writer; restore the backup
 if rollback is required.
 
 ## Safety and privacy
@@ -92,12 +102,13 @@ node --check custom_components/home_energy_intelligence/frontend/hei-panel.js
 
 See [testing](TESTING.md), [data quality](DATA_QUALITY.md), [schema](DATA_SCHEMA.md), [entity mapping](ENTITY_MAPPING.md), and [InfluxDB backfill](INFLUXDB_BACKFILL.md).
 
-The [V0.1.1 post-merge correction report](docs/V0.1.1_POST_MERGE_CORRECTION_REPORT.md) records the audited root causes, compatibility assessment, responsive layout evidence and manual backed-up Home Assistant checklist.
+The [V0.1.2 root-cause matrix](docs/V0_1_2_ROOT_CAUSE_MATRIX.md) and [implementation/acceptance report](docs/V0.1.2_IMPLEMENTATION_AND_ACCEPTANCE.md) record the design, migration/rollback procedure, evidence limits and manual backed-up Home Assistant checklist.
 
 ## Scope
 
 - **V0.1:** validated electricity, temperature, source quality, and basic dashboard/history/settings.
 - **V0.1.1:** whole-house electrical heating-response evidence; no thermal output is inferred.
+- **V0.1.2:** independent temperature history recovery, current-cutoff HVAC presentation and release-safety corrections.
 - **V0.2:** manually or natively sourced thermal energy, thermal response, and correctly weighted COP.
 - **V0.3:** weather sources and probabilistic forecasting.
 

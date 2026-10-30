@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 import uuid
 
@@ -23,6 +23,10 @@ POWER_UNITS = {"W", "kW"}
 TEMPERATURE_UNITS = {"°C", "°F"}
 DEFAULT_HP_MAP = {"heating_zones": "confirmed_heating", "heating_water": "dhw", "cooling": "cooling", "idle": "idle"}
 DEFAULT_AC_MAP = {"heating": "heating", "cooling": "cooling", "idle": "standby", "off": "standby"}
+MONTHS = {
+    "en": ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+    "sl": ("januar", "februar", "marec", "april", "maj", "junij", "julij", "avgust", "september", "oktober", "november", "december"),
+}
 
 
 def _optional(name: str, value: Any = None, **kwargs):
@@ -40,12 +44,30 @@ def _entity(domains, device_class=None):
 
 
 def _general(values):
+    locale = values.get("locale", "en")
+    month_names = MONTHS.get(locale, MONTHS["en"])
+    month_options = [
+        {"value": str(month), "label": label}
+        for month, label in enumerate(month_names, start=1)
+    ]
     return vol.Schema({
         vol.Required("locale", default=values.get("locale", "en")): selector.SelectSelector(selector.SelectSelectorConfig(options=["en", "sl"])),
         vol.Required("floor_area_m2", default=values.get("floor_area_m2", 180)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=5000, step=1, unit_of_measurement="m²")),
-        vol.Required("energy_season_start_month", default=values.get("energy_season_start_month", 7)): vol.All(vol.Coerce(int), vol.Range(min=1, max=12)),
-        vol.Required("energy_season_start_day", default=values.get("energy_season_start_day", 1)): vol.All(vol.Coerce(int), vol.Range(min=1, max=28)),
+        vol.Required("energy_season_start_month", default=str(values.get("energy_season_start_month", 7))): selector.SelectSelector(selector.SelectSelectorConfig(options=month_options)),
+        vol.Required("energy_season_start_day", default=values.get("energy_season_start_day", 1)): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=28, step=1, mode=selector.NumberSelectorMode.BOX)),
     })
+
+
+def _season_preview(values: dict[str, Any]) -> str:
+    locale = values.get("locale", "en")
+    months = MONTHS.get(locale, MONTHS["en"])
+    month = int(values.get("energy_season_start_month", 7))
+    day = int(values.get("energy_season_start_day", 1))
+    start = date(2026, month, day)
+    end = date(2027, month, day) - timedelta(days=1)
+    if locale == "sl":
+        return f"{start.day}. {months[start.month - 1]} – {end.day}. {months[end.month - 1]}"
+    return f"{months[start.month - 1]} {start.day} – {months[end.month - 1]} {end.day}"
 
 
 def _equipment(kind, values=None, allow_skip=False):
@@ -170,12 +192,32 @@ class _Wizard:
 
     async def async_step_general(self, user_input=None):
         if user_input is not None:
+            user_input["energy_season_start_month"] = int(
+                user_input.get(
+                    "energy_season_start_month",
+                    self.result.get("energy_season_start_month", 7),
+                )
+            )
+            user_input.setdefault(
+                "energy_season_start_day",
+                self.result.get("energy_season_start_day", 1),
+            )
             self.result.update(user_input)
             if not self._editing:
                 self.equipment = []
                 self.temperatures = []
             return await self.async_step_heat_pumps()
-        return self.async_show_form(step_id="general", data_schema=_general(self.result))
+        display_values = dict(self.result)
+        display_values.setdefault(
+            "locale",
+            self.hass.config.language if self.hass.config.language in MONTHS else "en",
+        )
+        return self.async_show_form(
+            step_id="general", data_schema=_general(display_values),
+            description_placeholders={
+                "energy_season_preview": _season_preview(display_values)
+            },
+        )
 
     def _accept_equipment(self, kind, values):
         if not values.get("configure"): return {}

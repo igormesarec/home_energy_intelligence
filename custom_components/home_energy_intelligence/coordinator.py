@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 import json
@@ -75,6 +75,7 @@ class HomeEnergyCoordinator:
         self.reader = RecorderReader(hass)
         self.timezone = hass.config.time_zone
         self._temperature_repair_lock = asyncio.Lock()
+        self._temperature_backfill_lock = asyncio.Lock()
 
     def _temperature_mapping_identity(self, item) -> dict[str, object]:
         return {
@@ -365,6 +366,324 @@ class HomeEnergyCoordinator:
             "elapsed_seconds": round(monotonic() - started, 3),
         }
 
+    async def async_start_temperature_backfill(
+        self, start_date: date, end_date: date, *, dry_run: bool = False,
+        attest_current_mapping: bool = False,
+    ) -> dict[str, object]:
+        """Queue a bounded independent temperature-history job."""
+        if end_date < start_date or (end_date - start_date).days > 30:
+            raise ValueError("Temperature backfill range must be 1–31 inclusive days")
+        range_start, _ = local_day_bounds(start_date, self.timezone)
+        _, range_end = local_day_bounds(end_date, self.timezone)
+        range_end = min(
+            range_end, datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        )
+        if attest_current_mapping and not dry_run:
+            for item in self._temperature_sources():
+                await self.hass.async_add_executor_job(
+                    self.database.attest_temperature_mapping,
+                    item.source_id, range_start, range_end,
+                    self._temperature_mapping_identity(item),
+                )
+        job_id = await self.hass.async_add_executor_job(
+            partial(
+                self.database.create_temperature_backfill_job,
+                start_date.isoformat(), end_date.isoformat(), dry_run=dry_run,
+                details={
+                    "attested_current_mapping": attest_current_mapping,
+                    "timezone": self.timezone,
+                },
+            )
+        )
+        task = self._async_run_temperature_backfill(job_id)
+        create_background = getattr(self.entry, "async_create_background_task", None)
+        if create_background is not None:
+            create_background(
+                self.hass, task, f"{self.entry.entry_id}_temperature_backfill_{job_id}"
+            )
+        else:
+            self.hass.async_create_task(task)
+        return {
+            "job_id": job_id, "status": "queued", "dry_run": dry_run,
+            "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
+        }
+
+    async def _async_run_temperature_backfill(self, job_id: int) -> dict[str, object]:
+        async with self._temperature_backfill_lock:
+            return await self._async_execute_temperature_backfill(job_id)
+
+    async def _async_execute_temperature_backfill(self, job_id: int) -> dict[str, object]:
+        """Run or resume one idempotent temperature-only backfill job."""
+        job = await self.hass.async_add_executor_job(
+            self.database.temperature_backfill_job, job_id
+        )
+        if job is None:
+            raise ValueError("Temperature backfill job does not exist")
+        counters = {
+            "processed_days": 0, "expected_hourly_intervals": 0,
+            "eligible_hourly_summaries": 0, "inserted_hourly": 0,
+            "eligible_daily_summaries": 0,
+            "updated_hourly": 0, "unchanged_hourly": 0,
+            "inserted_daily": 0, "updated_daily": 0, "unchanged_daily": 0,
+            "skipped": 0, "failed": 0, "recorder_query_count": 0,
+            "recorder_rows": 0, "normalized_samples": 0,
+        }
+        details = dict(job.get("details") or {})
+        counters.update({
+            key: int(details.get(key, value) or 0)
+            for key, value in counters.items()
+        })
+        reasons: list[dict[str, object]] = list(details.get("skip_reasons") or [])
+        dry_run = bool(job["dry_run"])
+        original_start_date = date.fromisoformat(str(job["start_date"]))
+        start_date = date.fromisoformat(str(job.get("cursor_date") or job["start_date"]))
+        end_date = date.fromisoformat(job["end_date"])
+        range_start_utc, _ = local_day_bounds(original_start_date, self.timezone)
+        _, range_end_utc = local_day_bounds(end_date, self.timezone)
+        before_counts = details.get("temperature_summaries_before")
+        if not isinstance(before_counts, dict):
+            before_counts = await self.hass.async_add_executor_job(
+                self.database.temperature_history_counts,
+                range_start_utc, range_end_utc, None, None,
+            )
+            details["temperature_summaries_before"] = before_counts
+        configured = {item.source_id: item for item in self._temperature_sources()}
+        await self.hass.async_add_executor_job(
+            partial(self.database.update_temperature_backfill_job, job_id, status="running")
+        )
+        try:
+            day = start_date
+            while day <= end_date:
+                current_job = await self.hass.async_add_executor_job(
+                    self.database.temperature_backfill_job, job_id
+                )
+                if current_job and current_job.get("cancel_requested"):
+                    details = {**details, **counters, "skip_reasons": reasons[-500:]}
+                    await self.hass.async_add_executor_job(
+                        partial(
+                            self.database.update_temperature_backfill_job, job_id,
+                            status="cancelled", cursor_date=day.isoformat(), details=details,
+                        )
+                    )
+                    return {"job_id": job_id, "status": "cancelled", **details}
+                day_start, day_end = local_day_bounds(day, self.timezone)
+                effective_end = min(
+                    day_end, datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+                )
+                if effective_end <= day_start:
+                    reasons.append({
+                        "date": day.isoformat(), "reason": "future_interval_not_processed",
+                    })
+                    day += timedelta(days=1)
+                    continue
+                hours: list[tuple[datetime, datetime]] = []
+                cursor = day_start
+                while cursor + timedelta(hours=1) <= effective_end:
+                    hours.append((cursor, cursor + timedelta(hours=1)))
+                    cursor += timedelta(hours=1)
+                counters["expected_hourly_intervals"] += len(hours) * len(configured)
+                applicable: dict[str, dict[str, object]] = {}
+                historical_mappings = []
+                for source_id, item in configured.items():
+                    decision = await self.hass.async_add_executor_job(
+                        partial(
+                            self.database.temperature_mapping_applicability,
+                            source_id, day_start, effective_end,
+                            self._temperature_mapping_identity(item),
+                            allow_historical_identity=True,
+                        )
+                    )
+                    if (
+                        not decision.get("eligible") and dry_run
+                        and details.get("attested_current_mapping")
+                    ):
+                        decision = {
+                            "eligible": True,
+                            "reason": "mapping_user_attested_preview",
+                            **self._temperature_mapping_identity(item),
+                            "mapping_event_id": None,
+                            "mapping_attestation_id": None,
+                            "mapping_effective_at": range_start_utc.isoformat(),
+                            "mapping_effective_end": range_end_utc.isoformat(),
+                        }
+                    if not decision.get("eligible"):
+                        reason = str(decision.get("reason") or "mapping_not_recorded_for_interval")
+                        if reason == "mapping_changes_within_interval":
+                            reason = "mapping_changed"
+                        counters["skipped"] += len(hours)
+                        reasons.append({
+                            "date": day.isoformat(), "source_id": source_id,
+                            "reason": reason, **decision,
+                        })
+                        continue
+                    applicable[source_id] = decision
+                    historical_mappings.append(replace(
+                        item, entity_id=str(decision["entity_id"]),
+                        attribute=decision.get("attribute"),
+                        role=str(decision["role"]), enabled=True,
+                    ))
+                if not historical_mappings:
+                    counters["processed_days"] += 1
+                    day += timedelta(days=1)
+                    continue
+                source = await self._async_collect_temperatures(
+                    day_start, effective_end,
+                    set(applicable), source_mappings=historical_mappings,
+                )
+                metrics = source.provenance.get("collection_metrics", {})
+                counters["recorder_query_count"] += int(
+                    metrics.get("recorder_query_count", 0) or 0
+                )
+                counters["recorder_rows"] += int(metrics.get("history_rows", 0) or 0)
+                counters["normalized_samples"] += int(
+                    metrics.get("normalized_samples", 0) or 0
+                )
+                aggregator = self._aggregator()
+
+                async def persist(
+                    kind: str, interval_start: datetime, interval_end: datetime,
+                    summary_source_id: str, summary: dict[str, Any],
+                ) -> None:
+                    decision = applicable[summary_source_id]
+                    provenance = dict(summary.get("source_provenance") or {})
+                    provenance.update({
+                        "source_id": summary_source_id,
+                        "entity_id": decision.get("entity_id"),
+                        "attribute": decision.get("attribute"),
+                        "role": decision.get("role"),
+                        "mapping_event_id": decision.get("mapping_event_id"),
+                        "mapping_attestation_id": decision.get("mapping_attestation_id"),
+                        "mapping_effective_at": decision.get("mapping_effective_at"),
+                        "mapping_effective_end": decision.get("mapping_effective_end"),
+                    })
+                    candidate = {**summary, "source_provenance": provenance}
+                    if candidate.get("mean") is None or float(
+                        candidate.get("coverage_seconds", 0) or 0
+                    ) <= 0:
+                        counters["skipped"] += 1
+                        collection = source.provenance.get(
+                            "temperature_collection", {}
+                        ).get(summary_source_id, {})
+                        invalid = collection.get("invalid_reasons") or []
+                        reasons.append({
+                            "date": day.isoformat(), "source_id": summary_source_id,
+                            "interval_start_utc": interval_start.isoformat(),
+                            "reason": ("invalid_samples" if invalid
+                                       else "no_valid_recorder_evidence"),
+                            "invalid_reasons": invalid,
+                        })
+                        return
+                    counters["eligible_hourly_summaries"] += int(kind == "hourly")
+                    counters["eligible_daily_summaries"] += int(kind == "daily")
+                    outcome = await self.hass.async_add_executor_job(
+                        partial(
+                            self.database.upsert_temperature_history,
+                            kind, interval_start, interval_end, day.isoformat(),
+                            self.timezone, summary_source_id, candidate, decision,
+                            dry_run=dry_run,
+                        )
+                    )
+                    key = f"{outcome}_{kind}"
+                    if key in counters:
+                        counters[key] += 1
+                    elif outcome.startswith("skipped"):
+                        counters["skipped"] += 1
+                        reasons.append({
+                            "date": day.isoformat(), "source_id": summary_source_id,
+                            "interval_start_utc": interval_start.isoformat(),
+                            "reason": outcome,
+                        })
+
+                for hour_start, hour_end in hours:
+                    recovered = await self.hass.async_add_executor_job(
+                        aggregator.aggregate_range, day, hour_start, hour_end, source
+                    )
+                    for source_id in applicable:
+                        summary = recovered.temperatures.get(source_id)
+                        if isinstance(summary, dict):
+                            await persist("hourly", hour_start, hour_end, source_id, summary)
+                if effective_end == day_end:
+                    recovered_day = await self.hass.async_add_executor_job(
+                        aggregator.aggregate_range, day, day_start, day_end, source
+                    )
+                    for source_id in applicable:
+                        summary = recovered_day.temperatures.get(source_id)
+                        if isinstance(summary, dict):
+                            await persist("daily", day_start, day_end, source_id, summary)
+                counters["processed_days"] += 1
+                next_day = day + timedelta(days=1)
+                details = {**details, **counters, "skip_reasons": reasons[-500:]}
+                await self.hass.async_add_executor_job(
+                    partial(
+                        self.database.update_temperature_backfill_job, job_id,
+                        cursor_date=next_day.isoformat(), details=details,
+                    )
+                )
+                day = next_day
+                await asyncio.sleep(0)
+            changes = sum(counters[key] for key in (
+                "inserted_hourly", "updated_hourly", "inserted_daily", "updated_daily",
+            ))
+            if dry_run:
+                outcome = (
+                    "preview_ready" if counters["eligible_hourly_summaries"]
+                    or counters["eligible_daily_summaries"]
+                    else "preview_no_recoverable_records_action_required"
+                )
+            elif changes:
+                outcome = "records_recovered"
+            elif counters["skipped"] or counters["failed"]:
+                outcome = "no_records_recovered_action_required"
+            else:
+                outcome = "no_changes_needed"
+            after_counts = await self.hass.async_add_executor_job(
+                self.database.temperature_history_counts,
+                range_start_utc, range_end_utc, None, None,
+            )
+            details = {
+                **details, **counters, "skip_reasons": reasons[-500:],
+                "outcome": outcome,
+                "temperature_summaries_before": before_counts,
+                "temperature_summaries_after": after_counts,
+                "net_new_temperature_summaries": {
+                    kind: int(after_counts.get(kind, 0)) - int(before_counts.get(kind, 0))
+                    for kind in {"hourly", "daily"}
+                },
+            }
+            status = "preview_complete" if dry_run else "completed"
+            await self.hass.async_add_executor_job(
+                partial(
+                    self.database.update_temperature_backfill_job, job_id,
+                    status=status, cursor_date=(end_date + timedelta(days=1)).isoformat(),
+                    details=details,
+                )
+            )
+            if changes:
+                async_dispatcher_send(self.hass, f"{self.entry.entry_id}_updated")
+            return {"job_id": job_id, "status": status, **details}
+        except asyncio.CancelledError:
+            await self.hass.async_add_executor_job(
+                partial(
+                    self.database.update_temperature_backfill_job, job_id,
+                    status="interrupted", details={
+                        **details, **counters, "skip_reasons": reasons[-500:],
+                    },
+                )
+            )
+            raise
+        except Exception as error:
+            _LOGGER.exception("Temperature-only backfill job %s failed", job_id)
+            counters["failed"] += 1
+            details = {**details, **counters, "skip_reasons": reasons[-500:],
+                       "error": type(error).__name__, "outcome": "failed"}
+            await self.hass.async_add_executor_job(
+                partial(
+                    self.database.update_temperature_backfill_job, job_id,
+                    status="failed", details=details,
+                )
+            )
+            return {"job_id": job_id, "status": "failed", **details}
+
     async def async_temperature_diagnostics(
         self, start_date: date, end_date: date,
     ) -> dict[str, Any]:
@@ -382,8 +701,24 @@ class HomeEnergyCoordinator:
         hourly = await self.hass.async_add_executor_job(
             self.database.hourly_range, start, end
         )
+        temperature_only_hourly = await self.hass.async_add_executor_job(
+            self.database.temperature_history_range, "hourly", start, end
+        )
+        hourly_by_key = {row["period_start_utc"]: row for row in hourly}
+        for row in temperature_only_hourly:
+            if row["period_start_utc"] not in hourly_by_key:
+                hourly.append(row)
+                hourly_by_key[row["period_start_utc"]] = row
+        hourly.sort(key=lambda row: row["period_start_utc"])
         daily = await self.hass.async_add_executor_job(
             self.database.history_period, start_date.isoformat(), end_date.isoformat()
+        )
+        temperature_only_daily = await self.hass.async_add_executor_job(
+            self.database.temperature_history_range, "daily", start, end
+        )
+        energy_counts = await self.hass.async_add_executor_job(
+            self.database.energy_record_counts, start, end,
+            start_date.isoformat(), end_date.isoformat(),
         )
         configured = self._temperature_sources(include_disabled=True)
         collection = source.provenance.get("temperature_collection", {})
@@ -399,6 +734,14 @@ class HomeEnergyCoordinator:
         for item in configured:
             live = self.hass.states.get(item.entity_id)
             raw = collection.get(item.source_id, {})
+            mapping_decision = await self.hass.async_add_executor_job(
+                partial(
+                    self.database.temperature_mapping_applicability,
+                    item.source_id, start, end,
+                    self._temperature_mapping_identity(item),
+                    allow_historical_identity=True,
+                )
+            )
             persisted_hourly = [
                 row.get("temperatures", {}).get(item.source_id)
                 for row in hourly
@@ -410,6 +753,10 @@ class HomeEnergyCoordinator:
                 if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
             ]
             missing_intervals = []
+            recoverable_intervals = []
+            nonrecoverable_intervals = []
+            recoverable_interval_count = 0
+            nonrecoverable_interval_count = 0
             for interval_start, _interval_end in expected_hours:
                 row = hourly_by_start.get(interval_start.isoformat())
                 summary = (row.get("temperatures", {}).get(item.source_id)
@@ -417,7 +764,7 @@ class HomeEnergyCoordinator:
                 if row is None:
                     reason = "hourly_record_not_processed"
                 elif not isinstance(summary, dict):
-                    reason = "temperature_summary_not_persisted"
+                    reason = "temperature_not_persisted"
                 elif not summary.get("coverage_seconds"):
                     reasons = [
                         rejection.get("reason", "rejected")
@@ -426,6 +773,22 @@ class HomeEnergyCoordinator:
                     reason = ",".join(sorted(set(reasons))) or "no_valid_coverage"
                 else:
                     continue
+                target = recoverable_intervals if (
+                    mapping_decision.get("eligible")
+                    and raw.get("validated_coverage_seconds", 0) > 0
+                ) else nonrecoverable_intervals
+                if target is recoverable_intervals:
+                    recoverable_interval_count += 1
+                else:
+                    nonrecoverable_interval_count += 1
+                if len(target) < 200:
+                    target.append({
+                        "start": interval_start.isoformat(),
+                        "reason": (
+                            reason if mapping_decision.get("eligible") else
+                            mapping_decision.get("reason", "mapping_not_recorded_for_interval")
+                        ),
+                    })
                 if len(missing_intervals) < 200:
                     missing_intervals.append({
                         "start": interval_start.isoformat(), "reason": reason,
@@ -456,6 +819,13 @@ class HomeEnergyCoordinator:
                 for summary in persisted_hourly
             )
             expected_seconds = max(0.0, (end - start).total_seconds())
+            raw_samples = source.temperatures.get(item.source_id, [])
+            raw_reason_counts: dict[str, int] = {}
+            for sample in raw_samples:
+                reason = str(sample.reason or (
+                    "valid" if sample.value is not None else "invalid"
+                ))
+                raw_reason_counts[reason] = raw_reason_counts.get(reason, 0) + 1
             if not item.enabled:
                 stage = "disabled"
             elif live is None:
@@ -500,6 +870,7 @@ class HomeEnergyCoordinator:
                     self.config.get("representative_outdoor_source_id"),
                 },
                 "mapping_effective_at": self.mapping_revision.get("effective_at"),
+                "mapping_eligibility": mapping_decision,
                 "persisted_source_provenance": next((
                     summary.get("source_provenance")
                     for summary in reversed([*persisted_hourly, *persisted_daily])
@@ -521,20 +892,56 @@ class HomeEnergyCoordinator:
                 "persisted_daily_summaries": len(persisted_daily),
                 "persisted_valid_daily_summaries": valid_daily,
                 "persisted_hourly_coverage_seconds": coverage_seconds,
+                "unvalidated_or_stale_seconds": max(
+                    0.0, expected_seconds
+                    - float(raw.get("validated_coverage_seconds", 0) or 0)
+                ),
+                "raw_sample_reason_counts": raw_reason_counts,
                 "persisted_hourly_coverage_percent": round(
                     coverage_seconds / expected_seconds * 100.0, 2
                 ) if expected_seconds else 0.0,
+                "complete_through_cutoff": bool(
+                    expected_seconds and coverage_seconds + 1e-6 >= expected_seconds
+                ),
+                "complete_calendar_range": bool(
+                    requested_end <= end and expected_seconds
+                    and coverage_seconds + 1e-6 >= expected_seconds
+                ),
                 "rejected_samples": rejections[-100:],
                 "missing_interval_count": len(expected_hours) - valid_hourly,
                 "missing_intervals": missing_intervals,
+                "recoverable_missing_interval_count": recoverable_interval_count,
+                "recoverable_missing_intervals": recoverable_intervals,
+                "nonrecoverable_interval_count": nonrecoverable_interval_count,
+                "nonrecoverable_intervals": nonrecoverable_intervals,
+                "temperature_only_hourly_summaries": sum(
+                    1 for row in temperature_only_hourly
+                    if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+                ),
+                "temperature_only_daily_summaries": sum(
+                    1 for row in temperature_only_daily
+                    if isinstance(row.get("temperatures", {}).get(item.source_id), dict)
+                ),
                 "pipeline_stage": stage,
             })
         return {
             "start_utc": start.isoformat(), "end_utc": end.isoformat(),
+            "requested_start": start_date.isoformat(),
+            "requested_end": end_date.isoformat(),
             "bounded_days": (end_date - start_date).days + 1,
             "expected_hourly_intervals": len(expected_hours),
             "query_errors": source.provenance.get("query_errors", []),
             "collection_metrics": source.provenance.get("collection_metrics", {}),
+            "energy_history_records": energy_counts,
+            "temperature_only_history_records": {
+                "hourly": len(temperature_only_hourly),
+                "daily": len(temperature_only_daily),
+            },
+            "estimated_recorder_query_count": int(
+                source.provenance.get("collection_metrics", {}).get(
+                    "recorder_query_count", 0
+                ) or 0
+            ),
             "configuration_status": "configured" if configured else "not_configured",
             "representative_sources": {
                 "indoor": self.config.get("representative_indoor_source_id"),
@@ -591,6 +998,19 @@ class HomeEnergyCoordinator:
 
     async def async_catch_up(self) -> None:
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
+        resumable_jobs = await self.hass.async_add_executor_job(
+            self.database.resumable_temperature_backfill_jobs
+        )
+        for job in resumable_jobs:
+            task = self._async_run_temperature_backfill(int(job["id"]))
+            create_background = getattr(self.entry, "async_create_background_task", None)
+            if create_background is not None:
+                create_background(
+                    self.hass, task,
+                    f"{self.entry.entry_id}_temperature_backfill_{job['id']}",
+                )
+            else:
+                self.hass.async_create_task(task)
         async def startup_temperature_repair() -> None:
             try:
                 async with asyncio.timeout(120):
@@ -652,9 +1072,10 @@ class HomeEnergyCoordinator:
 
     async def _async_collect_temperatures(
         self, start: datetime, end: datetime, source_ids: set[str] | None = None,
+        *, source_mappings=None,
     ) -> DailyInput:
         """Read only bounded temperature evidence; never query energy or HVAC modes."""
-        sources = self._temperature_sources()
+        sources = list(source_mappings) if source_mappings is not None else self._temperature_sources()
         if source_ids is not None:
             sources = [item for item in sources if item.source_id in source_ids]
         entity_ids = sorted({item.entity_id for item in sources if item.entity_id})
