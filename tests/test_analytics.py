@@ -566,7 +566,7 @@ def test_heating_response_uses_one_exact_coverage_boundary(coverage, expected_st
         "mean": 5, "minimum": 3, "maximum": 7,
         "coverage_percent": coverage,
         "coverage_seconds": 86400 * coverage / 100,
-        "period_seconds": 86400, "quality": "good" if coverage >= 95 else "partial",
+        "period_seconds": 86400, "quality": "good" if coverage >= 100 else "partial",
     }}
     point = heating_response_profile(
         [record], EQUIPMENT[:1], outdoor_source_id="outdoor",

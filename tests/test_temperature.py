@@ -58,6 +58,15 @@ def test_freshness_limit_creates_missing_coverage_without_new_evidence():
     assert result.coverage_percent == 25
 
 
+def test_response_eligible_coverage_is_still_honestly_partial_until_100_percent():
+    result = time_weighted_temperature(
+        [NumericSample(dt(), 20, "point_sample")], dt(), dt(1),
+        minimum_valid=-10, maximum_valid=60, max_carry=timedelta(minutes=57),
+    )
+    assert result.coverage_percent == 95
+    assert result.quality == "partial"
+
+
 def test_unchanged_recorder_state_is_not_stale_solely_from_last_change_time():
     result = time_weighted_temperature(
         [NumericSample(dt() - timedelta(days=2), 19.5)], dt(), dt(2),
