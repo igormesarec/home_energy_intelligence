@@ -1445,6 +1445,7 @@ class HomeEnergyCoordinator:
 
         numeric_evidence: dict[str, dict[str, object]] = {}
         counter_sources: dict[str, str] = {}
+        counter_fallback_reasons: dict[str, str] = {}
 
         async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
                           attribute: str | None = None, dimension: str | None = None,
@@ -1471,6 +1472,9 @@ class HomeEnergyCoordinator:
                 suspicious_counter = delta is None and rejected > 0
                 if not raw_usable:
                     counter_sources[source_key] = "recorder_states_unreliable"
+                    counter_fallback_reasons[source_key] = (
+                        "suspicious_reset_or_rejected_change" if rejected else "missing_counter_baseline"
+                    )
             if (raw_coverage > 0 if raw_coverage is not None else raw_usable):
                 if statistics_type == "counter":
                     counter_sources[source_key] = "recorder_states"
@@ -1704,5 +1708,6 @@ class HomeEnergyCoordinator:
             "mapping_effective_at": revision["effective_at"],
             "temperature_collection": temperature_collection,
             "counter_collection": counter_sources,
+            "counter_fallback_reasons": counter_fallback_reasons,
         }, temperature_quality=temperature_quality, temperature_roles=temperature_roles,
             site_configured={key for key, entity in site_sources.items() if entity})
