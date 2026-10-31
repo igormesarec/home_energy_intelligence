@@ -25,6 +25,33 @@ if importlib.util.find_spec("homeassistant") is not None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [True, False])
+async def test_false_counter_reset_uses_only_complete_statistics(hass, complete):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.allocation import counter_delta
+
+    start = datetime(2026, 9, 17, 22, tzinfo=UTC)
+    end = start + timedelta(hours=24)
+    entity = "sensor.aurora_energy"
+    entry = SimpleNamespace(entry_id="entry", data={
+        "equipment": json.dumps([{"equipment_id": "ac", "display_name": "AC", "kind": "air_conditioner", "enabled": True, "energy_entity": entity}]),
+        "site_sources": {}, "temperature_sources": "[]"}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, SimpleNamespace(store_mapping_revision=lambda _: True))
+    rows = [SimpleNamespace(last_updated=start + timedelta(hours=i), state=str(value),
+                            attributes={"unit_of_measurement": "kWh"})
+            for i, value in ((0, 310), (1, 0), (2, 310.06))]
+    stats = [{"start": start + timedelta(hours=i), "end": start + timedelta(hours=i+1), "change": 0.1}
+             for i in range(24 if complete else 23)]
+    coordinator.reader = SimpleNamespace(async_history=AsyncMock(return_value={entity: rows}),
+                                         async_statistics=AsyncMock(return_value={entity: stats}))
+    result = await coordinator._async_collect_range(start, end)
+    value, _, _ = counter_delta(result.devices["ac"].counter, start, end)
+    assert value == pytest.approx(2.4) if complete else value is None
+    assert result.provenance["counter_collection"]["equipment.ac.energy"] == (
+        "recorder_statistics" if complete else "recorder_states_unreliable")
+
+
+@pytest.mark.asyncio
 async def test_september_counter_history_without_baseline_uses_complete_statistics(hass):
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
     from custom_components.home_energy_intelligence.allocation import counter_delta

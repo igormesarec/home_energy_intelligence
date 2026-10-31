@@ -80,6 +80,29 @@ def test_historical_counter_correction_changes_residual_not_confirmed_classifica
     assert hp["authoritative_counter_source"] == "daily_recorder"
 
 
+@pytest.mark.parametrize("day", [date(2026, 9, 18), date(2026, 9, 30)])
+def test_unreliable_counter_cannot_restore_inflated_checkpoint(day):
+    from custom_components.home_energy_intelligence.timeutils import cycle_boundaries
+    boundaries = cycle_boundaries(day, "Europe/Ljubljana", 6)
+    checkpoints = [{"interval_start_utc": left.isoformat(), "interval_end_utc": right.isoformat(),
+                    "meter_kwh": 80, "allocations_kwh": {"cooling": .1},
+                    "residual_kwh": 79.9, "covered_seconds": 3600, "quality": "partial"}
+                   for left, right in zip(boundaries, boundaries[1:])]
+    history = DeviceHistory(kind="air_conditioner")
+    source = DailyInput({"ac": history}, {}, {}, checkpoints={"ac": checkpoints},
+                        provenance={"counter_collection": {"equipment.ac.energy": "recorder_states_unreliable"}})
+    allocation = DailyAggregator("Europe/Ljubljana").aggregate(day, source).allocations["ac"]
+    assert allocation["meter_kwh"] is None
+    assert allocation["categories"]["cooling"] == pytest.approx(.4)
+    assert allocation["authoritative_counter_source"] == "unavailable"
+    history.counter = [NumericSample(boundaries[0], 0), NumericSample(boundaries[-1], 2)]
+    source.provenance["counter_collection"]["equipment.ac.energy"] = "recorder_statistics"
+    allocation = DailyAggregator("Europe/Ljubljana").aggregate(day, source).allocations["ac"]
+    assert allocation["meter_kwh"] == pytest.approx(2)
+    assert allocation["residual_kwh"] == pytest.approx(1.6)
+    assert allocation["authoritative_counter_source"] == "recorder_statistics"
+
+
 def test_heat_pump_residual_is_assumed_only_for_reporting_and_remains_auditable():
     day = date(2026, 10, 25)
     start, end = local_day_bounds(day, "Europe/Ljubljana")

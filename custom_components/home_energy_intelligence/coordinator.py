@@ -1445,6 +1445,7 @@ class HomeEnergyCoordinator:
 
         numeric_evidence: dict[str, dict[str, object]] = {}
         counter_sources: dict[str, str] = {}
+        counter_fallback_reasons: dict[str, str] = {}
 
         async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
                           attribute: str | None = None, dimension: str | None = None,
@@ -1462,11 +1463,18 @@ class HomeEnergyCoordinator:
             candidates = ({"recorder_states": raw_coverage}
                           if raw_coverage is not None else {})
             raw_usable = len(raw) >= 2
+            suspicious_counter = False
             if statistics_type == "counter":
                 delta, _resets, rejected = counter_delta(
                     raw, start, end, maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500))
                 )
                 raw_usable = delta is not None and not rejected
+                suspicious_counter = delta is None and rejected > 0
+                if not raw_usable:
+                    counter_sources[source_key] = "recorder_states_unreliable"
+                    counter_fallback_reasons[source_key] = (
+                        "suspicious_reset_or_rejected_change" if rejected else "missing_counter_baseline"
+                    )
             if (raw_coverage > 0 if raw_coverage is not None else raw_usable):
                 if statistics_type == "counter":
                     counter_sources[source_key] = "recorder_states"
@@ -1529,7 +1537,7 @@ class HomeEnergyCoordinator:
                                 maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
                             )
                             if delta is None or rejected:
-                                return raw
+                                return []
                             counter_sources[source_key] = "recorder_statistics"
                         if temperature_mapping is not None:
                             numeric_evidence[source_key] = {
@@ -1539,7 +1547,7 @@ class HomeEnergyCoordinator:
                             }
                         return normalized_statistics
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
-            if influx is not None and isinstance(mapping, dict):
+            if influx is not None and isinstance(mapping, dict) and not suspicious_counter:
                 try:
                     rows = await self.hass.async_add_executor_job(partial(
                         influx.query, mapping["measurement"], mapping.get("field", "value"),
@@ -1607,7 +1615,7 @@ class HomeEnergyCoordinator:
                     "fallback_reason": "no_candidate_has_validated_coverage",
                     "candidate_validated_coverage_seconds": candidates,
                 }
-            return raw
+            return [] if statistics_type == "counter" and not raw_usable else raw
 
         devices = {}
         for item in equipment:
@@ -1700,5 +1708,6 @@ class HomeEnergyCoordinator:
             "mapping_effective_at": revision["effective_at"],
             "temperature_collection": temperature_collection,
             "counter_collection": counter_sources,
+            "counter_fallback_reasons": counter_fallback_reasons,
         }, temperature_quality=temperature_quality, temperature_roles=temperature_roles,
             site_configured={key for key, entity in site_sources.items() if entity})

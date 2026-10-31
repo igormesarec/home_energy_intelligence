@@ -147,7 +147,17 @@ class DailyAggregator:
                 history.counter, start, end,
                 maximum_delta_kwh=self.maximum_counter_delta_kwh,
             )
-            meter_value = authoritative if authoritative is not None else (meter_total if meter_known else None)
+            counter_source = source.provenance.get("counter_collection", {}).get(
+                f"equipment.{device}.energy"
+            )
+            unreliable = counter_source == "recorder_states_unreliable" or (
+                authoritative is None and daily_rejected > 0
+            )
+            meter_value = authoritative if authoritative is not None else (
+                meter_total if meter_known and not unreliable else None
+            )
+            if unreliable or counter_source == "recorder_statistics":
+                qualities.append("partial")
             if meter_value is not None:
                 # Categories remain checkpoint-derived. Any correction or missing
                 # evidence is visible as residual instead of being forced into a
@@ -178,7 +188,10 @@ class DailyAggregator:
                 "measured": True,
                 "checkpoint_intervals": checkpoint_intervals,
                 "classification_source": "persisted_checkpoints" if checkpoint_intervals else "history_recovery",
-                "authoritative_counter_source": "daily_recorder" if authoritative is not None else "checkpoints",
+                "authoritative_counter_source": (
+                    counter_source or "daily_recorder" if authoritative is not None
+                    else "checkpoints" if meter_value is not None else "unavailable"
+                ),
                 "source_provenance": history.provenance,
                 "checkpoint_source_provenance": checkpoint_sources,
                 "assumed_heating_reporting": self.assumed_heating_reporting,
