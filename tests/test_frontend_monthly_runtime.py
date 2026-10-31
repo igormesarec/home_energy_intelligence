@@ -106,6 +106,26 @@ process.stdout.write(panel.copView());
     assert "Space heating COP<b>Unavailable" in output
 
 
+def test_house_profile_uses_configured_area_qualified_points_and_separate_thermal():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.heatingIntensity=true;
+panel.responseProfileData={points:Array.from({length:10},(_,i)=>({status:'validated',outdoor_mean_c:i,heating_electricity_kwh:17+i*1.7,local_date:`2026-01-${String(i+1).padStart(2,'0')}`,outdoor_coverage_percent:100,equipment_heating:[]})).concat([{status:'excluded',outdoor_mean_c:50,heating_electricity_kwh:999,exclusion_reasons:['partial']}])};
+panel.monthlyReport={rows:[{month:'2026-09',period_coverage:{allocation_coverage:{complete:true},date_coverage:{complete_through_available_cutoff:true}},ecodan_heating_electricity_kwh:10,ac_heating_electricity_kwh:7,whole_house_heating_electricity_kwh:17,heating_thermal_kwh:34,dhw_thermal_kwh:8,ecodan_dhw_electricity_kwh:3,ac_cooling_electricity_kwh:2,quality:'good',snapshot_status:'final'},{month:'2026-10',period_coverage:{allocation_coverage:{complete:false},date_coverage:{complete_through_available_cutoff:true}},ecodan_heating_electricity_kwh:0,quality:'partial',snapshot_status:'partial'}]};
+process.stdout.write(panel.scatterChart()+'\n'+panel.monthlyHouseProfile());
+panel.responseProfileData.points=panel.responseProfileData.points.slice(0,2);process.stdout.write('\n---\n'+panel.scatterChart());
+""", {})
+    output, insufficient = output.split("\n---\n")
+    assert "Configured area: 170 m" in output
+    assert "0.100 kWh/m" in output
+    assert "y = 0.0100x + 0.1000" in output and "1.000" in output
+    assert "1 excluded day(s)" in output
+    assert "0.10" in output and "34.00" in output
+    assert "AC units provide measured electrical consumption" in output
+    assert "DHW controller kWh" in output and "Unavailable" in output
+    assert "max-width:100%;overflow-x:auto" in output
+    assert "Trendline: Unavailable" in insufficient
+
+
 def test_rolling_13_month_chart_table_and_distinct_snapshot_form_render():
     output = run_panel(r"""
 panel.monthlyReport=input.report;panel.monthlyMetricIds=input.report.default_metric_ids;

@@ -56,6 +56,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.monthlyEndMonth = null;
     this.monthlyMetricIds = null;
     this.temperatureChartSequence = 0;
+    this.heatingIntensity=false;this.heatingTrendVisible=true;this.monthlyProfileNormalized=false;
   }
 
   set hass(value) {
@@ -289,25 +290,31 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   scatterChart() {
     const evidence=this.responseProfileData?.points||[];
     const excluded=evidence.filter((point)=>point.status!=="validated");
-    const points=evidence.filter((point)=>point.status==="validated").map((point)=>[
-      Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh),point.local_date,
+    const area=Number(this.overviewData?.floor_area_m2);
+    const points=evidence.filter((point)=>point.status==="validated"&&point.outdoor_mean_c!=null&&point.heating_electricity_kwh!=null&&(!this.heatingIntensity||area>0)).map((point)=>[
+      Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh)/(this.heatingIntensity?area:1),point.local_date,
       point.outdoor_coverage_percent,point.equipment_heating||[],
     ]);
     const diagnostics=excluded.length?`<details><summary>${excluded.length} excluded day(s) — qualification evidence</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Outdoor</th><th>Coverage</th><th>Heating</th><th>Reason</th></tr></thead><tbody>${excluded.map((point)=>`<tr><td>${esc(point.local_date)}</td><td>${n(point.outdoor_mean_c)} °C</td><td>${point.outdoor_coverage_percent==null?"Unavailable":n(point.outdoor_coverage_percent,2)+"%"}</td><td>${n(point.heating_electricity_kwh)} kWh</td><td>${esc((point.exclusion_reasons||[]).join(", "))}</td></tr>`).join("")}</tbody></table></div></details>`:"";
-    if (!points.length) return `<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
+    const controls=`<div class="monthly-controls"><label>Y-axis <select class="heating-axis"><option value="energy" ${!this.heatingIntensity?"selected":""}>kWh/day</option><option value="intensity" ${this.heatingIntensity?"selected":""}>kWh/m²/day</option></select></label><label><input class="heating-trend" type="checkbox" ${this.heatingTrendVisible?"checked":""}> Show Trendline</label><span>Configured area: ${area>0?n(area,0)+" m²":"Unavailable"}</span></div>`;
+    if (!points.length) return `${controls}<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
     const xs = points.map((p) => p[0]); const ys = points.map((p) => p[1]);
     const xmin = Math.min(...xs) - 1, xmax = Math.max(...xs) + 1;
     const ymax = Math.max(1, ...ys) * 1.1;
     const px = (x) => 42 + ((x - xmin) / Math.max(1, xmax - xmin)) * 480;
     const py = (y) => 180 - (y / ymax) * 145;
-    const numericAxes=this.axisTicks(0,ymax).map((value)=>`<text x="4" y="${py(value)+4}">${n(value,1)} kWh</text>`).join("")+this.axisTicks(xmin,xmax).map((value)=>`<text x="${px(value)}" y="205" text-anchor="middle">${n(value,1)} °C</text>`).join("");
-    return `<svg viewBox="0 0 550 215" class="chart" role="img" aria-label="Heating electricity versus outdoor temperature">
+    const unit=this.heatingIntensity?"kWh/m²/day":"kWh/day";
+    const numericAxes=this.axisTicks(0,ymax).map((value)=>`<text x="4" y="${py(value)+4}">${n(value,this.heatingIntensity?3:1)}</text>`).join("")+this.axisTicks(xmin,xmax).map((value)=>`<text x="${px(value)}" y="205" text-anchor="middle">${n(value,1)} °C</text>`).join("");
+    const meanX=xs.reduce((a,b)=>a+b,0)/xs.length,meanY=ys.reduce((a,b)=>a+b,0)/ys.length,varianceX=xs.reduce((s,x)=>s+(x-meanX)**2,0),varianceY=ys.reduce((s,y)=>s+(y-meanY)**2,0);
+    const slope=points.length>=3&&varianceX>0&&varianceY>0?xs.reduce((s,x,i)=>s+(x-meanX)*(ys[i]-meanY),0)/varianceX:null;
+    const intercept=slope==null?null:meanY-slope*meanX,r2=slope==null?null:1-ys.reduce((s,y,i)=>s+(y-(intercept+slope*xs[i]))**2,0)/varianceY;
+    const observedMin=Math.min(...xs),observedMax=Math.max(...xs),validated=slope!=null&&points.length>=10&&observedMax-observedMin>=8&&r2>=.5;
+    const trend=slope==null?"Unavailable":`${validated?"Validated":"Exploratory, not validated"} · y = ${n(slope,4)}x ${intercept<0?"−":"+"} ${n(Math.abs(intercept),4)} ${unit} · slope ${n(slope,4)} ${unit}/°C · R² ${n(r2,3)} · ${points.length} qualified days`;
+    return `${controls}<svg viewBox="0 0 550 215" class="chart" style="overflow:hidden" role="img" aria-label="Heating electricity versus outdoor temperature"><defs><clipPath id="heating-scatter-plot"><rect x="42" y="35" width="480" height="145"/></clipPath></defs>
       ${numericAxes}
       ${[0, .25, .5, .75, 1].map((v) => `<line x1="42" x2="522" y1="${35 + v * 145}" y2="${35 + v * 145}" />`).join("")}
-      <text x="8" y="40">${n(ymax)}</text><text x="22" y="183">0</text>
-      ${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1])} kWh electric · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh`).join(" · ")}</title></circle>`).join("")}
-      <text x="42" y="205">${n(xmin)} °C</text><text x="480" y="205">${n(xmax)} °C</text>
-    </svg>${diagnostics}`;
+      <g clip-path="url(#heating-scatter-plot)">${this.heatingTrendVisible&&slope!=null?`<line x1="${px(observedMin)}" y1="${py(intercept+slope*observedMin)}" x2="${px(observedMax)}" y2="${py(intercept+slope*observedMax)}" style="stroke:#ef4444;stroke-width:2;${validated?"":"stroke-dasharray:5 4"}"/>`:""}${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1],this.heatingIntensity?3:1)} ${unit} · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh (confirmed ${n(item.confirmed_heating_kwh)}, assumed/selected/estimated ${n(item.uncertain_heating_kwh)}; ${esc(item.classification_quality)})`).join(" · ")}</title></circle>`).join("")}</g>
+    </svg><p class="muted">${unit} · Trendline: ${esc(trend)}</p>${diagnostics}`;
   }
 
   responseProfile() {
@@ -396,9 +403,23 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return `<article class="card page-card"><h2><ha-icon icon="mdi:home-lightning-bolt-outline"></ha-icon>Whole-House Energy / Toplotni profil hiše</h2><div class="table-wrap"><table><thead><tr><th>Energy path</th><th>Electricity</th><th>Measured thermal</th><th>Evidence</th></tr></thead><tbody><tr><td>Whole-house electricity</td><td>${this.evidence(energy.household_kwh,energy.known_household_kwh)}</td><td>—</td><td>physical household balance; missing remains unavailable</td></tr><tr><td>Ecodan space heating</td><td>${this.evidence(hpHeating,hpKnown)}</td><td>${thermalEvidence(heat)}</td><td>classified Shelly meter / fully contained cumulative intervals</td></tr><tr><td>Ecodan DHW</td><td>${this.evidence(energy.dhw_kwh,energy.known_dhw_kwh)}</td><td>${thermalEvidence(dhw)}</td><td>matched intervals only</td></tr><tr><td>AC heating</td><td>${this.evidence(acHeating,acKnown)}</td><td><span class="missing">Unavailable</span></td><td>AC thermal output unavailable</td></tr><tr><td>AC cooling</td><td>${this.evidence(energy.cooling_kwh,energy.known_cooling_kwh)}</td><td><span class="missing">Unavailable</span></td><td>no AC COP inferred</td></tr><tr><td>Idle / other / unknown</td><td>${this.evidence(addNullable(energy.idle_kwh,energy.other_hvac_kwh,energy.unknown_kwh),addNullable(energy.known_idle_kwh,energy.known_other_hvac_kwh,energy.unknown_kwh))}</td><td>—</td><td>preserved separately</td></tr></tbody></table></div><p class="quality partial">Whole-house thermal total is unavailable while AC thermal output or interval coverage is missing. Known measured subtotals are shown without filling gaps.</p></article>`;
   }
 
+  monthlyHouseProfile() {
+    const rows=this.monthlyReport?.rows||[],area=Number(this.overviewData?.floor_area_m2),normalize=this.monthlyProfileNormalized;
+    const outdoorRows=this.analysisData?.mode==="year"&&this.analysisData.source?.source_id===this.representativeSource("outdoor")?.source_id?this.temperatureCopRows():[];
+    const number=(v)=>v==null?"Unavailable":n(v,2);
+    const complete=(row)=>row.period_coverage?.allocation_coverage?.complete===true&&row.period_coverage?.date_coverage?.complete_through_available_cutoff===true;
+    const classified=(row,key)=>complete(row)?row[key]:null;
+    const divided=(value)=>value!=null&&area>0?Number(value)/area:null;
+    const normalized=(value)=>normalize?divided(value):value;
+    const sections=[{title:"Space-heating electricity",unit:normalize?"kWh/m²/month":"kWh",series:[["Ecodan (includes assumed)",(r)=>normalized(classified(r,"ecodan_heating_electricity_kwh"))],["AC (includes selected/estimated)",(r)=>normalized(classified(r,"ac_heating_electricity_kwh"))],["Whole-house",(r)=>normalized(classified(r,"whole_house_heating_electricity_kwh"))]]},{title:"Ecodan generated thermal energy",unit:normalize?"kWh thermal/m²/month":"kWh thermal",series:[["Heating",(r)=>normalized(r.heating_thermal_kwh)],["DHW",(r)=>normalized(r.dhw_thermal_kwh)]]},{title:"DHW and cooling electricity",unit:"kWh",series:[["Ecodan DHW",(r)=>classified(r,"ecodan_dhw_electricity_kwh")],["AC cooling",(r)=>classified(r,"ac_cooling_electricity_kwh")]]}];
+    const chart=(section)=>{const width=Math.max(520,rows.length*65),step=(width-45)/Math.max(1,rows.length),max=Math.max(1,...rows.flatMap((row)=>section.series.map(([,get])=>Number(get(row))||0)));return `<section><h3>${esc(section.title)} · ${esc(section.unit)}</h3><div style="max-width:100%;overflow-x:auto"><svg viewBox="0 0 ${width} 180" style="width:100%;min-width:${width}px;height:180px" role="img" aria-label="${esc(section.title)}"><text x="0" y="20" font-size="10">${n(max,1)}</text><text x="15" y="145" font-size="10">0</text>${rows.map((row,i)=>section.series.map(([name,get],j)=>{const value=get(row);if(value==null)return "";const bw=step*.75/section.series.length;return `<rect x="${40+i*step+j*bw}" y="${145-Number(value)*120/max}" width="${Math.max(1,bw-1)}" height="${Number(value)*120/max}" fill="${["#ef4444","#238ee8","#159b5b"][j]}"><title>${esc(row.month)} · ${esc(name)}: ${n(value,3)} ${esc(section.unit)} · ${esc(row.quality)} · ${esc(row.snapshot_status)}</title></rect>`;}).join("")+`<text x="${40+i*step+step/2}" y="165" text-anchor="middle" font-size="9">${esc(row.month)}</text>`).join("")}</svg></div><div class="legend">${section.series.map(([name],i)=>`<span><i class="dot" style="display:inline-block;background:${["#ef4444","#238ee8","#159b5b"][i]}"></i>${esc(name)}</span>`).join("")}</div></section>`;};
+    const table=rows.map((r)=>{const heating=classified(r,"whole_house_heating_electricity_kwh"),thermal=r.heating_thermal_kwh,outdoor=outdoorRows.find((item)=>item.key===r.month);return `<tr><td>${esc(r.month)}</td><td>${number(outdoor?.mean)}${outdoor?.coverage!=null?` (${n(outdoor.coverage,0)}% coverage)`:""}</td><td>${number(classified(r,"ecodan_heating_electricity_kwh"))}</td><td>${number(classified(r,"ac_heating_electricity_kwh"))}</td><td>${number(heating)}</td><td>${number(divided(heating))}</td><td>${number(thermal)}</td><td>${number(divided(thermal))}</td><td>${number(classified(r,"ecodan_dhw_electricity_kwh"))}</td><td>${number(r.provisional_shelly_dhw_electricity_kwh)}</td><td>${number(r.vendor_dhw_electricity_kwh)}</td><td>${number(r.dhw_thermal_kwh)}</td><td>${number(classified(r,"ac_cooling_electricity_kwh"))}</td><td>Vendor ${number(r.vendor_dhw_cop)} / provisional ${number(r.provisional_shelly_dhw_cop)} / primary ${number(r.primary_dhw_cop)}</td><td>${esc(r.quality)} · snapshot ${esc(r.snapshot_status)}</td></tr>`;}).join("");
+    return `<article class="card page-card"><h2>Monthly Whole-House Energy Summary</h2><p>Configured heated floor area: ${area>0?n(area,0)+" m²":"Unavailable"}. Change it in integration options if needed.</p><p class="warning">AC units provide measured electrical consumption, but do not provide measured heating or cooling thermal output. Therefore, total whole-house thermal energy delivered is unavailable without additional measurements or separately identified estimates. Ecodan-generated thermal energy is reported independently.</p><label><input class="profile-normalize" type="checkbox" ${normalize?"checked":""}> Normalize heating electricity and Ecodan thermal energy per m²/month</label><p class="muted">Classified electricity is shown only when date and allocation coverage are complete. Controller-proportion estimates are provisional. Snapshot status identifies partial month-to-date thermal figures.</p>${rows.length?sections.map(chart).join(""):'<div class="empty">Monthly evidence is unavailable.</div>'}<div class="table-wrap"><table><thead><tr>${["Month","Outdoor mean °C","Ecodan heating kWh","AC heating kWh","House heating kWh","House heating kWh/m²","Ecodan heating kWh thermal","Heating thermal kWh/m²","DHW Shelly kWh","DHW provisional kWh","DHW controller kWh","DHW kWh thermal","AC cooling kWh","DHW COP evidence","Quality / source"].map((label)=>`<th>${esc(label)}</th>`).join("")}</tr></thead><tbody>${table}</tbody></table></div><p class="muted">Provisional Ecodan heating: ${rows.map((r)=>`${esc(r.month)} ${number(r.provisional_shelly_heating_electricity_kwh)} kWh`).join(" · ")||"Unavailable"}. These estimates are not added to classified whole-house totals. Outdoor means use loaded annual temperature analysis when available.</p><button class="primary profile-csv">Export monthly fields CSV</button></article>`;
+  }
+
   thermalView() {
     const daily=this.v02Report?.whole_house_heating||[];const thermal=this.v02Report?.ecodan_space_heating||[];
-    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section><section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
+    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section>${this.monthlyHouseProfile()}<section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
   }
 
   async loadTemperatureCopAnalysis() {
@@ -708,6 +729,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelectorAll(".thermal-delete").forEach((button)=>button.addEventListener("click",()=>this.deleteThermalReading(Number(button.dataset.id))));
     this.shadowRoot.querySelector(".thermal-backfill")?.addEventListener("click",()=>this.backfillThermalReadings());
     this.shadowRoot.querySelector(".monthly-apply")?.addEventListener("click",()=>{this.monthlyEndMonth=this.shadowRoot.querySelector(".monthly-end")?.value||this.monthlyEndMonth;this.loadMonthly();});
+    this.shadowRoot.querySelector(".heating-axis")?.addEventListener("change",(event)=>{this.heatingIntensity=event.target.value==="intensity";this.render();});
+    this.shadowRoot.querySelector(".heating-trend")?.addEventListener("change",(event)=>{this.heatingTrendVisible=event.target.checked;this.render();});
+    this.shadowRoot.querySelector(".profile-normalize")?.addEventListener("change",(event)=>{this.monthlyProfileNormalized=event.target.checked;this.render();});
+    this.shadowRoot.querySelector(".profile-csv")?.addEventListener("click",()=>this.exportHouseProfile());
     this.shadowRoot.querySelectorAll(".monthly-metric").forEach((checkbox)=>checkbox.addEventListener("change",()=>{this.monthlyMetricIds=[...this.shadowRoot.querySelectorAll(".monthly-metric:checked")].map((item)=>item.value);this.render();}));
     this.shadowRoot.querySelector(".monthly-csv")?.addEventListener("click",()=>this.exportMonthlyCsv());
     this.shadowRoot.querySelector(".monthly-form")?.addEventListener("submit",(event)=>this.saveMonthlySnapshot(event));
@@ -721,6 +746,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelector(".analysis-reset")?.addEventListener("click",()=>{this.analysisLower=0;this.analysisUpper=5;this.render();});
     this.shadowRoot.querySelectorAll(".analysis-metric").forEach((item)=>item.addEventListener("change",()=>{this.analysisMetrics=[...this.shadowRoot.querySelectorAll(".analysis-metric:checked")].map((selected)=>selected.value);this.render();}));
     this.shadowRoot.querySelector(".analysis-export")?.addEventListener("click",()=>this.exportTemperatureCopAnalysis());
+  }
+
+  exportHouseProfile() {
+    const rows=this.monthlyReport?.rows||[],area=Number(this.overviewData?.floor_area_m2);
+    const outdoorRows=this.analysisData?.mode==="year"&&this.analysisData.source?.source_id===this.representativeSource("outdoor")?.source_id?this.temperatureCopRows():[];
+    const fields=[["month","configured_area_m2","outdoor_mean_c","outdoor_coverage_percent","ecodan_heating_kwh","ecodan_provisional_heating_kwh","ac_heating_kwh","house_heating_kwh","house_heating_kwh_m2","ecodan_heating_thermal_kwh","heating_thermal_kwh_m2","dhw_shelly_kwh","dhw_provisional_kwh","dhw_vendor_kwh","dhw_thermal_kwh","ac_cooling_kwh","dhw_vendor_cop","dhw_provisional_cop","dhw_primary_cop","quality","snapshot_status"]];
+    for(const row of rows){const complete=row.period_coverage?.allocation_coverage?.complete===true&&row.period_coverage?.date_coverage?.complete_through_available_cutoff===true;const get=(key)=>complete?row[key]:null;const heat=get("whole_house_heating_electricity_kwh"),thermal=row.heating_thermal_kwh,outdoor=outdoorRows.find((item)=>item.key===row.month);fields.push([row.month,area>0?area:null,outdoor?.mean,outdoor?.coverage,get("ecodan_heating_electricity_kwh"),row.provisional_shelly_heating_electricity_kwh,get("ac_heating_electricity_kwh"),heat,heat!=null&&area>0?heat/area:null,thermal,thermal!=null&&area>0?thermal/area:null,get("ecodan_dhw_electricity_kwh"),row.provisional_shelly_dhw_electricity_kwh,row.vendor_dhw_electricity_kwh,row.dhw_thermal_kwh,get("ac_cooling_electricity_kwh"),row.vendor_dhw_cop,row.provisional_shelly_dhw_cop,row.primary_dhw_cop,row.quality,row.snapshot_status]);}
+    const csv=fields.map((row)=>row.map((v)=>`"${String(v??"").replaceAll('"','""')}"`).join(",")).join("\r\n"),link=document.createElement("a");link.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));link.download="whole-house-monthly-energy.csv";link.click();URL.revokeObjectURL(link.href);
   }
 
   exportTemperatureCopAnalysis() {
