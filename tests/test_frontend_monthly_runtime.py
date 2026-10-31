@@ -74,6 +74,21 @@ process.stdout.write('\n---\n'+panel.copView());
     assert "Provisional monthly COP" not in partial
 
 
+def test_temperature_analysis_uses_duration_weighted_percentiles_and_preserves_mean():
+    output = run_panel(r"""
+const item=(mean,seconds,min,max)=>({mean,valid_seconds:seconds,expected_seconds:seconds,minimum:min,maximum:max});
+panel.analysisData={mode:'year',period:'2026-03',source:{source_id:'outdoor'},daily:{intervals:[{local_date:'2026-03-29',temperatures:{outdoor:item(8,23*3600,7,29)}},{local_date:'2026-03-30',temperatures:{outdoor:item(10,3600,10,10)}}]},hourly:{intervals:[{local_date:'2026-03-29',temperatures:{outdoor:item(7,22*3600,7,7)}},{local_date:'2026-03-29',temperatures:{outdoor:item(29,3600,29,29)}},{local_date:'2026-03-30',temperatures:{outdoor:item(10,3600,10,10)}}]},cop:{rows:[{month:'2026-03',vendor_combined_cop:3.8}]}};
+panel.analysisLower=0;panel.analysisUpper=5;const a=panel.temperatureCopRows();panel.analysisLower=10;panel.analysisUpper=0;const b=panel.temperatureCopRows();panel.analysisData.hourly.intervals=[];const c=panel.temperatureCopRows();
+process.stdout.write(JSON.stringify({a:a[2],b:b[2],c:c[2],count:a.length}));
+""", {})
+    result = json.loads(output)
+    assert result["count"] == 12
+    assert result["a"]["mean"] == pytest.approx((8 * 23 + 10) / 24)
+    assert result["a"]["high"] == 10
+    assert result["b"]["high"] == 29
+    assert result["a"]["mean"] == result["b"]["mean"]
+    assert result["c"]["low"] is None
+    assert result["a"]["cop"]["vendor_combined_cop"] == 3.8
 def test_annual_cop_uses_matched_months_and_ratio_of_sums():
     output = run_panel(r"""
 panel.historyPreset='this_year';panel.selectedPeriod={start_date:'2026-01-01',end_date:'2026-10-31'};
@@ -87,6 +102,7 @@ process.stdout.write(panel.copView());
     assert "Combined<b>4.00" in output
     assert "Combined<b>4.10" in output
     assert "COP for available months" in output
+    assert "Temperature & COP Analysis" in output
     assert "Space heating COP<b>Unavailable" in output
 
 
