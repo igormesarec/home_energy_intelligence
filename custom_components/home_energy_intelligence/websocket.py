@@ -129,6 +129,7 @@ def _local_calendar_dates(timezone: str, now: datetime | None = None):
     vol.Required("start_date"): str,
     vol.Required("end_date"): str,
     vol.Required("resolution"): vol.In({"hourly", "daily"}),
+    vol.Optional("analysis", default=False): bool,
     vol.Required("source_ids"): vol.All([str], vol.Length(min=1, max=8)),
 })
 @websocket_api.async_response
@@ -140,10 +141,13 @@ async def ws_temperature_timeline(hass, connection, msg):
         return
     resolution = msg["resolution"]
     try:
-        start_date, end_date = validate_timeline_dates(
-            msg["start_date"], msg["end_date"],
-            maximum_days=7 if resolution == "hourly" else 3660,
-        )
+        if resolution == "hourly" and msg.get("analysis"):
+            start_date, end_date = validate_timeline_dates(msg["start_date"], msg["end_date"], maximum_days=366)
+        else:
+            start_date, end_date = validate_timeline_dates(
+                msg["start_date"], msg["end_date"],
+                maximum_days=7 if resolution == "hourly" else 3660,
+            )
     except ValueError as error:
         connection.send_error(msg["id"], "invalid_range", str(error))
         return
