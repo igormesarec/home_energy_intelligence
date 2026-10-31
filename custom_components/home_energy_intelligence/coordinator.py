@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .allocation import allocate_interval, configurable_classifier
+from .allocation import allocate_interval, configurable_classifier, counter_delta
 from .configuration import (
     equipment_from_config, equipment_temperature_mappings, mapping_revision,
     temperatures_from_config,
@@ -1444,6 +1444,7 @@ class HomeEnergyCoordinator:
             return state.attributes.get("unit_of_measurement") if state else None
 
         numeric_evidence: dict[str, dict[str, object]] = {}
+        counter_sources: dict[str, str] = {}
 
         async def numeric(source_key: str, entity_id: str | None, *, statistics_type: str | None = None,
                           attribute: str | None = None, dimension: str | None = None,
@@ -1460,7 +1461,15 @@ class HomeEnergyCoordinator:
             )
             candidates = ({"recorder_states": raw_coverage}
                           if raw_coverage is not None else {})
-            if (raw_coverage > 0 if raw_coverage is not None else len(raw) >= 2):
+            raw_usable = len(raw) >= 2
+            if statistics_type == "counter":
+                delta, _resets, rejected = counter_delta(
+                    raw, start, end, maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500))
+                )
+                raw_usable = delta is not None and not rejected
+            if (raw_coverage > 0 if raw_coverage is not None else raw_usable):
+                if statistics_type == "counter":
+                    counter_sources[source_key] = "recorder_states"
                 if temperature_mapping is not None:
                     numeric_evidence[source_key] = {
                         "selected_history_source": "recorder_states",
@@ -1469,9 +1478,30 @@ class HomeEnergyCoordinator:
                     }
                 return raw
             if statistics_type:
+                statistic_rows = statistics.get(entity_id, [])
+                if statistics_type == "counter":
+                    # The synthetic baseline is valid only for a complete sequence of
+                    # nonnegative hourly changes, not gaps or clamped corrections.
+                    cursor = start
+                    for row in sorted(statistic_rows, key=lambda item: item.get("start", 0)):
+                        stamp, stop, change = row.get("start"), row.get("end"), row.get("change")
+                        if isinstance(stamp, (int, float)):
+                            stamp = datetime.fromtimestamp(stamp, UTC)
+                        if isinstance(stop, (int, float)):
+                            stop = datetime.fromtimestamp(stop, UTC)
+                        try:
+                            valid = (stamp == cursor and stop == cursor + timedelta(hours=1)
+                                     and isfinite(float(change)) and float(change) >= 0)
+                        except (TypeError, ValueError):
+                            valid = False
+                        if not valid:
+                            break
+                        cursor = stop
+                    if cursor != end:
+                        statistic_rows = []
                 from_statistics = (
                     statistics_to_counter_samples(
-                        statistics.get(entity_id, []), start,
+                        statistic_rows, start,
                         source_unit=source_unit(entity_id) or "kWh",
                     )
                     if statistics_type == "counter"
@@ -1493,6 +1523,14 @@ class HomeEnergyCoordinator:
                     if statistics_coverage is not None:
                         candidates["recorder_statistics"] = statistics_coverage
                     if (statistics_coverage > 0 if statistics_coverage is not None else True):
+                        if statistics_type == "counter":
+                            delta, _resets, rejected = counter_delta(
+                                normalized_statistics, start, end,
+                                maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
+                            )
+                            if delta is None or rejected:
+                                return raw
+                            counter_sources[source_key] = "recorder_statistics"
                         if temperature_mapping is not None:
                             numeric_evidence[source_key] = {
                                 "selected_history_source": "recorder_statistics",
@@ -1661,5 +1699,6 @@ class HomeEnergyCoordinator:
             "collected_at": datetime.now(UTC).isoformat(),
             "mapping_effective_at": revision["effective_at"],
             "temperature_collection": temperature_collection,
+            "counter_collection": counter_sources,
         }, temperature_quality=temperature_quality, temperature_roles=temperature_roles,
             site_configured={key for key, entity in site_sources.items() if entity})

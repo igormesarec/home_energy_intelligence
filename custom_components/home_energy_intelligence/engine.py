@@ -267,6 +267,8 @@ class DailyAggregator:
 
         quality_flags = [data["quality"] for data in allocations.values()]
         quality_flags.extend(data["quality"] for data in temperatures.values())
+        if "recorder_statistics" in source.provenance.get("counter_collection", {}).values():
+            quality_flags.append("partial")
         if household is None:
             quality = "missing"
         elif non_hvac is not None and non_hvac < -0.05:
