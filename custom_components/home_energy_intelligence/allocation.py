@@ -108,6 +108,18 @@ def counter_delta(
     if len(observations) < 2:
         return None, 0, 0
 
+    # A drop followed by a return to the pre-drop cumulative level is ambiguous:
+    # treating it as a reset counts the old lifetime reading as new energy.
+    # Leave it unavailable so the collector can use complete hourly statistics.
+    for index in range(1, len(observations) - 1):
+        previous_value = observations[index - 1].value
+        current_value = observations[index].value
+        if (previous_value is not None and current_value is not None
+                and current_value < previous_value
+                and any(item.value is not None and item.value >= previous_value
+                        for item in observations[index + 1:])):
+            return None, 1, 1
+
     total = 0.0
     resets = 0
     rejected = 0

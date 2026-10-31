@@ -85,6 +85,15 @@ def test_counter_reset_is_explicit_and_delta_continues():
     assert rejected == 0
 
 
+def test_counter_transient_drop_and_rebound_is_unavailable():
+    delta, resets, rejected = counter_delta([
+        NumericSample(START, 310), NumericSample(START + timedelta(hours=2), 0),
+        NumericSample(END, 310.06),
+    ], START, END)
+    assert delta is None
+    assert resets == 1 and rejected == 1
+
+
 def test_counter_spike_is_rejected():
     delta, _resets, rejected = counter_delta([
         NumericSample(START, 0), NumericSample(END, 1000),
