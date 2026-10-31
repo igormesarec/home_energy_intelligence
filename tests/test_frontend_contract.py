@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "home_energy_intelligence"
 GUIDED_STEPS = {
@@ -112,7 +111,9 @@ def test_temperature_timeline_refreshes_with_period_and_keeps_mobile_targets_rea
     assert source.count("await this.loadTemperatureTimeline(") >= 2
     assert ".temp-hit{fill:transparent" in source
     assert 'r="8"' in source
-    assert "height:98px" in source
+    assert ".temp-chart-shell{width:100%;max-width:100%;margin-top:10px;overflow:hidden}" in source
+    assert "aspect-ratio:320/190" in source
+    assert "clipPath" in source and 'class="temp-plot" clip-path=' in source
     assert "new Date(" not in source
 
 

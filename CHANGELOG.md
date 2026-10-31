@@ -2,6 +2,8 @@
 
 ## V0.2.1 — draft
 
+- Constrained indoor and outdoor temperature timelines to responsive SVG plot rectangles
+  with per-instance clipping, validated min/mean/max domain padding and readable mobile axes.
 - Made a completed Yesterday available immediately from persisted hourly energy and
   temperature records. The non-persisted provisional view exposes internal gaps and
   is replaced by the authoritative daily row after the 05:00 close without double counting.
