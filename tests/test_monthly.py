@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -50,6 +50,42 @@ def daily_record(
             "coverage_percent": 100, "quality": "uncertain",
         }},
     }
+
+
+def test_september_provisional_shelly_cop_without_classification():
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+
+    entry = normalize_monthly_snapshot(snapshot(
+        report_month="2026-09", cutoff_local_date="2026-10-01", cutoff_local_time="00:00",
+        cutoff_certainty="exact", status="final", heating_thermal_kwh=309,
+        dhw_thermal_kwh=424, vendor_combined_thermal_kwh=734,
+        vendor_heating_electricity_kwh=72, vendor_dhw_electricity_kwh=121,
+        vendor_combined_electricity_kwh=193,
+    ), "Europe/Ljubljana")
+    entry["id"] = 1
+    records = []
+    for number in range(1, 31):
+        day = date(2026, 9, number)
+        start, end = local_day_bounds(day, "Europe/Ljubljana")
+        item = daily_record(local_date=day.isoformat(), period_start=start.isoformat(), period_end=end.isoformat())
+        item["allocations"]["hp_main"].update(meter_kwh=186.11 / 30, quality="partial", coverage_percent=0, covered_seconds=0, categories={})
+        records.append(item)
+    equipment = [{"equipment_id": "hp_main", "kind": "heat_pump", "enabled": True}]
+    row = build_rolling_month_report(daily_records=records, snapshots=[entry], equipment=equipment,
+                                     timezone="Europe/Ljubljana", end_month="2026-09", count=1)["rows"][0]
+    assert row["provisional_shelly_heating_electricity_kwh"] == pytest.approx(186.11 * 72 / 193)
+    assert row["provisional_shelly_dhw_electricity_kwh"] == pytest.approx(186.11 * 121 / 193)
+    assert row["provisional_shelly_heating_cop"] == pytest.approx(4.45, abs=.01)
+    assert row["provisional_shelly_dhw_cop"] == pytest.approx(3.63, abs=.01)
+    assert row["provisional_shelly_combined_cop"] == pytest.approx(3.94, abs=.01)
+    assert row["primary_heating_cop"] is None
+    assert row["vendor_heating_cop"] == pytest.approx(309 / 72)
+    assert row["ecodan_total_generated_thermal_kwh"] == 733
+    assert row["vendor_combined_thermal_kwh"] == 734
+    missing = build_rolling_month_report(daily_records=records[:-1], snapshots=[entry], equipment=equipment,
+                                         timezone="Europe/Ljubljana", end_month="2026-09", count=1)["rows"][0]
+    assert missing["provisional_shelly_combined_cop"] is None
+    assert missing["provisional_cop_quality"] == "unavailable"
 
 
 def test_monthly_snapshot_is_distinct_nullable_and_unit_normalized():

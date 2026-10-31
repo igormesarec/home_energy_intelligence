@@ -370,6 +370,50 @@ def build_rolling_month_report(
         vendor_category_sum = _sum_complete(
             (vendor_heating_electricity, vendor_dhw_electricity)
         )
+        # This estimate uses only complete finalized daily meter evidence; mode
+        # classification and temperature coverage are deliberately independent.
+        day = month_start
+        daily_meter_values = []
+        daily_by_date = {str(item.get("local_date")): item for item in records}
+        meter_complete = len(records) == len(daily_by_date) == (month_end - month_start).days + 1
+        while meter_complete and day <= month_end:
+            item = daily_by_date.get(day.isoformat())
+            left, right = local_day_bounds(day, timezone)
+            if (not item or item.get("temperature_only") or item.get("provisional")
+                    or item.get("finalized") is False
+                    or item.get("period_start_utc") != left.isoformat()
+                    or item.get("period_end_utc") != right.isoformat()):
+                meter_complete = False
+                break
+            for equipment_id in heat_pump_ids:
+                allocation = item.get("allocations", {}).get(equipment_id, {})
+                meter = allocation.get("meter_kwh")
+                if (meter is None or not math.isfinite(float(meter)) or float(meter) < 0
+                        or allocation.get("quality") in {"missing_counter", "unreconciled"}
+                        or allocation.get("authoritative_counter_source") == "unavailable"
+                        or allocation.get("rejected_count", 0)):
+                    meter_complete = False
+                    break
+                daily_meter_values.append(float(meter))
+            day += timedelta(days=1)
+        _, month_end_utc = local_day_bounds(month_end, timezone)
+        provisional_valid = bool(
+            meter_complete and heat_pump_ids and set(selected) == heat_pump_ids and exact_cutoff
+            and len(cutoff_values) == 1 and cutoff_values[0] == month_end_utc.isoformat()
+            and all(item.get("status") == "final" for item in selected_values)
+            and vendor_category_sum is not None and vendor_category_sum > 0
+            and all(item.get("vendor_heating_electricity_kwh") is not None
+                    and item.get("vendor_dhw_electricity_kwh") is not None for item in selected_values)
+        )
+        measured_month = sum(daily_meter_values) if provisional_valid else None
+        estimated_heating = (measured_month * vendor_heating_electricity / vendor_category_sum
+                             if provisional_valid else None)
+        estimated_dhw = measured_month - estimated_heating if provisional_valid else None
+        provisional_thermal = (
+            vendor_combined_thermal if all(item.get("vendor_combined_thermal_kwh") is not None for item in selected_values)
+            else generated_total if all(item.get("heating_thermal_kwh") is not None and item.get("dhw_thermal_kwh") is not None for item in selected_values)
+            else None
+        )
         vendor_rounding_mismatch = (
             float(vendor_combined_electricity) - float(vendor_category_sum)
             if vendor_combined_electricity is not None
@@ -463,6 +507,12 @@ def build_rolling_month_report(
             "vendor_heating_cop": vendor_heating_cop,
             "vendor_dhw_cop": vendor_dhw_cop,
             "vendor_combined_cop": vendor_combined_cop,
+            "provisional_shelly_heating_electricity_kwh": estimated_heating,
+            "provisional_shelly_dhw_electricity_kwh": estimated_dhw,
+            "provisional_shelly_heating_cop": _ratio(thermal_heating, estimated_heating) if all(item.get("heating_thermal_kwh") is not None for item in selected_values) else None,
+            "provisional_shelly_dhw_cop": _ratio(thermal_dhw, estimated_dhw) if all(item.get("dhw_thermal_kwh") is not None for item in selected_values) else None,
+            "provisional_shelly_combined_cop": _ratio(provisional_thermal, measured_month),
+            "provisional_cop_quality": "provisional_controller_proportions" if provisional_valid else "unavailable",
             "shelly_minus_vendor_kwh": difference,
             "shelly_heating_minus_vendor_kwh": heating_difference,
             "shelly_heating_minus_vendor_percent": heating_percent,
@@ -546,6 +596,8 @@ def monthly_metric_catalog(
         "vendor_rounding_mismatch_kwh": "Vendor displayed total rounding mismatch",
         "vendor_combined_thermal_kwh": "Vendor combined thermal energy",
         "shelly_minus_vendor_kwh": "Shelly minus Ecodan electricity",
+        "provisional_shelly_heating_electricity_kwh": "Provisional Shelly heating electricity",
+        "provisional_shelly_dhw_electricity_kwh": "Provisional Shelly DHW electricity",
         "shelly_heating_minus_vendor_kwh": "Shelly minus Ecodan heating electricity",
         "shelly_dhw_minus_vendor_kwh": "Shelly minus Ecodan DHW electricity",
     }
@@ -598,6 +650,9 @@ def monthly_metric_catalog(
             "vendor_heating_cop": "Vendor heating COP",
             "vendor_dhw_cop": "Vendor DHW COP",
             "vendor_combined_cop": "Vendor combined COP",
+            "provisional_shelly_heating_cop": "PROVISIONAL Shelly Heating COP",
+            "provisional_shelly_dhw_cop": "PROVISIONAL Shelly DHW COP",
+            "provisional_shelly_combined_cop": "PROVISIONAL Shelly Combined COP",
         }.items()
     )
     catalog.extend((

@@ -57,6 +57,23 @@ def monthly_payload():
     }
 
 
+def test_monthly_cop_is_separate_from_verified_interval_reports():
+    output = run_panel(r"""
+panel.selectedPeriod={start_date:'2026-09-01',end_date:'2026-09-30'};
+panel.selectedMonthReport={month:'2026-09',provisional_shelly_heating_cop:4.45,provisional_shelly_dhw_cop:3.63,provisional_shelly_combined_cop:3.94};
+panel.v02Report={ecodan_reports:{},ecodan_space_heating:[],ecodan_dhw:[]};
+panel.periodControls=()=>'';panel.monthlyView=()=>'';
+process.stdout.write(panel.copView());
+panel.selectedPeriod={start_date:'2026-09-02',end_date:'2026-09-30'};
+process.stdout.write('\n---\n'+panel.copView());
+""", {})
+    full, partial = output.split("\n---\n")
+    assert "Provisional monthly COP" in full and "4.45" in full and "3.63" in full and "3.94" in full
+    assert "Space heating COP<b>Unavailable" in full
+    assert "matching intervals" in full and "No matched measured intervals" in full
+    assert "Provisional monthly COP" not in partial
+
+
 def test_rolling_13_month_chart_table_and_distinct_snapshot_form_render():
     output = run_panel(r"""
 panel.monthlyReport=input.report;panel.monthlyMetricIds=input.report.default_metric_ids;
