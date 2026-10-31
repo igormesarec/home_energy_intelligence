@@ -447,8 +447,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const yesterday = source ? this.overviewData?.yesterday_full?.temperatures?.[source.source_id] : null;
     const diagnostic=(this.overviewData?.temperature_pipeline||[]).find((item)=>item.source_id===source.source_id)||{};
     const explanation = role === "indoor" ? "Selected location; not a whole-house mean." : "Selected measured source; not weather-provider data.";
+    const displayedTemperature=this.historyPreset==="today" ? today?.latest_value : today?.mean;
     return `<article class="card temperature-card"><h2><ha-icon icon="${role === "indoor" ? "mdi:home-thermometer" : "mdi:thermometer-lines"}"></ha-icon>Representative ${label} Temperature</h2>
-      <div class="temperature">${n(today?.latest_value)}${today?.latest_value == null ? "" : " °C"}</div>
+      <div class="temperature">${displayedTemperature==null?"Unavailable":`${n(displayedTemperature)} °C`}</div>
       <p class="muted">Source: ${esc(source.entity_id || source.source_id)} · latest valid: ${esc(today?.latest_timestamp || "unavailable")} · ${esc(explanation)}</p>
       <div class="mini-stats"><span>Period mean <b>${n(today?.mean)} °C</b></span>${this.historyPreset==="today"?`<span>Yesterday mean <b>${n(yesterday?.mean)} °C</b></span>`:""}<span>Min / max <b>${n(today?.minimum)} / ${n(today?.maximum)} °C</b></span><span>Coverage <b>${today?.coverage_percent==null?"Unavailable":n(today.coverage_percent,0)+"%"}</b></span><span>Quality <b>${esc(today ? this.temperatureQualityLabel(today) : (diagnostic.pipeline_stage || "missing"))}</b></span></div>${today?.mean==null?`<p class="warning">Pipeline: ${esc(diagnostic.pipeline_stage||"not yet diagnosed").replaceAll("_"," ")} · live ${esc(diagnostic.live_state??"unavailable")} ${esc(diagnostic.live_unit||"")} · last update ${esc(diagnostic.live_last_updated||"unavailable")} · persisted hourly summaries ${n(diagnostic.persisted_hourly_summaries,0)}</p>`:""}${this.temperatureTimeline(role)}</article>`;
   }

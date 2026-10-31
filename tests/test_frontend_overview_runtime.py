@@ -12,6 +12,27 @@ PANEL = (
 )
 
 
+def test_indoor_and_outdoor_kpis_show_current_today_and_mean_for_history():
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required")
+    script = r"""
+const fs=require('fs'),vm=require('vm');let Panel;
+global.HTMLElement=class{attachShadow(){return {}}};
+global.customElements={define:(_name,ctor)=>{Panel=ctor}};
+global.window={setInterval:()=>0,clearInterval:()=>{},clearTimeout:()=>{}};
+vm.runInThisContext(fs.readFileSync(process.argv[1],'utf8'));
+const panel=new Panel();panel.representativeSource=(role)=>({source_id:role});
+panel.selectedRecord=()=>({temperatures:{indoor:{latest_value:22,mean:20},outdoor:{latest_value:12,mean:8}}});
+panel.temperatureTimeline=()=>'';
+for(const preset of ['today','yesterday','this_month']){panel.historyPreset=preset;for(const role of ['indoor','outdoor'])process.stdout.write(panel.temperatureCard(role)+'\n');}
+"""
+    result = subprocess.run(["node", "-e", script, str(PANEL)], capture_output=True, text=True, check=True)
+    assert 'class="temperature">22.0' in result.stdout
+    assert 'class="temperature">12.0' in result.stdout
+    assert result.stdout.count('class="temperature">20.0') == 2
+    assert result.stdout.count('class="temperature">8.0') == 2
+
+
 def test_today_overview_renders_provisional_energy_without_reference_error():
     if shutil.which("node") is None:
         pytest.skip("Node.js is required for the frontend runtime contract")
