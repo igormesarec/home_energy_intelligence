@@ -126,6 +126,25 @@ panel.responseProfileData.points=panel.responseProfileData.points.slice(0,2);pro
     assert "Trendline: Unavailable" in insufficient
 
 
+def test_monthly_profile_loads_weighted_outdoor_and_separates_dhw_sources():
+    output = run_panel(r"""
+(async()=>{
+panel.overviewData={floor_area_m2:170};panel.monthlyProfileNormalized=true;
+panel.representativeSource=()=>({source_id:'outdoor',entity_id:'sensor.outdoor'});
+panel.monthlyReport={months:['2026-09'],rows:[{month:'2026-09',period_coverage:{allocation_coverage:{complete:true},date_coverage:{complete_through_available_cutoff:true}},whole_house_heating_electricity_kwh:17,heating_thermal_kwh:34,dhw_thermal_kwh:8,ecodan_dhw_electricity_kwh:0,provisional_shelly_dhw_electricity_kwh:5,vendor_dhw_electricity_kwh:6,ecodan_assumed_heating_kwh:10,quality:'partial',snapshot_status:'final'}]};
+panel._hass={callWS:async(msg)=>({intervals:[{local_date:'2026-09-01',temperatures:{outdoor:{mean:10,valid_seconds:82800,expected_seconds:82800}}},{local_date:'2026-09-02',temperatures:{outdoor:{mean:20,valid_seconds:3600,expected_seconds:90000}}}]})};
+await panel.loadProfileOutdoor();process.stdout.write(panel.monthlyHouseProfile());
+})();
+""", {})
+    assert "10.42" in output and "50% coverage" in output
+    assert "0.200 kWh thermal/m" in output
+    assert "DHW: 8.000 kWh thermal" in output
+    assert "Provisional Shelly DHW: 5.000 kWh" in output
+    assert "Vendor-reported DHW: 6.000 kWh" in output
+    assert "Classified Shelly DHW: 0.000" not in output
+    assert "alternative evidence, not additive" in output
+
+
 def test_rolling_13_month_chart_table_and_distinct_snapshot_form_render():
     output = run_panel(r"""
 panel.monthlyReport=input.report;panel.monthlyMetricIds=input.report.default_metric_ids;
