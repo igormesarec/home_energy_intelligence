@@ -133,6 +133,8 @@ def test_mismatched_monthly_cutoff_never_claims_primary_cop():
     assert report["primary_heating_cop"] is None
     assert report["primary_cop_quality"] == "unavailable"
     assert report["vendor_heating_cop"] == pytest.approx(30 / 9)
+    assert report["shelly_minus_vendor_kwh"] is None
+    assert report["shelly_minus_vendor_percent"] is None
 
 
 def test_latest_same_month_snapshot_replaces_mtd_value_without_summing():

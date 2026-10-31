@@ -893,10 +893,17 @@ def prefer_authoritative_daily(
     local_date = str(provisional.get("local_date"))
     if any(
         str(item.get("local_date")) == local_date
+        and not item.get("temperature_only")
         and not (item.get("provisional") is True and item.get("finalized") is False)
         for item in stored_records
     ):
         return list(stored_records)
+    temperatures = dict(provisional.get("temperatures") or {})
+    for item in stored_records:
+        if str(item.get("local_date")) == local_date and item.get("temperature_only"):
+            temperatures.update(item.get("temperatures") or {})
+    if temperatures:
+        provisional = {**provisional, "temperatures": temperatures}
     return [
         *[item for item in stored_records if str(item.get("local_date")) != local_date],
         provisional,

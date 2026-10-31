@@ -353,7 +353,7 @@ def build_rolling_month_report(
         shelly_total = shelly_ecodan_total
         difference = (
             float(shelly_total) - float(vendor_total)
-            if vendor_total is not None and shelly_total is not None else None
+            if cutoff_matches and vendor_total is not None and shelly_total is not None else None
         )
         device_metrics: dict[str, float | None] = {}
         for item in ac_rows:

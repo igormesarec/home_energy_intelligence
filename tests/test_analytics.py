@@ -369,6 +369,24 @@ def test_authoritative_daily_replaces_provisional_without_duplicate_energy():
     assert replaced == [authoritative]
 
 
+def test_temperature_only_yesterday_is_replaced_without_losing_temperature():
+    start = datetime(2026, 10, 29, 23, tzinfo=UTC)
+    hours = [_hour(start + timedelta(hours=index), 1.5) for index in range(24)]
+    provisional = provisional_completed_day_from_hourly(
+        hours, start, start + timedelta(hours=24),
+        local_date="2026-10-30", timezone="Europe/Ljubljana",
+    )
+    temperature = {"outdoor": {"mean": 8, "coverage_percent": 100}}
+    placeholder = {"local_date": "2026-10-30", "temperature_only": True,
+                   "temperatures": temperature}
+    result = prefer_authoritative_daily([placeholder], provisional)
+    assert len(result) == 1
+    assert result[0]["household_kwh"] == pytest.approx(36)
+    assert result[0]["temperatures"] == temperature
+    authoritative = {"local_date": "2026-10-30", "household_kwh": 36}
+    assert prefer_authoritative_daily([authoritative], provisional) == [authoritative]
+
+
 def test_provisional_yesterday_survives_restart_from_compact_hourly_rows(tmp_path):
     from custom_components.home_energy_intelligence.database import EnergyDatabase
 

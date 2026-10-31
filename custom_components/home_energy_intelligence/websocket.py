@@ -499,13 +499,13 @@ async def _monthly_report_payload(hass, coordinator, end_month: str, count: int 
     )
     local_today, local_yesterday = _local_calendar_dates(coordinator.timezone)
     if start_date <= local_yesterday.isoformat() <= end_date and not any(
-        str(item.get("local_date")) == local_yesterday.isoformat() for item in records
+        str(item.get("local_date")) == local_yesterday.isoformat() and not item.get("temperature_only") for item in records
     ):
         provisional = await _provisional_completed_day_snapshot(
             hass, coordinator, local_yesterday
         )
         if provisional is not None:
-            records.append(provisional)
+            records = prefer_authoritative_daily(records, provisional)
     if start_date <= local_today.isoformat() <= end_date:
         partial_today, _hours, _coverage, _cutoff, _today = await _current_day_snapshot(
             hass, coordinator
@@ -766,10 +766,14 @@ async def ws_overview(hass, connection, msg):
     yesterday_full = await hass.async_add_executor_job(
         coordinator.database.daily, yesterday.isoformat()
     )
-    if yesterday_full is None:
-        yesterday_full = await _provisional_completed_day_snapshot(
+    if yesterday_full is None or yesterday_full.get("temperature_only"):
+        provisional = await _provisional_completed_day_snapshot(
             hass, coordinator, yesterday
         )
+        if provisional is not None:
+            yesterday_full = prefer_authoritative_daily(
+                [yesterday_full] if yesterday_full else [], provisional
+            )[0]
     required_temperature_ids = _representative_temperature_source_ids(coordinator)
     if yesterday_full:
         yesterday_full = derive_record_quality(
@@ -931,7 +935,7 @@ async def ws_history(hass, connection, msg):
         yesterday_key = local_yesterday.isoformat()
         if (
             start_date <= yesterday_key <= end_date
-            and not any(str(item.get("local_date")) == yesterday_key for item in stored_records)
+            and not any(str(item.get("local_date")) == yesterday_key and not item.get("temperature_only") for item in stored_records)
         ):
             provisional_yesterday = await _provisional_completed_day_snapshot(
                 hass, coordinator, local_yesterday
