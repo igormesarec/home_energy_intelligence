@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .analytics import canonical_energy, combine_daily_records
+from .analytics import canonical_energy, combine_daily_records, combine_interval_records, interval_coverage
 from .thermal import resolve_local_timestamp
 from .timeutils import local_day_bounds
 
@@ -203,6 +203,7 @@ def build_rolling_month_report(
     *, daily_records: Iterable[dict[str, Any]], snapshots: Iterable[dict[str, Any]],
     equipment: list[dict[str, Any]], timezone: str, end_month: str, count: int = 13,
     floor_area_m2: float | None = None,
+    hourly_records: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Build complete calendar-month rows from compact SQLite evidence."""
     months = rolling_months(end_month, count)
@@ -212,6 +213,7 @@ def build_rolling_month_report(
         if len(local_date) >= 7 and local_date[:7] in months:
             by_month[local_date[:7]].append(record)
     all_snapshots = list(snapshots)
+    all_hours = list(hourly_records)
     heat_pump_ids = {
         str(item.get("equipment_id")) for item in equipment
         if item.get("enabled", True) and item.get("kind") == "heat_pump"
@@ -255,6 +257,29 @@ def build_rolling_month_report(
             equipment_ids=[str(item.get("equipment_id")) for item in equipment if item.get("enabled", True)],
             timezone=timezone,
         ) if records else None
+        month_start_utc, _ = local_day_bounds(month_start, timezone)
+        if len(cutoff_values) == 1 and selected_values and all(
+            item.get("cutoff_certainty") == "exact" for item in selected_values
+        ):
+            cutoff = datetime.fromisoformat(cutoff_values[0])
+            seconds = (cutoff - month_start_utc).total_seconds()
+            hours = [item for item in all_hours if not item.get("temperature_only")
+                     and str(item.get("period_start_utc")) >= month_start_utc.isoformat()
+                     and str(item.get("period_end_utc")) <= cutoff.isoformat()]
+            if seconds > 0 and seconds % 3600 == 0 and hours:
+                coverage = interval_coverage(hours, month_start_utc, cutoff)
+                hourly = combine_interval_records(hours, expected_start=month_start_utc, expected_end=cutoff)
+                if coverage["complete"] and len(hours) == coverage["expected_intervals"] and hourly:
+                    hourly["period_coverage"] = {
+                        "date_coverage": {"complete_through_available_cutoff": True},
+                        "allocation_coverage": {"complete": all(
+                            item.get("allocations", {}).get(eid, {}).get("coverage_percent") == 100
+                            and item.get("allocations", {}).get(eid, {}).get("meter_kwh") is not None
+                            and item.get("allocations", {}).get(eid, {}).get("quality") not in {"partial", "poor", "missing", "missing_counter", "unreconciled"}
+                            for item in hours for eid in heat_pump_ids
+                        )},
+                    }
+                    combined = hourly
         energy = canonical_energy(combined or {}, equipment)
         thermal_heating = _sum_present(
             item.get("heating_thermal_kwh") for item in selected_values
@@ -355,6 +380,14 @@ def build_rolling_month_report(
             float(shelly_total) - float(vendor_total)
             if cutoff_matches and vendor_total is not None and shelly_total is not None else None
         )
+        def comparison(shelly, vendor):
+            if not cutoff_matches or shelly is None or vendor is None:
+                return None, None
+            delta = float(shelly) - float(vendor)
+            return delta, 100 * delta / float(vendor) if vendor else None
+
+        heating_difference, heating_percent = comparison(shelly_heating, vendor_heating_electricity)
+        dhw_difference, dhw_percent = comparison(shelly_dhw, vendor_dhw_electricity)
         device_metrics: dict[str, float | None] = {}
         for item in ac_rows:
             equipment_id = str(item.get("equipment_id"))
@@ -431,6 +464,10 @@ def build_rolling_month_report(
             "vendor_dhw_cop": vendor_dhw_cop,
             "vendor_combined_cop": vendor_combined_cop,
             "shelly_minus_vendor_kwh": difference,
+            "shelly_heating_minus_vendor_kwh": heating_difference,
+            "shelly_heating_minus_vendor_percent": heating_percent,
+            "shelly_dhw_minus_vendor_kwh": dhw_difference,
+            "shelly_dhw_minus_vendor_percent": dhw_percent,
             "shelly_minus_vendor_percent": (
                 100 * difference / vendor_total
                 if difference is not None and vendor_total not in (None, 0) else None
@@ -509,6 +546,8 @@ def monthly_metric_catalog(
         "vendor_rounding_mismatch_kwh": "Vendor displayed total rounding mismatch",
         "vendor_combined_thermal_kwh": "Vendor combined thermal energy",
         "shelly_minus_vendor_kwh": "Shelly minus Ecodan electricity",
+        "shelly_heating_minus_vendor_kwh": "Shelly minus Ecodan heating electricity",
+        "shelly_dhw_minus_vendor_kwh": "Shelly minus Ecodan DHW electricity",
     }
     catalog = [
         {
@@ -532,7 +571,7 @@ def monthly_metric_catalog(
     catalog.append({
         "id": "whole_house_heating_kwh_m2",
         "label": "Whole-house heating electricity per floor area",
-        "unit": "kWh/m²", "axis": "energy", "group": "ac_house",
+        "unit": "kWh/m²", "axis": "normalized", "group": "ac_house",
     })
     for item in equipment:
         if not item.get("enabled", True) or item.get("kind") != "air_conditioner":
@@ -562,6 +601,8 @@ def monthly_metric_catalog(
         }.items()
     )
     catalog.extend((
+        {"id": "shelly_heating_minus_vendor_percent", "label": "Shelly minus Ecodan heating", "unit": "%", "axis": "percent", "group": "vendor"},
+        {"id": "shelly_dhw_minus_vendor_percent", "label": "Shelly minus Ecodan DHW", "unit": "%", "axis": "percent", "group": "vendor"},
         {
             "id": "shelly_minus_vendor_percent", "label": "Shelly minus Ecodan",
             "unit": "%", "axis": "percent", "group": "vendor",

@@ -117,6 +117,13 @@ def test_temperature_timeline_refreshes_with_period_and_keeps_mobile_targets_rea
     assert "new Date(" not in source
 
 
+def test_response_charts_keep_normalized_units_and_zero_cooling_distinct():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert 'item.axis==="normalized"' in source
+    assert 'Measured AC cooling electricity: 0.0 kWh' in source
+    assert 'this.axisTicks(0,maxY)' in source and 'kWh/m²/day' in source
+
+
 def test_all_history_presets_are_backend_resolved_and_refresh_state_is_preserved():
     frontend = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
     backend = (INTEGRATION / "periods.py").read_text(encoding="utf-8")

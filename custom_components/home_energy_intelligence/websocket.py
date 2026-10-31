@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import voluptuous as vol
@@ -518,10 +518,20 @@ async def _monthly_report_payload(hass, coordinator, end_month: str, count: int 
             start_month=months[0], end_month=months[-1]
         )
     )
+    hourly_records = []
+    for month in months:
+        candidates = [item for item in snapshots if item.get("report_month") == month and item.get("cutoff_certainty") == "exact" and item.get("cutoff_utc")]
+        if not candidates:
+            continue
+        start, _ = local_day_bounds(date.fromisoformat(f"{month}-01"), coordinator.timezone)
+        end = max(datetime.fromisoformat(item["cutoff_utc"]) for item in candidates)
+        if end > start and (end - start).total_seconds() % 3600 == 0:
+            hourly_records.extend(await hass.async_add_executor_job(coordinator.database.hourly_range, start, end))
     return build_rolling_month_report(
         daily_records=records, snapshots=snapshots, equipment=_equipment(coordinator),
         timezone=coordinator.timezone, end_month=end_month, count=count,
         floor_area_m2=coordinator.config.get("floor_area_m2"),
+        hourly_records=hourly_records,
     )
 
 
@@ -577,7 +587,8 @@ async def ws_monthly_report_csv(hass, connection, msg):
         "snapshot_cutoff_utc", "energy_period_end_utc", "cutoff_match",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
-    writer.writeheader()
+    units = {item["id"]: item["unit"] for item in report["metric_catalog"]}
+    writer.writerow({field: f"{field} ({units[field]})" if field in units else field for field in fields})
     for row in report["rows"]:
         writer.writerow({field: row.get(field) for field in fields})
     connection.send_result(msg["id"], {

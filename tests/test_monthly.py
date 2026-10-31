@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -105,6 +105,8 @@ def test_rolling_report_has_all_13_calendar_positions_and_shelly_primary_cop():
     assert january["vendor_heating_cop"] == pytest.approx(30 / 9)
     assert january["shelly_minus_vendor_kwh"] == pytest.approx(3)
     assert january["shelly_minus_vendor_percent"] == pytest.approx(100 * 3 / 13)
+    assert january["shelly_heating_minus_vendor_kwh"] == pytest.approx(1)
+    assert january["shelly_dhw_minus_vendor_kwh"] == pytest.approx(1)
     assert january["cutoff_match"] is True
     assert result["rows"][0]["quality"] == "missing"
 
@@ -135,6 +137,33 @@ def test_mismatched_monthly_cutoff_never_claims_primary_cop():
     assert report["vendor_heating_cop"] == pytest.approx(30 / 9)
     assert report["shelly_minus_vendor_kwh"] is None
     assert report["shelly_minus_vendor_percent"] is None
+    assert report["shelly_heating_minus_vendor_kwh"] is None
+    assert report["shelly_dhw_minus_vendor_percent"] is None
+
+
+def test_hourly_aligned_midmonth_snapshot_uses_hourly_evidence():
+    entry = normalize_monthly_snapshot(snapshot(
+        report_month="2026-01", cutoff_local_date="2026-01-01",
+        cutoff_local_time="02:00", cutoff_certainty="exact",
+    ), "Europe/Ljubljana")
+    entry["id"] = 1
+    start = datetime(2025, 12, 31, 23, tzinfo=UTC)
+    hours = []
+    for index in range(2):
+        begin = start + timedelta(hours=index)
+        item = daily_record(local_date="2026-01-01", period_start=begin.isoformat(),
+                            period_end=(begin + timedelta(hours=1)).isoformat())
+        item["day_seconds"] = 3600
+        item["allocations"]["hp_main"].update(covered_seconds=3600, period_seconds=3600)
+        hours.append(item)
+    row = build_rolling_month_report(
+        daily_records=[], hourly_records=hours, snapshots=[entry],
+        equipment=[{"equipment_id": "hp_main", "kind": "heat_pump", "enabled": True}],
+        timezone="Europe/Ljubljana", end_month="2026-01", count=1,
+    )["rows"][0]
+    assert row["cutoff_match"] is True
+    assert row["primary_heating_cop"] == pytest.approx(1.5)
+    assert row["primary_cop_quality"] == "provisional_assumed_heating"
 
 
 def test_latest_same_month_snapshot_replaces_mtd_value_without_summing():
