@@ -40,9 +40,27 @@ def test_unknown_ecodan_is_assumed_heating_but_idle_is_not():
 
 
 def test_ac_action_selected_mode_and_explicit_seasonal_fallback_are_distinct():
-    assert ac_category(StateSample(START, "heat", {"hvac_action": "heating"})) == "heating"
+    assert ac_category(StateSample(START, "heat", {"hvac_action": "heating"})) == "heating_selected"
     assert ac_category(StateSample(START, "heat", {})) == "heating_selected"
     assert ac_category(StateSample(START, "unknown", {}), seasonal_fallback=True) == "heating_estimated"
+
+
+@pytest.mark.parametrize(
+    ("selected", "action", "expected"),
+    [
+        ("heat", "idle", "heating_selected"),
+        ("cool", "idle", "cooling_selected"),
+        ("off", "heating", "standby"),
+        ("dry", "cooling", "dry_fan"),
+        ("fan_only", "heating", "dry_fan"),
+        ("auto", "heating", "heating"),
+        ("unavailable", "idle", "standby"),
+        ("auto", "idle", "standby"),
+        ("auto", "", "unknown"),
+    ],
+)
+def test_ac_selected_mode_has_priority_over_hvac_action(selected, action, expected):
+    assert ac_category(StateSample(START, selected, {"hvac_action": action})) == expected
 
 
 def test_missing_power_is_unallocatable_residual_not_time_prorated():

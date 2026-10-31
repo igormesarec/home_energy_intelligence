@@ -21,6 +21,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("wall_time", ["00:00", "00:05", "00:29", "01:00", "05:01"])
+def test_local_yesterday_identity_is_available_across_midnight_close_window(wall_time):
+    from custom_components.home_energy_intelligence.websocket import _local_calendar_dates
+
+    hour, minute = (int(part) for part in wall_time.split(":"))
+    local = datetime(2026, 10, 31, hour, minute, tzinfo=ZoneInfo("Europe/Ljubljana"))
+    today, yesterday = _local_calendar_dates(
+        "Europe/Ljubljana", local.astimezone(UTC)
+    )
+    assert today == date(2026, 10, 31)
+    assert yesterday == date(2026, 10, 30)
+
+
 @pytest.mark.asyncio
 async def test_temperature_pipeline_preserves_recorder_rows_and_collection_evidence(hass):
     from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator

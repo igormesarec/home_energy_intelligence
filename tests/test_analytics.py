@@ -3,10 +3,17 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from custom_components.home_energy_intelligence.analytics import (
-    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records,
-    daily_coverage, heating_response_profile, interval_coverage, replace_with_partial_day,
+    attach_canonical,
+    canonical_energy,
+    combine_daily_records,
+    combine_interval_records,
+    daily_coverage,
+    heating_response_profile,
+    interval_coverage,
+    prefer_authoritative_daily,
+    provisional_completed_day_from_hourly,
+    replace_with_partial_day,
 )
-
 
 EQUIPMENT = [
     {"equipment_id": "hp-a", "display_name": "Heat pump A", "kind": "heat_pump", "enabled": True},
@@ -287,6 +294,119 @@ def test_23_and_25_hour_expected_interval_counts():
     fall = datetime(2026, 10, 24, 22, tzinfo=UTC)
     assert interval_coverage([], spring, spring + timedelta(hours=23))["expected_intervals"] == 23
     assert interval_coverage([], fall, fall + timedelta(hours=25))["expected_intervals"] == 25
+
+
+@pytest.mark.parametrize("hours", [23, 24, 25])
+def test_provisional_yesterday_uses_all_local_elapsed_hours(hours):
+    start = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    records = [_hour(start + timedelta(hours=index), 1.5) for index in range(hours)]
+    for index, record in enumerate(records):
+        record["local_date"] = "2026-10-25"
+        record["pv_kwh"] = 0.25
+        record["temperatures"] = {"outdoor": {
+            "mean": 5 + index / 10, "minimum": 4, "maximum": 8,
+            "coverage_seconds": 3600, "period_seconds": 3600,
+            "coverage_percent": 100, "quality": "good",
+        }}
+    report = provisional_completed_day_from_hourly(
+        records, start, start + timedelta(hours=hours),
+        local_date="2026-10-25", timezone="Europe/Ljubljana",
+    )
+    assert report["known_household_kwh"] == pytest.approx(hours * 1.5)
+    assert report["household_kwh"] == pytest.approx(hours * 1.5)
+    assert report["pv_kwh"] == pytest.approx(hours * .25)
+    assert report["temperatures"]["outdoor"]["coverage_percent"] == 100
+    assert report["provisional"] is True
+    assert report["partial"] is True
+    assert report["finalized"] is False
+
+
+def test_temperature_only_hour_does_not_hide_missing_yesterday_electricity():
+    start = datetime(2026, 10, 29, 23, tzinfo=UTC)
+    records = [_hour(start + timedelta(hours=index)) for index in range(24)]
+    for record in records:
+        record["temperatures"] = {"outdoor": {
+            "mean": 7.0, "minimum": 7.0, "maximum": 7.0,
+            "coverage_seconds": 3600, "period_seconds": 3600,
+            "coverage_percent": 100, "quality": "good",
+        }}
+    missing = records.pop(7)
+    records.append({
+        "local_date": "2026-10-30", "timezone": "Europe/Ljubljana",
+        "period_start_utc": missing["period_start_utc"],
+        "period_end_utc": missing["period_end_utc"], "day_seconds": 3600,
+        "temperature_only": True, "quality": "partial", "allocations": {},
+        "household_kwh": None, "pv_kwh": None, "import_kwh": None,
+        "export_kwh": None, "temperatures": {"outdoor": {
+            "mean": 7.0, "minimum": 7.0, "maximum": 7.0,
+            "coverage_seconds": 3600, "period_seconds": 3600,
+            "coverage_percent": 100, "quality": "good",
+        }},
+    })
+    report = provisional_completed_day_from_hourly(
+        records, start, start + timedelta(hours=24),
+        local_date="2026-10-30", timezone="Europe/Ljubljana",
+    )
+    assert report["household_kwh"] is None
+    assert report["known_household_kwh"] == 23
+    assert report["partial"] is True
+    assert report["interval_coverage"]["missing_intervals"] == [{
+        "start": missing["period_start_utc"], "end": missing["period_end_utc"],
+    }]
+    assert report["temperatures"]["outdoor"]["coverage_percent"] == 100
+
+
+def test_authoritative_daily_replaces_provisional_without_duplicate_energy():
+    provisional = {"local_date": "2026-10-30", "provisional": True,
+                   "finalized": False, "household_kwh": 42}
+    first = prefer_authoritative_daily([], provisional)
+    assert first == [provisional]
+    retry = prefer_authoritative_daily(first, {**provisional, "household_kwh": 43})
+    assert len(retry) == 1 and retry[0]["household_kwh"] == 43
+    authoritative = {"local_date": "2026-10-30", "finalized": True,
+                     "household_kwh": 42.631}
+    replaced = prefer_authoritative_daily([authoritative], provisional)
+    assert replaced == [authoritative]
+
+
+def test_temperature_only_yesterday_is_replaced_without_losing_temperature():
+    start = datetime(2026, 10, 29, 23, tzinfo=UTC)
+    hours = [_hour(start + timedelta(hours=index), 1.5) for index in range(24)]
+    provisional = provisional_completed_day_from_hourly(
+        hours, start, start + timedelta(hours=24),
+        local_date="2026-10-30", timezone="Europe/Ljubljana",
+    )
+    temperature = {"outdoor": {"mean": 8, "coverage_percent": 100}}
+    placeholder = {"local_date": "2026-10-30", "temperature_only": True,
+                   "temperatures": temperature}
+    result = prefer_authoritative_daily([placeholder], provisional)
+    assert len(result) == 1
+    assert result[0]["household_kwh"] == pytest.approx(36)
+    assert result[0]["temperatures"] == temperature
+    authoritative = {"local_date": "2026-10-30", "household_kwh": 36}
+    assert prefer_authoritative_daily([authoritative], provisional) == [authoritative]
+
+
+def test_provisional_yesterday_survives_restart_from_compact_hourly_rows(tmp_path):
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+
+    database = EnergyDatabase(tmp_path / "energy.sqlite3")
+    database.initialize()
+    start = datetime(2026, 10, 29, 23, tzinfo=UTC)
+    for index in range(24):
+        item = _hour(start + timedelta(hours=index), 1.25)
+        item.update({"local_date": "2026-10-30", "timezone": "Europe/Ljubljana"})
+        assert database.upsert_hourly(item)
+    reopened = EnergyDatabase(database.path)
+    reopened.initialize()
+    rows = reopened.hourly_range(start, start + timedelta(hours=24))
+    report = provisional_completed_day_from_hourly(
+        rows, start, start + timedelta(hours=24),
+        local_date="2026-10-30", timezone="Europe/Ljubljana",
+    )
+    assert report["known_household_kwh"] == pytest.approx(30)
+    assert report["provisional"] is True and report["partial"] is True
+    assert reopened.daily("2026-10-30") is None
 
 
 def test_month_temperature_mean_is_weighted_by_valid_elapsed_duration():

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
-
 
 PANEL = Path(__file__).parents[1] / "custom_components" / "home_energy_intelligence" / "frontend" / "hei-panel.js"
 
@@ -28,7 +28,15 @@ panel.overviewData={representative_indoor_source_id:'indoor'};
 panel.temperatureSources=[{source_id:'indoor',display_name:'Indoor',entity_id:'sensor.indoor',role:'indoor'}];
 panel.historySummary=input.daily || null;
 panel.temperatureTimelineData=input.timeline;
-process.stdout.write(panel.temperatureTimeline('indoor'));
+const first=panel.temperatureTimeline('indoor');
+if(input.twice){
+  panel.overviewData.representative_outdoor_source_id='outdoor';
+  panel.temperatureSources.push({source_id:'outdoor',display_name:'Outdoor',entity_id:'sensor.outdoor',role:'outdoor'});
+  input.timeline.source_ids.push('outdoor');
+  input.timeline.sources.push({source_id:'outdoor',display_name:'Outdoor',entity_id:'sensor.outdoor',role:'outdoor'});
+  input.timeline.intervals.forEach((row)=>{row.temperatures.outdoor={...row.temperatures.indoor};});
+}
+process.stdout.write(first+(input.twice?panel.temperatureTimeline('outdoor'):''));
 """
     result = subprocess.run(
         ["node", "-e", script, str(PANEL)], input=json.dumps(payload), text=True,
@@ -90,6 +98,11 @@ def test_yesterday_renders_real_hourly_points_time_axis_and_accessible_details()
     assert html.count('tabindex="0"') == 24
     assert "Europe/Berlin" in html and "hourly" in html
     assert "sensor.indoor" in html and "coverage 100.0%" in html
+    assert 'viewBox="0 0 320 190"' in html
+    assert '<clipPath id="hei-temp-plot-1">' in html
+    assert 'clip-path="url(#hei-temp-plot-1)"' in html
+    assert 'class="temp-chart-shell"' in html
+    assert "°C" in html
 
 
 def test_missing_hours_break_lines_and_one_real_hour_remains_one_point():
@@ -112,3 +125,54 @@ def test_daily_summary_without_hourly_archive_shows_truthful_empty_state():
     html = _render({"timeline": timeline, "daily": daily})
     assert "Daily summary available, but hourly temperature history has not been archived/backfilled" in html
     assert "<polyline" not in html and 'class="temp-point' not in html
+
+
+def test_large_valid_range_and_whiskers_stay_inside_plot_rectangle():
+    timeline = _timeline()
+    timeline["intervals"][0]["temperatures"]["indoor"].update({
+        "mean": -12.0, "minimum": -20.0, "maximum": -5.0,
+    })
+    timeline["intervals"][-1]["temperatures"]["indoor"].update({
+        "mean": 39.0, "minimum": 34.0, "maximum": 45.0,
+    })
+    html = _render({"timeline": timeline})
+    ranges = re.findall(r'class="temp-range[^\"]*"[^>]*y1="([0-9.]+)" y2="([0-9.]+)"', html)
+    assert ranges
+    assert all(12 <= float(value) <= 148 for pair in ranges for value in pair)
+    points = re.findall(r'class="temp-point[^\"]*" cx="([0-9.]+)" cy="([0-9.]+)"', html)
+    assert all(48 <= float(x) <= 308 and 12 <= float(y) <= 148 for x, y in points)
+    assert "min -20.0" in html and "max -5.0" in html
+    assert "min 34.0" in html and "max 45.0" in html
+
+
+def test_rejected_spikes_partial_day_and_missing_data_do_not_create_graphics():
+    timeline = _timeline(missing={3, 4})
+    for index, rejected in ((7, -55), (12, 155)):
+        timeline["intervals"][index]["temperatures"]["indoor"].update({
+            "mean": None, "minimum": None, "maximum": None,
+            "coverage_percent": 0, "valid_seconds": 0, "quality": "filtered",
+            "rejected_reasons": [f"invalid_sentinel:{rejected}"],
+        })
+    timeline["available_interval_count"] = 20
+    html = _render({"timeline": timeline})
+    assert html.count('class="temp-point') == 20
+    assert "20/24 intervals" in html
+    assert "-55.0 °C" not in html and "155.0 °C" not in html
+
+
+def test_multiple_chart_instances_have_independent_clip_paths():
+    html = _render({"timeline": _timeline(), "twice": True})
+    ids = re.findall(r'<clipPath id="([^"]+)"', html)
+    references = re.findall(r'clip-path="url\(#([^\)]+)\)"', html)
+    assert ids == ["hei-temp-plot-1", "hei-temp-plot-2"]
+    assert references == ids
+
+
+@pytest.mark.parametrize("viewport_width", [320, 360, 390, 430, 1280])
+def test_responsive_viewbox_fits_mobile_and_desktop_without_horizontal_scroll(viewport_width):
+    html = _render({"timeline": _timeline()})
+    view_width, view_height = map(int, re.search(r'viewBox="0 0 (\d+) (\d+)"', html).groups())
+    rendered_width = min(viewport_width, view_width if viewport_width > 800 else viewport_width)
+    rendered_height = min(230, rendered_width * view_height / view_width)
+    assert rendered_width <= viewport_width
+    assert 190 <= rendered_height <= 230

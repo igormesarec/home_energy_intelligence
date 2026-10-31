@@ -1,5 +1,29 @@
 # Changelog
 
+## V0.2.1 — draft
+
+- Constrained indoor and outdoor temperature timelines to responsive SVG plot rectangles
+  with per-instance clipping, validated min/mean/max domain padding and readable mobile axes.
+- Made a completed Yesterday available immediately from persisted hourly energy and
+  temperature records. The non-persisted provisional view exposes internal gaps and
+  is replaced by the authoritative daily row after the 05:00 close without double counting.
+- Added additive schema V7 for distinct monthly/month-to-date Ecodan report snapshots,
+  nullable fields, exact/date-only cutoff evidence, partial/final state, revisions and audit.
+- Added a rolling 13-calendar-month interactive histogram, synchronized table and
+  selected-metric CSV export with Shelly electricity as the primary measurement source.
+- Separated confirmed heating, DHW, idle/other, assumed unknown-mode electricity,
+  assumed positive residual, raw unassigned evidence, remaining unassigned energy and
+  signed reconciliation error without assigning uncertainty to confirmed categories.
+- Changed AC classification to prioritize the selected climate mode over transient
+  `hvac_action`, preserving heat/cool electricity while the compressor is idle.
+- Primary heating/DHW/combined COP now uses exactly matched Shelly-classified intervals;
+  assumed heating produces an explicit provisional COP. Vendor COP remains secondary.
+- Kept cross-boundary cumulative thermal intervals as evidence but excluded them from
+  exact selected-period thermal totals. Missing heat and incomplete household values no
+  longer render as false zeroes in the whole-house energy card.
+- Added numeric axes to response, temperature and new monthly charts; forecasting remains
+  a V0.3 placeholder and no AC COP or inferred thermal output is generated.
+
 ## V0.2.0 — draft
 
 - Added additive schema V6 cumulative Ecodan thermal readings with source timestamps,

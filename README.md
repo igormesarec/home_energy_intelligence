@@ -1,5 +1,21 @@
 # Home Energy Intelligence
 
+## V0.2.1 monthly analytics and midnight availability (draft)
+
+V0.2.1 keeps the 05:00 authoritative daily close but no longer makes Yesterday wait for
+it. If the daily row is absent, History assembles a clearly provisional, non-persisted
+completed day from the compact hourly rows. Internal electrical gaps remain unavailable;
+independent temperature coverage does not hide them. The authoritative daily row replaces
+that view automatically after close.
+
+The **Monthly Analytics** section under **COP & Efficiency** stores monthly/month-to-date Ecodan report snapshots in a
+new ledger that is separate from lifetime cumulative thermal readings. Its rolling
+13-calendar-month chart and synchronized table use classified Shelly electricity as the
+primary basis for heating, DHW and combined COP. Assumed heating is included only in a
+visibly provisional primary COP; vendor electricity/COP remains a secondary comparison.
+Blank source fields stay unavailable, all cutoffs and provenance are retained, and CSV
+exports only the metrics selected in the chart.
+
 ## V0.2 measured thermal energy (draft)
 
 V0.2 adds measured Ecodan thermal evidence without deriving heat from electricity.
@@ -86,15 +102,17 @@ Home Energy Intelligence is a HACS-installable Home Assistant custom integration
 7. Review Recorder-first historical collection; enable read-only InfluxDB backfill only if needed.
 8. Confirm the Home Assistant time zone. Completed-hour rows refresh shortly after every hour, six-hour checkpoints preserve classification evidence, and the previous calendar day is finalized at 05:00 local time.
 9. If a representative sensor has blank history, open dashboard **Settings → Temperature pipeline diagnostics and recovery**. Select 1–31 dates, run **Diagnose**, then **Preview temperature-only backfill**. Start the backfill only after reviewing mapping blocks and query cost. Use the explicit attestation checkbox only when you can prove the displayed current entity/attribute/role applied to the entire selected range. Missing Recorder intervals remain gaps.
-10. After upgrading through HACS, redownload the integration if needed and restart Home Assistant. V0.2 migrates schema V5 to V6 additively; make a protected backup first. The panel content hash changes with the JavaScript bundle; no config-entry recreation or database rebuild is required.
+10. After upgrading through HACS, redownload the integration if needed and restart Home Assistant. V0.2.1 migrates schema V6 to V7 additively for the separate monthly snapshot ledger; make a protected backup first. V1–V6 records remain intact. The panel content hash changes with the JavaScript bundle; no config-entry recreation or database rebuild is required.
 11. Open integration Options → Data sources, choose manual-only, Home Assistant counters, or mixed thermal mode, select the Ecodan stable equipment ID and optional cumulative thermal entities. Existing saved floor area and all V0.1.x records are retained.
+12. In **COP & Efficiency → Monthly Analytics**, enter each report month, local cutoff date/time, partial/final status and only the values printed by the source report. This form is not a cumulative lifetime meter. Administrator access is required to add, revise or delete snapshots; authenticated users may view the derived monthly report.
 
 For a manual install, copy `custom_components/home_energy_intelligence` into the Home Assistant configuration directory's `custom_components` folder, then restart.
 
 Before updating an existing installation, create the administrator-only protected
 database backup. Startup integrity-checks the database and transactionally
-migrates V1–V4 storage to schema V5. V4 normalization remains intact; V5 adds
-independent temperature history, mapping events, attestations and resumable jobs.
+migrates legacy storage through schema V7. V4 normalization remains intact; V5 adds
+independent temperature history, V6 adds cumulative thermal evidence and V7 adds the
+separate monthly/MtD snapshot ledger.
 Migration is keyset-batched and never runs `VACUUM` during startup. Dashboard
 Settings discloses current/target schema, free space and the protected-backup
 policy; optional compaction is a separate manual offline maintenance action.
@@ -137,6 +155,7 @@ The [V0.1.2 root-cause matrix](docs/V0_1_2_ROOT_CAUSE_MATRIX.md) and [implementa
 - **V0.1.1:** whole-house electrical heating-response evidence; no thermal output is inferred.
 - **V0.1.2:** independent temperature history recovery, current-cutoff HVAC presentation and release-safety corrections.
 - **V0.2:** measured Ecodan thermal intervals/COP, four separate response curves and whole-house electrical/partially-known thermal profile.
+- **V0.2.1:** Shelly-first monthly/MtD Ecodan analytics, audited rolling 13-month reports and immediate provisional Yesterday.
 - **V0.3:** weather-dependent forecasting (interface only in V0.2; no values yet).
 - **V0.2:** manually or natively sourced thermal energy, thermal response, and correctly weighted COP.
 - **V0.3:** weather sources and probabilistic forecasting.

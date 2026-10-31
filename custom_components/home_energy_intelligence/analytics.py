@@ -148,7 +148,9 @@ def canonical_energy(
             cooling = _category(allocation, ("cooling",))
             idle = _category(allocation, ("idle",))
             other = 0.0
-            unknown = _category(allocation, ("unknown",))
+            unknown = _number(allocation.get("remaining_unassigned_after_fallback_kwh"))
+            if unknown is None:
+                unknown = _category(allocation, ("unknown",))
             selected = estimated = 0.0
             selected_cooling = estimated_cooling = 0.0
             totals["confirmed_heat_pump_heating_kwh"] += confirmed
@@ -220,6 +222,21 @@ def canonical_energy(
             "idle_kwh": idle if classification_complete else None,
             "other_hvac_kwh": other if classification_complete else None,
             "unknown_kwh": unknown, "residual_kwh": residual,
+            "raw_unassigned_before_fallback_kwh": allocation.get(
+                "raw_unassigned_before_fallback_kwh"
+            ),
+            "heating_assumed_unknown_mode_kwh": allocation.get(
+                "heating_assumed_unknown_mode_kwh"
+            ),
+            "heating_assumed_residual_kwh": allocation.get(
+                "heating_assumed_residual_kwh"
+            ),
+            "remaining_unassigned_after_fallback_kwh": allocation.get(
+                "remaining_unassigned_after_fallback_kwh"
+            ),
+            "signed_overallocation_or_reconciliation_error_kwh": allocation.get(
+                "signed_overallocation_or_reconciliation_error_kwh"
+            ),
             "coverage_percent": device_coverage,
             "coverage_known": device_coverage is not None,
             "covered_seconds": allocation.get("covered_seconds"),
@@ -641,6 +658,23 @@ def combine_interval_records(
             "reported_assumed_heating_kwh": sum(
                 float(part.get("reported_assumed_heating_kwh", 0) or 0) for part in available
             ),
+            **{
+                key: (
+                    None if len(available) != len(records) or any(
+                        _number(part.get(key)) is None for part in available
+                    ) else sum(float(part[key]) for part in available)
+                )
+                for key in (
+                    "shelly_total_kwh", "heating_confirmed_kwh",
+                    "dhw_confirmed_kwh", "idle_other_kwh",
+                    "heating_assumed_unknown_mode_kwh",
+                    "positive_reconciliation_residual_kwh",
+                    "heating_assumed_residual_kwh",
+                    "raw_unassigned_before_fallback_kwh",
+                    "remaining_unassigned_after_fallback_kwh",
+                    "signed_overallocation_or_reconciliation_error_kwh",
+                )
+            },
             "coverage_percent": (
                 100 * covered / seconds if coverage_known and seconds else None
             ),
@@ -799,6 +833,81 @@ def combine_interval_records(
         "temperatures": temperatures, "allocations": allocations,
         "provenance": {"source": "persisted_hourly_records", "interval_count": len(records)},
     }
+
+
+def provisional_completed_day_from_hourly(
+    records: list[dict[str, Any]], start: datetime, end: datetime,
+    *, local_date: str, timezone: str,
+) -> dict[str, Any] | None:
+    """Build a non-persisted completed-day view from hourly evidence.
+
+    Temperature-only rows contribute temperature coverage but cannot satisfy
+    electrical interval coverage or manufacture zero electricity.
+    """
+    if not records:
+        return None
+    energy_records = [item for item in records if not item.get("temperature_only")]
+    temperature_record = combine_interval_records(
+        records, expected_start=start, expected_end=end,
+    )
+    combined = combine_interval_records(
+        energy_records, expected_start=start, expected_end=end,
+    )
+    if combined is None:
+        combined = {
+            "local_date": local_date, "timezone": timezone,
+            "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+            "day_seconds": int((end - start).total_seconds()),
+            "known_household_kwh": None, "known_pv_kwh": None,
+            "known_import_kwh": None, "known_export_kwh": None,
+            "known_non_hvac_kwh": None, "household_kwh": None, "pv_kwh": None,
+            "import_kwh": None, "export_kwh": None, "non_hvac_kwh": None,
+            "quality": "missing", "allocations": {},
+            "interval_coverage": interval_coverage([], start, end),
+            "provenance": {"source": "persisted_hourly_records", "interval_count": 0},
+        }
+    combined["local_date"] = local_date
+    combined["timezone"] = timezone
+    combined["temperatures"] = (
+        temperature_record.get("temperatures", {}) if temperature_record else {}
+    )
+    combined.update({
+        "provisional": True,
+        "partial": True,
+        "finalized": False,
+    })
+    combined.setdefault("provenance", {}).update({
+        "source": "persisted_hourly_records",
+        "report_status": "provisional_completed_day",
+        "authoritative_daily_record_pending": True,
+    })
+    return combined
+
+
+def prefer_authoritative_daily(
+    stored_records: list[dict[str, Any]], provisional: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Add a provisional day only until an authoritative row with that date exists."""
+    if provisional is None:
+        return list(stored_records)
+    local_date = str(provisional.get("local_date"))
+    if any(
+        str(item.get("local_date")) == local_date
+        and not item.get("temperature_only")
+        and not (item.get("provisional") is True and item.get("finalized") is False)
+        for item in stored_records
+    ):
+        return list(stored_records)
+    temperatures = dict(provisional.get("temperatures") or {})
+    for item in stored_records:
+        if str(item.get("local_date")) == local_date and item.get("temperature_only"):
+            temperatures.update(item.get("temperatures") or {})
+    if temperatures:
+        provisional = {**provisional, "temperatures": temperatures}
+    return [
+        *[item for item in stored_records if str(item.get("local_date")) != local_date],
+        provisional,
+    ]
 
 
 def daily_coverage(
@@ -1106,6 +1215,8 @@ def combine_daily_records(
         return None
     combined = combine_interval_records(records)
     assert combined is not None
+    if any(item.get("provisional") is True for item in records):
+        combined.update({"provisional": True, "partial": True, "finalized": False})
     coverage = daily_coverage(
         records, start_date, end_date,
         equipment_ids=equipment_ids,

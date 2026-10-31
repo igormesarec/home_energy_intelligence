@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from custom_components.home_energy_intelligence.database import EnergyDatabase
+from custom_components.home_energy_intelligence.database import EnergyDatabase, SCHEMA_VERSION
 from custom_components.home_energy_intelligence.thermal import (
     cumulative_intervals, match_classified_electricity, normalize_manual_reading,
     ratio_of_sums, thermal_performance_points,
@@ -71,7 +71,7 @@ def hourly(start, *, heat, dhw, assumed=0):
     }
 
 
-def test_exact_interval_ecodan_heating_and_dhw_cop_excludes_assumed_and_ac():
+def test_exact_interval_ecodan_cop_includes_assumed_as_provisional_and_excludes_ac():
     start = datetime(2026, 10, 25, tzinfo=UTC)
     interval = {
         "ecodan_equipment_id": "hp-main", "meter_identity": "meter",
@@ -96,8 +96,11 @@ def test_exact_interval_ecodan_heating_and_dhw_cop_excludes_assumed_and_ac():
     assumed = match_classified_electricity(
         interval, [hourly(start, heat=1, dhw=1.5, assumed=.5), records[1]], equipment[:1]
     )
-    assert assumed["exact_match"] is False
-    assert "assumed_heating_excluded" in assumed["issues"]
+    assert assumed["exact_match"] is True
+    assert assumed["heating_electricity_kwh"] == pytest.approx(2.5)
+    assert assumed["confirmed_heating_electricity_kwh"] == pytest.approx(2)
+    assert assumed["assumed_heating_electricity_kwh"] == pytest.approx(.5)
+    assert assumed["heating_match_quality"] == "provisional_assumed_heating"
     assert ratio_of_sums([8, 12], [2, 3]) == 4
 
 
@@ -118,7 +121,7 @@ def test_thermal_ledger_migration_crud_audit_and_unrelated_data_preserved(tmp_pa
     assert [item["action"] for item in audit] == ["create", "update", "delete"]
     assert database.thermal_readings() == []
     with database.connect() as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_thermal_configuration_translations_are_synchronized():

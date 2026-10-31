@@ -56,9 +56,17 @@ def configurable_classifier(
 
 
 def ac_category(state: StateSample, *, seasonal_fallback: bool = False) -> str:
-    """Classify AC operation from action first, then selected HVAC mode."""
+    """Classify AC electricity from selected mode before transient action."""
     action = str(state.attributes.get("hvac_action", "")).lower()
     selected = state.state.lower()
+    selected_map = {
+        "heat": "heating_selected", "heating": "heating_selected",
+        "cool": "cooling_selected", "cooling": "cooling_selected",
+        "off": "standby", "idle": "standby",
+        "dry": "dry_fan", "fan_only": "dry_fan", "fan": "dry_fan",
+    }
+    if selected in selected_map:
+        return selected_map[selected]
     action_map = {
         "heating": "heating",
         "cooling": "cooling",
@@ -69,14 +77,6 @@ def ac_category(state: StateSample, *, seasonal_fallback: bool = False) -> str:
     }
     if action in action_map:
         return action_map[action]
-    if selected in {"heat", "heating"}:
-        return "heating_selected"
-    if selected in {"cool", "cooling"}:
-        return "cooling_selected"
-    if selected in {"dry", "fan_only", "fan"}:
-        return "dry_fan"
-    if selected in {"off", "idle"}:
-        return "standby"
     if seasonal_fallback:
         return "cooling_estimated" if 5 <= state.timestamp.month <= 9 else "heating_estimated"
     return "unknown"
@@ -161,7 +161,7 @@ def allocate_interval(
     covered_seconds = 0.0
     rejected = 0
 
-    for segment_start, segment_end in zip(instants, instants[1:]):
+    for segment_start, segment_end in zip(instants, instants[1:], strict=False):
         mode = _at_or_before(modes, segment_start)
         power = _at_or_before(powers, segment_start)
         if mode is None or power is None or power.value is None:

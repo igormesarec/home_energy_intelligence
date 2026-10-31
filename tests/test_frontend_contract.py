@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "home_energy_intelligence"
 GUIDED_STEPS = {
@@ -57,8 +56,8 @@ def test_v02_frontend_cache_key_uses_content_hash_and_keeps_sidebar_path():
     panel = (INTEGRATION / "panel.py").read_text(encoding="utf-8")
     manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
     const = (INTEGRATION / "const.py").read_text(encoding="utf-8")
-    assert manifest["version"] == "0.2.0"
-    assert 'VERSION: Final = "0.2.0"' in const
+    assert manifest["version"] == "0.2.1"
+    assert 'VERSION: Final = "0.2.1"' in const
     assert "sha256" in panel and "frontend_build" in panel
     assert "?v={VERSION}-{frontend_build}" in panel
     assert "frontend_url_path=PANEL_URL" in panel
@@ -112,8 +111,17 @@ def test_temperature_timeline_refreshes_with_period_and_keeps_mobile_targets_rea
     assert source.count("await this.loadTemperatureTimeline(") >= 2
     assert ".temp-hit{fill:transparent" in source
     assert 'r="8"' in source
-    assert "height:98px" in source
+    assert ".temp-chart-shell{width:100%;max-width:100%;margin-top:10px;overflow:hidden}" in source
+    assert "aspect-ratio:320/190" in source
+    assert "clipPath" in source and 'class="temp-plot" clip-path=' in source
     assert "new Date(" not in source
+
+
+def test_response_charts_keep_normalized_units_and_zero_cooling_distinct():
+    source = (INTEGRATION / "frontend" / "hei-panel.js").read_text(encoding="utf-8")
+    assert 'item.axis==="normalized"' in source
+    assert 'Measured AC cooling electricity: 0.0 kWh' in source
+    assert 'this.axisTicks(0,maxY)' in source and 'kWh/m²/day' in source
 
 
 def test_all_history_presets_are_backend_resolved_and_refresh_state_is_preserved():
