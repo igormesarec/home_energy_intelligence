@@ -20,6 +20,32 @@ pytestmark = pytest.mark.skipif(
     reason="current Home Assistant test harness is installed in CI",
 )
 
+if importlib.util.find_spec("homeassistant") is not None:
+    import custom_components.home_energy_intelligence.coordinator
+
+
+@pytest.mark.asyncio
+async def test_september_counter_history_without_baseline_uses_complete_statistics(hass):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    from custom_components.home_energy_intelligence.allocation import counter_delta
+
+    start = datetime(2026, 8, 31, 22, tzinfo=UTC)
+    end = start + timedelta(hours=24)
+    entities = {"pv": "sensor.pv", "import": "sensor.grid_import", "export": "sensor.grid_export"}
+    entry = SimpleNamespace(entry_id="entry", data={"equipment": "[]", "site_sources": entities,
+                            "temperature_sources": "[]"}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, SimpleNamespace(store_mapping_revision=lambda _: True))
+    rows = [SimpleNamespace(last_updated=start + timedelta(hours=i), state=str(i),
+                            attributes={"unit_of_measurement": "kWh"}) for i in (1, 2)]
+    stats = [{"start": start + timedelta(hours=i), "end": start + timedelta(hours=i + 1),
+              "change": 1.0} for i in range(24)]
+    coordinator.reader = SimpleNamespace(async_history=AsyncMock(return_value={v: rows for v in entities.values()}),
+                                         async_statistics=AsyncMock(return_value={v: stats for v in entities.values()}))
+    result = await coordinator._async_collect_range(start, end)
+    for key in entities:
+        assert counter_delta(result.site_counters[key], start, end)[0] == pytest.approx(24)
+        assert result.provenance["counter_collection"][f"site.{key}"] == "recorder_statistics"
+
 
 @pytest.mark.parametrize("wall_time", ["00:00", "00:05", "00:29", "01:00", "05:01"])
 def test_local_yesterday_identity_is_available_across_midnight_close_window(wall_time):
