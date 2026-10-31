@@ -74,6 +74,22 @@ process.stdout.write('\n---\n'+panel.copView());
     assert "Provisional monthly COP" not in partial
 
 
+def test_annual_cop_uses_matched_months_and_ratio_of_sums():
+    output = run_panel(r"""
+panel.historyPreset='this_year';panel.selectedPeriod={start_date:'2026-01-01',end_date:'2026-10-31'};
+const row=(month,heat,dhw,vh,vd,sh,sd)=>({month,snapshot_status:'final',provisional_cop_quality:'provisional_controller_proportions',heating_thermal_kwh:heat,dhw_thermal_kwh:dhw,vendor_heating_electricity_kwh:vh,vendor_dhw_electricity_kwh:vd,vendor_combined_electricity_kwh:vh+vd,provisional_shelly_heating_electricity_kwh:sh,provisional_shelly_dhw_electricity_kwh:sd,provisional_shelly_heating_cop:heat/sh,provisional_shelly_dhw_cop:dhw/sd,provisional_shelly_combined_cop:(heat+dhw)/(sh+sd)});
+panel.selectedYearReport={rows:[row('2026-08',100,200,30,50,29,49),row('2026-09',200,300,50,70,49,68),{month:'2026-10',snapshot_status:'partial'}]};
+panel.v02Report={ecodan_reports:{},ecodan_space_heating:[],ecodan_dhw:[]};panel.periodControls=()=>'';panel.monthlyView=()=>'';
+process.stdout.write(panel.copView());
+""", {})
+    assert "August to September 2026, 2 eligible months" in output
+    assert "2026-08, 2026-09" in output
+    assert "Combined<b>4.00" in output
+    assert "Combined<b>4.10" in output
+    assert "COP for available months" in output
+    assert "Space heating COP<b>Unavailable" in output
+
+
 def test_rolling_13_month_chart_table_and_distinct_snapshot_form_render():
     output = run_panel(r"""
 panel.monthlyReport=input.report;panel.monthlyMetricIds=input.report.default_metric_ids;
