@@ -96,7 +96,9 @@ class DailyAggregator:
             }
             checkpoint_intervals = 0
             checkpoint_sources: list[dict[str, Any]] = []
-            for interval_start, interval_end in zip(boundaries, boundaries[1:]):
+            for interval_start, interval_end in zip(
+                boundaries, boundaries[1:], strict=False
+            ):
                 checkpoint = stored.get((interval_start.isoformat(), interval_end.isoformat()))
                 if checkpoint is not None:
                     checkpoint_intervals += 1
@@ -156,8 +158,12 @@ class DailyAggregator:
                 max(0.0, residual)
                 if residual_known and history.kind == "heat_pump" else 0.0
             )
-            assumed_from_modes = categories.get("heating_assumed", 0.0)
+            assumed_from_modes = (
+                categories.get("heating_assumed", 0.0)
+                + (categories.get("unknown", 0.0) if history.kind == "heat_pump" else 0.0)
+            )
             reporting_assumed = assumed_from_modes + positive_residual
+            remaining_unassigned = 0.0 if residual_known else None
             meter_totals.append(meter_value)
             allocations[device] = {
                 "meter_kwh": meter_value,
@@ -178,6 +184,24 @@ class DailyAggregator:
                 "assumed_heating_reporting": self.assumed_heating_reporting,
                 "reported_assumed_heating_kwh": reporting_assumed,
                 "uncertain_residual_kwh": residual if residual_known else None,
+                "shelly_total_kwh": meter_value,
+                "heating_confirmed_kwh": categories.get("confirmed_heating", 0.0),
+                "dhw_confirmed_kwh": categories.get("dhw", 0.0),
+                "idle_other_kwh": (
+                    categories.get("idle", 0.0) + categories.get("cooling", 0.0)
+                ),
+                "heating_assumed_unknown_mode_kwh": assumed_from_modes,
+                "positive_reconciliation_residual_kwh": positive_residual,
+                "heating_assumed_residual_kwh": positive_residual,
+                "raw_unassigned_before_fallback_kwh": (
+                    assumed_from_modes + positive_residual
+                ),
+                "remaining_unassigned_after_fallback_kwh": remaining_unassigned,
+                "signed_overallocation_or_reconciliation_error_kwh": (
+                    residual if residual_known and residual < 0 else 0.0
+                ),
+                "classification_coverage_seconds": covered,
+                "classification_expected_seconds": elapsed_seconds(start, end),
                 "reported_heating_kwh": None if meter_value is None else (
                     categories.get("confirmed_heating", 0.0) + categories.get("heating", 0.0)
                     + (reporting_assumed

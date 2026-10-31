@@ -3,32 +3,51 @@
 from __future__ import annotations
 
 import csv
-from datetime import UTC, datetime, timedelta
 import io
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import voluptuous as vol
-
 from homeassistant.components import websocket_api
 
-from .configuration import (
-    equipment_from_config, equipment_temperature_mappings, temperatures_from_config,
-)
 from .analytics import (
-    attach_canonical, canonical_energy, combine_daily_records, combine_interval_records, daily_coverage,
-    derive_record_quality, heating_response_profile,
-    interval_coverage, replace_with_partial_day,
+    attach_canonical,
+    canonical_energy,
+    combine_daily_records,
+    combine_interval_records,
+    daily_coverage,
+    derive_record_quality,
+    heating_response_profile,
+    interval_coverage,
+    prefer_authoritative_daily,
+    provisional_completed_day_from_hourly,
+    replace_with_partial_day,
+)
+from .configuration import (
+    equipment_from_config,
+    equipment_temperature_mappings,
+    temperatures_from_config,
 )
 from .const import DOMAIN
+from .monthly import (
+    build_rolling_month_report,
+    monthly_metric_catalog,
+    normalize_monthly_snapshot,
+    rolling_months,
+)
 from .periods import period_bounds, previous_day_same_local_cutoff
-from .timeutils import local_day_bounds
 from .temperature_timeline import (
-    build_timeline_intervals, hourly_axis_ticks, validate_timeline_dates,
+    build_timeline_intervals,
+    hourly_axis_ticks,
+    validate_timeline_dates,
 )
 from .thermal import (
-    cumulative_intervals, normalize_manual_reading, ratio_of_sums,
+    cumulative_intervals,
+    normalize_manual_reading,
+    ratio_of_sums,
     thermal_performance_points,
 )
+from .timeutils import local_day_bounds
 
 
 def async_register_websocket(hass) -> None:
@@ -49,6 +68,11 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_save_thermal_reading)
     websocket_api.async_register_command(hass, ws_delete_thermal_reading)
     websocket_api.async_register_command(hass, ws_backfill_thermal_readings)
+    websocket_api.async_register_command(hass, ws_monthly_report)
+    websocket_api.async_register_command(hass, ws_monthly_report_csv)
+    websocket_api.async_register_command(hass, ws_monthly_ecodan_snapshots)
+    websocket_api.async_register_command(hass, ws_save_monthly_ecodan_snapshot)
+    websocket_api.async_register_command(hass, ws_delete_monthly_ecodan_snapshot)
 
 
 def _coordinator(hass):
@@ -92,6 +116,12 @@ def _representative_temperature_source_ids(coordinator) -> list[str]:
 
 def _response_temperature_coverage_minimum(coordinator) -> float:
     return float(coordinator.config.get("response_temperature_coverage_minimum", 95))
+
+
+def _local_calendar_dates(timezone: str, now: datetime | None = None):
+    """Return HA-local Today and the immediately completed Yesterday."""
+    today = (now or datetime.now(UTC)).astimezone(ZoneInfo(timezone)).date()
+    return today, today - timedelta(days=1)
 
 
 @websocket_api.websocket_command({
@@ -298,9 +328,13 @@ async def ws_v02_report(hass, connection, msg):
     readings = await hass.async_add_executor_job(
         coordinator.database.thermal_readings_period, period_start, period_end
     )
-    intervals = [item for item in cumulative_intervals(readings)
-                 if item["end_utc"] >= period_start.isoformat()
-                 and item["start_utc"] <= period_end.isoformat()]
+    candidate_intervals = [item for item in cumulative_intervals(readings)
+                           if item["end_utc"] >= period_start.isoformat()
+                           and item["start_utc"] <= period_end.isoformat()]
+    intervals = [item for item in candidate_intervals
+                 if item["start_utc"] >= period_start.isoformat()
+                 and item["end_utc"] <= period_end.isoformat()]
+    overlapping_evidence = [item for item in candidate_intervals if item not in intervals]
     hourly = []
     if intervals:
         interval_start = min(datetime.fromisoformat(item["start_utc"]) for item in intervals)
@@ -346,6 +380,8 @@ async def ws_v02_report(hass, connection, msg):
         "ecodan_space_heating": thermal_points, "ecodan_dhw": thermal_points,
         "ecodan_reports": {"heating": heating_report, "dhw": dhw_report,
                            "combined": combined_report},
+        "overlapping_thermal_evidence": overlapping_evidence,
+        "thermal_exact_interval_policy": "fully_contained_only",
         "cop_scope": "ecodan_only", "ac_cop_supported": False,
     })
 
@@ -448,6 +484,196 @@ async def ws_backfill_thermal_readings(hass, connection, msg):
     connection.send_result(msg["id"], result)
 
 
+async def _monthly_report_payload(hass, coordinator, end_month: str, count: int = 13):
+    """Load one bounded SQLite window for the rolling monthly report."""
+    months = rolling_months(end_month, count)
+    start_date = f"{months[0]}-01"
+    end_year, end_number = (int(part) for part in months[-1].split("-"))
+    if end_number == 12:
+        next_month = datetime(end_year + 1, 1, 1).date()
+    else:
+        next_month = datetime(end_year, end_number + 1, 1).date()
+    end_date = (next_month - timedelta(days=1)).isoformat()
+    records = await hass.async_add_executor_job(
+        coordinator.database.history_period, start_date, end_date
+    )
+    local_today, local_yesterday = _local_calendar_dates(coordinator.timezone)
+    if start_date <= local_yesterday.isoformat() <= end_date and not any(
+        str(item.get("local_date")) == local_yesterday.isoformat() for item in records
+    ):
+        provisional = await _provisional_completed_day_snapshot(
+            hass, coordinator, local_yesterday
+        )
+        if provisional is not None:
+            records.append(provisional)
+    if start_date <= local_today.isoformat() <= end_date:
+        partial_today, _hours, _coverage, _cutoff, _today = await _current_day_snapshot(
+            hass, coordinator
+        )
+        records = replace_with_partial_day(
+            records, partial_today, local_date=local_today.isoformat()
+        )
+    snapshots = await hass.async_add_executor_job(
+        lambda: coordinator.database.monthly_ecodan_snapshots(
+            start_month=months[0], end_month=months[-1]
+        )
+    )
+    return build_rolling_month_report(
+        daily_records=records, snapshots=snapshots, equipment=_equipment(coordinator),
+        timezone=coordinator.timezone, end_month=end_month, count=count,
+        floor_area_m2=coordinator.config.get("floor_area_m2"),
+    )
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/monthly_report",
+    vol.Required("end_month"): str,
+    vol.Optional("count", default=13): vol.All(vol.Coerce(int), vol.Range(min=1, max=24)),
+})
+@websocket_api.async_response
+async def ws_monthly_report(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        result = await _monthly_report_payload(
+            hass, coordinator, msg["end_month"], msg["count"]
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_month", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/monthly_report_csv",
+    vol.Required("end_month"): str,
+    vol.Optional("count", default=13): vol.All(vol.Coerce(int), vol.Range(min=1, max=24)),
+    vol.Required("metric_ids"): vol.All([str], vol.Length(min=1, max=30)),
+})
+@websocket_api.async_response
+async def ws_monthly_report_csv(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    allowed = {item["id"] for item in monthly_metric_catalog(_equipment(coordinator))}
+    metrics = list(dict.fromkeys(msg["metric_ids"]))
+    invalid = [item for item in metrics if item not in allowed]
+    if invalid:
+        connection.send_error(msg["id"], "invalid_metric", ", ".join(invalid))
+        return
+    try:
+        report = await _monthly_report_payload(
+            hass, coordinator, msg["end_month"], msg["count"]
+        )
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_month", str(error))
+        return
+    output = io.StringIO()
+    fields = [
+        "month", *metrics, "quality", "primary_cop_quality", "snapshot_status",
+        "snapshot_cutoff_utc", "energy_period_end_utc", "cutoff_match",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in report["rows"]:
+        writer.writerow({field: row.get(field) for field in fields})
+    connection.send_result(msg["id"], {
+        "filename": f"home-energy-intelligence-monthly-{msg['end_month']}.csv",
+        "csv": output.getvalue(), "row_count": len(report["rows"]),
+        "metric_ids": metrics,
+    })
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/monthly_ecodan_snapshots",
+    vol.Optional("start_month"): str, vol.Optional("end_month"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_monthly_ecodan_snapshots(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    rows = await hass.async_add_executor_job(
+        lambda: coordinator.database.monthly_ecodan_snapshots(
+            start_month=msg.get("start_month"), end_month=msg.get("end_month")
+        )
+    )
+    connection.send_result(msg["id"], {"snapshots": rows, "total": len(rows)})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/save_monthly_ecodan_snapshot",
+    vol.Optional("snapshot_id"): int,
+    vol.Required("ecodan_equipment_id"): str,
+    vol.Optional("meter_identity", default="monthly_report"): str,
+    vol.Required("report_month"): str,
+    vol.Required("cutoff_local_date"): str,
+    vol.Optional("cutoff_local_time"): str,
+    vol.Optional("cutoff_certainty"): vol.In(["exact", "day_only", "unknown"]),
+    vol.Optional("fold"): vol.In([0, 1]),
+    vol.Optional("entry_local_date"): str,
+    vol.Optional("entry_local_time"): str,
+    vol.Optional("status", default="partial"): vol.In(["partial", "final"]),
+    vol.Optional("heating_thermal_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("dhw_thermal_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_heating_electricity_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_dhw_electricity_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_combined_electricity_kwh"): _OPTIONAL_COUNTER,
+    vol.Optional("vendor_combined_thermal_kwh"): _OPTIONAL_COUNTER,
+    vol.Required("source_label"): str,
+    vol.Optional("source_reference"): str,
+    vol.Optional("note"): str,
+    vol.Optional("unit", default="kWh"): vol.In(["Wh", "kWh", "MWh"]),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_save_monthly_ecodan_snapshot(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    equipment = {item.equipment_id: item for item in equipment_from_config(coordinator.config)}
+    selected = equipment.get(msg["ecodan_equipment_id"])
+    if selected is None or selected.kind != "heat_pump":
+        connection.send_error(msg["id"], "invalid_equipment", "Select a configured heat pump")
+        return
+    try:
+        payload = normalize_monthly_snapshot(msg, coordinator.timezone)
+        result = await hass.async_add_executor_job(
+            coordinator.database.save_monthly_ecodan_snapshot,
+            payload, msg.get("snapshot_id"),
+        )
+    except (ValueError, KeyError) as error:
+        connection.send_error(msg["id"], "invalid_snapshot", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/delete_monthly_ecodan_snapshot",
+    vol.Required("snapshot_id"): int,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_monthly_ecodan_snapshot(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    deleted = await hass.async_add_executor_job(
+        coordinator.database.delete_monthly_ecodan_snapshot, msg["snapshot_id"]
+    )
+    if not deleted:
+        connection.send_error(msg["id"], "not_found", "Monthly snapshot was not found")
+        return
+    connection.send_result(msg["id"], {"deleted": True})
+
+
 async def _current_day_snapshot(
     hass, coordinator, cutoff: datetime | None = None, *, now: datetime | None = None,
 ):
@@ -460,9 +686,10 @@ async def _current_day_snapshot(
     today_start, _ = local_day_bounds(today, coordinator.timezone)
     if cutoff < today_start:
         raise ValueError("cutoff is outside the current Home Assistant local day")
-    energy_hours = await hass.async_add_executor_job(
+    stored_hours = await hass.async_add_executor_job(
         coordinator.database.hourly_range, today_start, cutoff
     )
+    energy_hours = [item for item in stored_hours if not item.get("temperature_only")]
     temperature_hours = await hass.async_add_executor_job(
         coordinator.database.temperature_history_range,
         "hourly", today_start, cutoff,
@@ -488,7 +715,7 @@ async def _current_day_snapshot(
                 summary.get("coverage_seconds", 0) or 0
             ) > float(existing.get("coverage_seconds", 0) or 0):
                 current["temperatures"][source_id] = summary
-    hours_by_start = {item["period_start_utc"]: item for item in energy_hours}
+    hours_by_start = {item["period_start_utc"]: item for item in stored_hours}
     for item in temperature_hours:
         existing = hours_by_start.get(item["period_start_utc"])
         if existing is None:
@@ -499,6 +726,17 @@ async def _current_day_snapshot(
     if current is not None:
         current.update({"partial": True, "finalized": False})
     return current, display_hours, coverage, cutoff, today
+
+
+async def _provisional_completed_day_snapshot(hass, coordinator, day):
+    """Return a completed local day from persisted hours without writing daily history."""
+    start, end = local_day_bounds(day, coordinator.timezone)
+    rows = await hass.async_add_executor_job(
+        coordinator.database.hourly_range, start, end
+    )
+    return provisional_completed_day_from_hourly(
+        rows, start, end, local_date=day.isoformat(), timezone=coordinator.timezone,
+    )
 
 
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/overview"})
@@ -528,6 +766,10 @@ async def ws_overview(hass, connection, msg):
     yesterday_full = await hass.async_add_executor_job(
         coordinator.database.daily, yesterday.isoformat()
     )
+    if yesterday_full is None:
+        yesterday_full = await _provisional_completed_day_snapshot(
+            hass, coordinator, yesterday
+        )
     required_temperature_ids = _representative_temperature_source_ids(coordinator)
     if yesterday_full:
         yesterday_full = derive_record_quality(
@@ -659,7 +901,7 @@ async def ws_history(hass, connection, msg):
             connection.send_error(msg["id"], "invalid_period", str(error))
             return
     partial_today = None
-    local_today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    local_today, _local_yesterday = _local_calendar_dates(coordinator.timezone)
     if start_date and end_date and start_date <= local_today.isoformat() <= end_date:
         requested_cutoff = None
         if msg.get("cutoff_utc"):
@@ -685,6 +927,18 @@ async def ws_history(hass, connection, msg):
         stored_records = await hass.async_add_executor_job(
             coordinator.database.history_period, start_date, end_date
         )
+        local_yesterday = _local_yesterday
+        yesterday_key = local_yesterday.isoformat()
+        if (
+            start_date <= yesterday_key <= end_date
+            and not any(str(item.get("local_date")) == yesterday_key for item in stored_records)
+        ):
+            provisional_yesterday = await _provisional_completed_day_snapshot(
+                hass, coordinator, local_yesterday
+            )
+            stored_records = prefer_authoritative_daily(
+                stored_records, provisional_yesterday
+            )
         period_records = replace_with_partial_day(
             stored_records, partial_today,
             local_date=local_today.isoformat()
@@ -777,6 +1031,10 @@ async def ws_history(hass, connection, msg):
         "selected_period": {"preset": msg.get("preset"), "label": selected_label,
                             "start_date": start_date, "end_date": end_date},
         "partial": partial_today is not None,
+        "provisional_dates": [
+            record["local_date"] for record in period_records
+            if record.get("provisional") is True and record.get("finalized") is False
+        ],
         "cutoff_utc": history_cutoff.isoformat() if history_cutoff else None,
         "cutoff_local": (history_cutoff.astimezone(ZoneInfo(coordinator.timezone)).isoformat()
                          if history_cutoff else None),

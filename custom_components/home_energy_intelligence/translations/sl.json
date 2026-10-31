@@ -28,5 +28,22 @@
       "data_sources": {"title": "Viri podatkov in merjena toplota", "description": "Recorder je primarni vir; InfluxDB je samo za branje, števci toplote Ecodan pa so izbirni.", "data": {"historical_source": "Zgodovinski vir", "influx_enabled": "Omogoči InfluxDB", "influx_host": "Gostitelj InfluxDB", "influx_port": "Vrata", "influx_use_ssl": "Uporabi TLS", "influx_verify_ssl": "Preveri potrdilo TLS", "influx_database": "Podatkovna zbirka", "influx_retention_policy": "Politika hrambe", "influx_username": "Uporabniško ime", "influx_password": "Geslo", "influx_mapping_json": "Preslikave virov in enot (JSON)", "thermal_source_mode": "Način vira toplote", "ecodan_thermal_equipment_id": "Naprava Ecodan", "heating_thermal_energy_entity": "Kumulativna toplota ogrevanja", "dhw_thermal_energy_entity": "Kumulativna toplota sanitarne vode", "vendor_heating_electricity_entity": "Proizvajalčev števec elektrike ogrevanja (dopolnilno)", "vendor_dhw_electricity_entity": "Proizvajalčev števec elektrike sanitarne vode (dopolnilno)"}},
       "data_quality": {"title": "Kakovost podatkov", "description": "Pravila vrzeli, skokov in reprezentativnih virov. Trenutno preverjanje: {representative_preview}", "data": {"maximum_power_gap_minutes": "Najdaljša vrzel moči", "counter_jump_limit_kwh": "Največji skok števca (kWh)", "response_temperature_coverage_minimum": "Najmanjša pokritost zunanje temperature za odzivni profil (%)", "assumed_heating_reporting": "Pravilo poročanja ocenjenega ogrevanja", "representative_indoor_source_id": "Reprezentativni vir notranje temperature", "representative_outdoor_source_id": "Reprezentativni merjeni zunanji vir", "test_representative_sources": "Preveri povezavi in osveži predogled"}}
     }
+  },
+  "panel": {
+    "monthly_analytics": "Mesečna analitika",
+    "rolling_13_months": "Drseča 13-mesečna analitika Ecodan",
+    "monthly_snapshots": "Mesečni in tekoči mesečni posnetki poročila Ecodan",
+    "shelly_primary": "Primarni vir je elektrika, razvrščena po merilniku Shelly",
+    "vendor_secondary": "Elektrika in COP proizvajalca sta sekundarni primerjavi",
+    "report_cutoff": "Datum in čas preseka poročila",
+    "cutoff_certainty": "Zanesljivost preseka",
+    "entry_timestamp": "Čas vnosa v časovnem pasu Home Assistant",
+    "heating_produced": "Proizvedena toplota za ogrevanje (kWh toplote)",
+    "dhw_produced": "Proizvedena toplota sanitarne vode (kWh toplote)",
+    "shelly_minus_vendor": "Elektrika Shelly minus Ecodan",
+    "provisional_yesterday": "Začasno zaključeni dan — čaka na uradni dnevni obračun",
+    "missing": "Ni na voljo",
+    "partial": "Delno",
+    "final": "Končno"
   }
 }

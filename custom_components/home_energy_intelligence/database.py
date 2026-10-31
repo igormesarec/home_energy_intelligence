@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
-from math import isfinite
-from pathlib import Path
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from math import isfinite
+from pathlib import Path
 from typing import Any
 
 from .models import DailyRecord
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -176,6 +176,40 @@ CREATE TABLE IF NOT EXISTS thermal_meter_reading_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_thermal_reading_audit_reading
   ON thermal_meter_reading_audit(reading_id, id);
+"""
+MIGRATION_7 = """
+CREATE TABLE IF NOT EXISTS monthly_ecodan_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ecodan_equipment_id TEXT NOT NULL, meter_identity TEXT NOT NULL,
+  report_month TEXT NOT NULL, cutoff_local_date TEXT NOT NULL,
+  cutoff_local_time TEXT, cutoff_utc TEXT, timezone TEXT NOT NULL,
+  entry_local_date TEXT NOT NULL, entry_local_time TEXT NOT NULL,
+  entry_utc TEXT NOT NULL,
+  fold INTEGER NOT NULL DEFAULT 0,
+  cutoff_certainty TEXT NOT NULL CHECK(cutoff_certainty IN ('exact','day_only','unknown')),
+  status TEXT NOT NULL CHECK(status IN ('partial','final')),
+  heating_thermal_kwh REAL, dhw_thermal_kwh REAL,
+  vendor_heating_electricity_kwh REAL, vendor_dhw_electricity_kwh REAL,
+  vendor_combined_electricity_kwh REAL, vendor_combined_thermal_kwh REAL,
+  source_label TEXT NOT NULL, source_reference TEXT, note TEXT,
+  unit TEXT NOT NULL DEFAULT 'kWh', revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(ecodan_equipment_id,meter_identity,report_month,cutoff_local_date,cutoff_local_time)
+);
+CREATE INDEX IF NOT EXISTS idx_monthly_ecodan_report
+  ON monthly_ecodan_snapshots(report_month,ecodan_equipment_id,cutoff_utc,id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_monthly_ecodan_identity
+  ON monthly_ecodan_snapshots(
+    ecodan_equipment_id,meter_identity,report_month,cutoff_local_date,
+    IFNULL(cutoff_local_time,'')
+  );
+CREATE TABLE IF NOT EXISTS monthly_ecodan_snapshot_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_id INTEGER,
+  action TEXT NOT NULL, revision INTEGER NOT NULL,
+  payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_monthly_ecodan_audit
+  ON monthly_ecodan_snapshot_audit(snapshot_id,id);
 """
 
 _TEMPERATURE_REJECTION_REASONS = (
@@ -451,6 +485,13 @@ def _migrate_thermal_storage_v6(connection: sqlite3.Connection) -> None:
             connection.execute(statement)
 
 
+def _migrate_monthly_storage_v7(connection: sqlite3.Connection) -> None:
+    """Add the distinct monthly Ecodan report ledger."""
+    for statement in MIGRATION_7.split(";"):
+        if statement.strip():
+            connection.execute(statement)
+
+
 def _temperature_coverage(value: dict[str, Any] | None) -> float:
     if not isinstance(value, dict):
         return -1.0
@@ -656,7 +697,7 @@ class EnergyDatabase:
                 )
             if row is None:
                 connection.executescript(
-                    "BEGIN IMMEDIATE;\n" + MIGRATION_4 + MIGRATION_5 + MIGRATION_6
+                    "BEGIN IMMEDIATE;\n" + MIGRATION_4 + MIGRATION_5 + MIGRATION_6 + MIGRATION_7
                 )
                 connection.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
             elif row[0] == 1:
@@ -666,27 +707,36 @@ class EnergyDatabase:
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
                 _migrate_thermal_storage_v6(connection)
+                _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 2:
                 connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_3 + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
                 _migrate_thermal_storage_v6(connection)
+                _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 3:
                 connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_4)
                 _migrate_temperature_storage_v4(connection)
                 _migrate_temperature_storage_v5(connection)
                 _migrate_thermal_storage_v6(connection)
+                _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 4:
                 connection.execute("BEGIN IMMEDIATE")
                 _migrate_temperature_storage_v5(connection)
                 _migrate_thermal_storage_v6(connection)
+                _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] == 5:
                 connection.execute("BEGIN IMMEDIATE")
                 _migrate_thermal_storage_v6(connection)
+                _migrate_monthly_storage_v7(connection)
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            elif row[0] == 6:
+                connection.execute("BEGIN IMMEDIATE")
+                _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
@@ -1131,11 +1181,14 @@ class EnergyDatabase:
         assignments = ["updated_at=?"]
         args: list[Any] = [datetime.now(UTC).isoformat()]
         if status is not None:
-            assignments.append("status=?"); args.append(status)
+            assignments.append("status=?")
+            args.append(status)
         if cursor_date is not None:
-            assignments.append("cursor_date=?"); args.append(cursor_date)
+            assignments.append("cursor_date=?")
+            args.append(cursor_date)
         if details is not None:
-            assignments.append("details_json=?"); args.append(_canonical_json(details))
+            assignments.append("details_json=?")
+            args.append(_canonical_json(details))
         args.append(job_id)
         with self.connect() as connection:
             connection.execute(
@@ -1832,6 +1885,129 @@ class EnergyDatabase:
                 """SELECT action,revision,payload_json,created_at
                 FROM thermal_meter_reading_audit WHERE reading_id=? ORDER BY id""",
                 (reading_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "payload": json.loads(row["payload_json"])} for row in rows
+        ]
+
+    def save_monthly_ecodan_snapshot(
+        self, payload: dict[str, Any], snapshot_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Insert or revise one monthly/MtD report snapshot with audit history."""
+        fields = (
+            "ecodan_equipment_id", "meter_identity", "report_month",
+            "cutoff_local_date", "cutoff_local_time", "cutoff_utc", "timezone", "fold",
+            "entry_local_date", "entry_local_time", "entry_utc",
+            "cutoff_certainty", "status", "heating_thermal_kwh", "dhw_thermal_kwh",
+            "vendor_heating_electricity_kwh", "vendor_dhw_electricity_kwh",
+            "vendor_combined_electricity_kwh", "vendor_combined_thermal_kwh",
+            "source_label", "source_reference", "note", "unit",
+        )
+        now = datetime.now(UTC).isoformat()
+        values = [payload.get(field) for field in fields]
+        identity = (
+            payload.get("ecodan_equipment_id"), payload.get("meter_identity"),
+            payload.get("report_month"), payload.get("cutoff_local_date"),
+            payload.get("cutoff_local_time") or "",
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflict = connection.execute(
+                """SELECT id FROM monthly_ecodan_snapshots
+                WHERE ecodan_equipment_id=? AND meter_identity=? AND report_month=?
+                AND cutoff_local_date=? AND IFNULL(cutoff_local_time,'')=?""",
+                identity,
+            ).fetchone()
+            if conflict is not None and int(conflict["id"]) != int(snapshot_id or -1):
+                raise ValueError("a monthly snapshot already exists for this cutoff")
+            if snapshot_id is None:
+                cursor = connection.execute(
+                    f"""INSERT INTO monthly_ecodan_snapshots
+                    ({','.join(fields)},revision,created_at,updated_at)
+                    VALUES ({','.join('?' for _ in fields)},1,?,?)""",
+                    (*values, now, now),
+                )
+                snapshot_id = int(cursor.lastrowid)
+                revision = 1
+                action = "create"
+            else:
+                prior = connection.execute(
+                    "SELECT * FROM monthly_ecodan_snapshots WHERE id=?", (snapshot_id,)
+                ).fetchone()
+                if prior is None:
+                    raise ValueError("monthly snapshot does not exist")
+                revision = int(prior["revision"]) + 1
+                assignments = ",".join(f"{field}=?" for field in fields)
+                connection.execute(
+                    f"""UPDATE monthly_ecodan_snapshots SET {assignments},
+                    revision=?,updated_at=? WHERE id=?""",
+                    (*values, revision, now, snapshot_id),
+                )
+                action = "update"
+            row = connection.execute(
+                "SELECT * FROM monthly_ecodan_snapshots WHERE id=?", (snapshot_id,)
+            ).fetchone()
+            result = dict(row)
+            connection.execute(
+                """INSERT INTO monthly_ecodan_snapshot_audit
+                (snapshot_id,action,revision,payload_json,created_at)
+                VALUES (?,?,?,?,?)""",
+                (snapshot_id, action, revision, _canonical_json(result), now),
+            )
+        return result
+
+    def delete_monthly_ecodan_snapshot(self, snapshot_id: int) -> bool:
+        """Delete a monthly snapshot while retaining its audit evidence."""
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM monthly_ecodan_snapshots WHERE id=?", (snapshot_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            payload = dict(row)
+            revision = int(row["revision"]) + 1
+            connection.execute(
+                """INSERT INTO monthly_ecodan_snapshot_audit
+                (snapshot_id,action,revision,payload_json,created_at)
+                VALUES (?,?,?,?,?)""",
+                (snapshot_id, "delete", revision, _canonical_json(payload), now),
+            )
+            connection.execute("DELETE FROM monthly_ecodan_snapshots WHERE id=?", (snapshot_id,))
+        return True
+
+    def monthly_ecodan_snapshots(
+        self, *, start_month: str | None = None, end_month: str | None = None,
+        ecodan_equipment_id: str | None = None, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        arguments: list[Any] = []
+        if start_month is not None:
+            clauses.append("report_month>=?")
+            arguments.append(start_month)
+        if end_month is not None:
+            clauses.append("report_month<=?")
+            arguments.append(end_month)
+        if ecodan_equipment_id is not None:
+            clauses.append("ecodan_equipment_id=?")
+            arguments.append(ecodan_equipment_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        arguments.append(max(1, min(int(limit), 20_000)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM monthly_ecodan_snapshots{where}
+                ORDER BY report_month,ecodan_equipment_id,cutoff_utc,id LIMIT ?""",
+                arguments,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def monthly_ecodan_snapshot_audit(self, snapshot_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT action,revision,payload_json,created_at
+                FROM monthly_ecodan_snapshot_audit WHERE snapshot_id=? ORDER BY id""",
+                (snapshot_id,),
             ).fetchall()
         return [
             {**dict(row), "payload": json.loads(row["payload_json"])} for row in rows

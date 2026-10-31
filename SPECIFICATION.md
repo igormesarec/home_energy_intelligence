@@ -1,5 +1,22 @@
 # V0.1 implementation specification
 
+## V0.2.1 monthly report and midnight contract
+
+- Before the 05:00 authoritative close, Yesterday is reconstructed in memory from
+  persisted hourly rows. Missing hours remain gaps; the provisional row is never written
+  as finalized history and is replaced by the authoritative daily row without addition.
+- Monthly/MtD Ecodan report snapshots are independent observations from calendar-month
+  start through their stated cutoff. They are never differenced across months or inserted
+  into the lifetime cumulative thermal ledger.
+- Primary monthly COP uses measured Shelly electricity over the exact same interval.
+  Assigned positive residual remains assumed heating and makes heating/combined COP
+  provisional. Vendor electricity and vendor COP remain separate informational evidence.
+- Date-only or unknown report cutoffs cannot create an exact primary COP. A final month
+  requires an exact cutoff at the following month’s local midnight.
+- The rolling report contains exactly 13 calendar positions, dynamic equipment metrics,
+  nulls for unavailable evidence, synchronized chart/table/CSV values and separate
+  energy, COP and percentage scales.
+
 ## V0.2 thermal and response contract
 
 - Thermal inputs are cumulative measured counters, not inferred heat. Supported units
@@ -117,3 +134,27 @@ Create a standalone Home Assistant custom integration with domain `home_energy_i
 - A true 100% temperature interval remains complete even when filtered invalid samples are audited. The configurable response threshold (95% default) is independent and never claims full completeness.
 - General configuration uses localized English/Slovenian month choices, a visible 1–28 start-day field and a season preview. Editing season fields preserves floor area, equipment, sources, representative selections and mapping-effective dates.
 - The V0.1.2 baseline introduced deterministic content-hash cache invalidation. V0.2.0 retains the unchanged sidebar path and the same cache-safety contract.
+
+## V0.2.1 monthly analytics and completed-day availability
+
+- After local midnight, a missing Yesterday daily row is represented from persisted
+  completed hourly records. This view is always labelled provisional/partial, is never
+  inserted into finalized history and is superseded by the authoritative daily row.
+- Hourly electrical coverage ignores temperature-only archive rows. Missing hours keep
+  household, PV, grid and HVAC complete totals unavailable while retaining known subtotals,
+  missing-interval identity and independent temperature evidence.
+- Schema V7 adds a monthly/MtD Ecodan snapshot ledger distinct from the lifetime cumulative
+  thermal ledger. It stores report month, local/UTC cutoff, timezone/fold, cutoff certainty,
+  partial/final status, nullable thermal/vendor fields, source identity, notes and audit.
+- The rolling report contains exactly 13 calendar-month positions. Selected chart series,
+  the synchronized table and authenticated CSV share one backend result and never replace
+  a missing value with zero.
+- Shelly meter electricity is primary. Heat-pump allocation retains confirmed heating,
+  DHW, idle/other, unknown-mode assumed heating, positive residual fallback, raw unassigned
+  evidence, remaining unassigned energy and signed reconciliation error as distinct fields.
+- AC classification uses selected heat/cool/off/dry/fan state before transient action.
+- Primary COP is a ratio of measured thermal energy to exactly cutoff-matched Shelly
+  electricity. Heating COP that contains assumed heating is explicitly provisional. Vendor
+  COP is secondary and sparse cumulative readings remain interval evidence.
+- Cumulative intervals that cross selected-period boundaries are disclosed separately and
+  excluded from exact totals. No AC COP, inferred thermal output or forecast value is added.

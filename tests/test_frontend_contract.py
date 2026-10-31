@@ -57,8 +57,8 @@ def test_v02_frontend_cache_key_uses_content_hash_and_keeps_sidebar_path():
     panel = (INTEGRATION / "panel.py").read_text(encoding="utf-8")
     manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
     const = (INTEGRATION / "const.py").read_text(encoding="utf-8")
-    assert manifest["version"] == "0.2.0"
-    assert 'VERSION: Final = "0.2.0"' in const
+    assert manifest["version"] == "0.2.1"
+    assert 'VERSION: Final = "0.2.1"' in const
     assert "sha256" in panel and "frontend_build" in panel
     assert "?v={VERSION}-{frontend_build}" in panel
     assert "frontend_url_path=PANEL_URL" in panel

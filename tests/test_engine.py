@@ -97,6 +97,11 @@ def test_heat_pump_residual_is_assumed_only_for_reporting_and_remains_auditable(
     assert hp["uncertain_residual_kwh"] == 10
     assert hp["reported_assumed_heating_kwh"] == 10
     assert hp["reported_heating_kwh"] == 10
+    assert hp["shelly_total_kwh"] == 10
+    assert hp["heating_assumed_unknown_mode_kwh"] == 0
+    assert hp["heating_assumed_residual_kwh"] == 10
+    assert hp["raw_unassigned_before_fallback_kwh"] == 10
+    assert hp["remaining_unassigned_after_fallback_kwh"] == 0
 
 
 def test_missing_optional_sources_remain_unavailable_not_zero():

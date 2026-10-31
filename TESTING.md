@@ -1,5 +1,30 @@
 # Testing
 
+## V0.2.1 acceptance evidence
+
+The V0.2.1 suite adds immediate post-midnight Yesterday reconstruction from persisted
+hourly evidence, including internal gaps, restart survival, authoritative daily
+replacement and 23/25-hour local dates. It also covers the additive V6→V7 migration,
+audited monthly snapshot edits/deletes, nullable report values, unit normalization,
+cutoff alignment, missing-equipment COP suppression, Shelly-first COP, selected-mode AC
+classification and executable Node rendering of all 13 rolling month positions on desktop
+and mobile layouts.
+
+The release verification commands are:
+
+```bash
+python -m pytest
+python -m pytest tests/test_ha_runtime.py
+python -m compileall -q custom_components tests
+node --check custom_components/home_energy_intelligence/frontend/hei-panel.js
+```
+
+The monthly report reads only bounded compact SQLite rows. A primary COP is emitted only
+when the report cutoff, month start, all configured heat-pump snapshots and complete
+classified electrical coverage describe the same interval. Confirmed zero remains zero;
+missing components remain unavailable. Vendor electricity and vendor COP are retained as
+secondary evidence.
+
 ## V0.2 acceptance evidence
 
 The V0.2 suite covers cumulative unit normalization, DST ambiguous/nonexistent wall

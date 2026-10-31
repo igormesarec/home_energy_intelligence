@@ -5,10 +5,11 @@ sparse readings into invented daily heat and never averages individual COPs.
 """
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import UTC, date, datetime, time
 import math
-from typing import Any, Iterable
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import UTC, date, datetime, time
+from typing import Any
 from zoneinfo import ZoneInfo
 
 _ENERGY_FACTORS = {"Wh": 0.001, "kWh": 1.0, "MWh": 1000.0}
@@ -97,7 +98,7 @@ def cumulative_intervals(readings: Iterable[dict[str, Any]]) -> list[dict[str, A
     result: list[dict[str, Any]] = []
     for (equipment_id, meter_identity), items in sorted(groups.items()):
         items.sort(key=lambda item: (item["effective_at_utc"], int(item.get("id", 0))))
-        for previous, current in zip(items, items[1:]):
+        for previous, current in zip(items, items[1:], strict=False):
             start = datetime.fromisoformat(previous["effective_at_utc"]).astimezone(UTC)
             end = datetime.fromisoformat(current["effective_at_utc"]).astimezone(UTC)
             if end <= start:
@@ -157,8 +158,8 @@ def match_classified_electricity(
     """Match classified Ecodan electricity to the exact thermal interval.
 
     Records must tile the interval without a boundary gap and every selected
-    Ecodan allocation must be complete.  Unknown/assumed heating is retained as
-    evidence but is not promoted into measured COP electricity.
+    Ecodan allocation must tile the same interval. Assumed heating remains
+    explicit and makes heating COP provisional; it is never double-counted.
     """
     from .analytics import canonical_energy  # Avoid a module import cycle.
 
@@ -174,7 +175,7 @@ def match_classified_electricity(
         key=lambda record: record["period_start_utc"],
     )
     cursor = start
-    heating = dhw = 0.0
+    heating = confirmed_heating = assumed_heating = dhw = 0.0
     issues: list[str] = []
     equipment_id = interval["ecodan_equipment_id"]
     for record in records:
@@ -189,13 +190,18 @@ def match_classified_electricity(
              if item.get("equipment_id") == equipment_id),
             None,
         )
-        if not device or not device.get("classification_complete"):
+        if not device or device.get("meter_kwh") is None:
             issues.append("classification_incomplete")
             continue
+        coverage = device.get("coverage_percent")
+        if coverage is None or float(coverage) < 99.999:
+            issues.append("classification_incomplete")
+            continue
+        confirmed = float(device.get("known_confirmed_heating_kwh") or 0)
         assumed = float(device.get("known_assumed_heating_kwh") or 0)
-        if assumed > 0:
-            issues.append("assumed_heating_excluded")
-        heating += float(device.get("known_confirmed_heating_kwh") or 0)
+        confirmed_heating += confirmed
+        assumed_heating += assumed
+        heating += confirmed + assumed
         dhw += float(device.get("known_dhw_kwh") or 0)
     if cursor != end:
         issues.append("interval_boundaries_not_tiled")
@@ -203,8 +209,17 @@ def match_classified_electricity(
     return {
         "exact_match": exact,
         "heating_electricity_kwh": heating if exact else None,
+        "confirmed_heating_electricity_kwh": confirmed_heating if exact else None,
+        "assumed_heating_electricity_kwh": assumed_heating if exact else None,
+        "assumed_heating_share_percent": (
+            100 * assumed_heating / heating if exact and heating > 0 else 0.0 if exact else None
+        ),
         "dhw_electricity_kwh": dhw if exact else None,
         "source": "classified_primary_meter_hourly",
+        "heating_match_quality": (
+            "provisional_assumed_heating" if exact and assumed_heating > 0
+            else ("measured_exact_interval" if exact else "unavailable")
+        ),
         "issues": sorted(set(issues)),
     }
 
@@ -230,7 +245,8 @@ def thermal_performance_points(
                 else None
             )
             point[f"{category}_quality"] = (
-                "measured_exact_interval"
+                (point.get("heating_match_quality") if category == "heating"
+                 else "measured_exact_interval")
                 if point[f"{category}_cop"] is not None else "unavailable"
             )
         points.append(point)
