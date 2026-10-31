@@ -46,6 +46,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.thermalLedger = null;
     this.thermalEdit = null;
     this.monthlyReport = null;
+    this.selectedMonthReport = null;
     this.monthlyLedger = null;
     this.monthlyEdit = null;
     this.monthlyEndMonth = null;
@@ -108,6 +109,12 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     try { this.thermalLedger = await this._hass.callWS({type:"home_energy_intelligence/thermal_readings"}); }
     catch(error) { if(!String(error?.code||error?.message||error).includes("unauthorized")) throw error; this.thermalLedger=null; }
     await this.loadMonthly(false);
+    const selectedMonth=this.fullCalendarMonth(period);
+    this.selectedMonthReport=null;
+    if(selectedMonth){
+      const existing=this.monthlyReport?.rows?.find((row)=>row.month===selectedMonth);
+      this.selectedMonthReport=existing||((await this._hass.callWS({type:"home_energy_intelligence/monthly_report",end_month:selectedMonth,count:1})).rows||[])[0]||null;
+    }
     if (shouldRender) this.render();
   }
 
@@ -118,6 +125,15 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     try{this.monthlyLedger=await this._hass.callWS({type:"home_energy_intelligence/monthly_ecodan_snapshots",start_month:this.monthlyReport.months?.[0],end_month:this.monthlyReport.months?.at(-1)});}
     catch(error){if(!String(error?.code||error?.message||error).includes("unauthorized"))throw error;this.monthlyLedger=null;}
     if(shouldRender)this.render();
+  }
+
+  fullCalendarMonth(period) {
+    const start=period?.start_date||"",end=period?.end_date||"";
+    if(!/^\d{4}-\d{2}-01$/.test(start)||end.slice(0,7)!==start.slice(0,7))return null;
+    const year=Number(start.slice(0,4)),month=Number(start.slice(5,7));
+    if(month<1||month>12)return null;
+    const days=[31,(year%4===0&&(year%100!==0||year%400===0))?29:28,31,30,31,30,31,31,30,31,30,31][month-1];
+    return end===`${start.slice(0,7)}-${days}`?start.slice(0,7):null;
   }
 
   historyRequest() {
@@ -380,10 +396,13 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   copView() {
     const points=this.v02Report?.ecodan_space_heating||[];
     const reports=this.v02Report?.ecodan_reports||{};const report=(label,item)=>`<span>${label}<b>${item?.cop==null?"Unavailable":n(item.cop,2)}</b><small>${n(item?.thermal_kwh,2)} kWh thermal / ${n(item?.electricity_kwh,2)} kWh electricity · ${item?.matched_interval_count||0} matched category interval(s)</small></span>`;
+    const month=this.fullCalendarMonth(this.selectedPeriod);
+    const monthly=month===this.selectedMonthReport?.month?this.selectedMonthReport:null;
+    const provisional=month?`<h3>Provisional monthly COP · ${esc(month)}</h3><div class="mini-stats">${[["Heating",monthly?.provisional_shelly_heating_cop],["DHW",monthly?.provisional_shelly_dhw_cop],["Combined",monthly?.provisional_shelly_combined_cop]].map(([label,value])=>`<span>${label}<b>${value==null?"Unavailable":n(value,2)}</b></span>`).join("")}</div><p class="muted">Provisional monthly COP uses measured Shelly electricity allocated by controller heating/DHW electricity proportions and controller thermal production. It is not a verified operating-mode split.</p>`:"";
     const heatPumps=this.equipment.filter((item)=>item.kind==="heat_pump");const edit=this.thermalEdit||{};
     const ledger=this.thermalLedger?.readings||[];const rows=ledger.map((row)=>`<tr><td>${esc(row.local_date)} ${esc(row.local_time)} ${esc(row.timezone)} fold ${row.fold}</td><td>${esc(row.ecodan_equipment_id)}</td><td>${n(row.heating_thermal_kwh,3)}</td><td>${n(row.dhw_thermal_kwh,3)}</td><td>${esc(row.source_label)}</td><td><button class="thermal-edit" data-id="${row.id}">Edit</button> <button class="thermal-delete" data-id="${row.id}">Delete</button></td></tr>`).join("");
     const form=this.thermalLedger?`<form class="thermal-form"><input type="hidden" name="reading_id" value="${esc(edit.id||"")}"><label>Heat pump <select name="ecodan_equipment_id">${heatPumps.map((item)=>`<option value="${esc(item.equipment_id)}" ${edit.ecodan_equipment_id===item.equipment_id?"selected":""}>${esc(item.display_name)}</option>`).join("")}</select></label><label>Local date <input required type="date" name="local_date" value="${esc(edit.local_date||"")}"></label><label>Local time <input required type="time" step="1" name="local_time" value="${esc(edit.local_time||"")}"></label><label>DST occurrence <select name="fold"><option value="">Unambiguous</option><option value="0" ${edit.fold===0?"selected":""}>First</option><option value="1" ${edit.fold===1?"selected":""}>Second</option></select></label><label>Cumulative heating thermal <input type="number" min="0" step="any" name="heating_thermal_kwh" value="${esc(edit.heating_thermal_kwh??"")}"></label><label>Cumulative DHW thermal <input type="number" min="0" step="any" name="dhw_thermal_kwh" value="${esc(edit.dhw_thermal_kwh??"")}"></label><label>Vendor heating electricity (optional) <input type="number" min="0" step="any" name="vendor_heating_electricity_kwh" value="${esc(edit.vendor_heating_electricity_kwh??"")}"></label><label>Vendor DHW electricity (optional) <input type="number" min="0" step="any" name="vendor_dhw_electricity_kwh" value="${esc(edit.vendor_dhw_electricity_kwh??"")}"></label><label>Meter identity <input required name="meter_identity" value="${esc(edit.meter_identity||"")}"></label><label>Source label <input required name="source_label" value="${esc(edit.source_label||"")}"></label><label>Unit <select name="unit"><option>kWh</option><option>Wh</option><option>MWh</option></select></label><label>Note <input name="note" value="${esc(edit.note||"")}"></label><button class="primary" type="submit">${edit.id?"Save revision":"Add cumulative reading"}</button></form><div class="table-wrap"><table><thead><tr><th>Effective time</th><th>Equipment</th><th>Heat kWh</th><th>DHW kWh</th><th>Source</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6">First reading establishes the baseline.</td></tr>'}</tbody></table></div>`:'<p class="muted">Administrator access is required to manage cumulative readings.</p>';
-    return `${this.periodControls()}<article class="card"><h2>Ecodan-only COP reports</h2><div class="mini-stats">${report("Space heating COP",reports.heating)}${report("DHW COP",reports.dhw)}${report("Combined COP",reports.combined)}</div><p class="muted">Combined COP is the ratio of measured thermal sums to exactly matched electricity sums. COP values are never averaged. AC electricity and thermal estimates are excluded.</p></article><section class="grid equipment-charts"><article class="card"><h2>Ecodan Space-Heating Performance Curve</h2>${this.responseCurve(points,{kind:"heating",thermal:true})}</article><article class="card"><h2>Ecodan DHW Performance Curve</h2>${this.responseCurve(this.v02Report?.ecodan_dhw||[],{kind:"dhw",thermal:true})}</article></section><article class="card page-card"><h2>Measured cumulative Ecodan generation readings</h2><p class="muted">Enter cumulative meter observations only. The first is a baseline. Negative differences are resets/corrections; no value is clamped. Multi-day spans remain clearly labelled interval COP.</p>${this.thermalLedger?`<p><button type="button" class="primary thermal-backfill">Backfill configured thermal counters for selected period</button></p>`:""}${form}</article>${this.monthlyView()}`;
+    return `${this.periodControls()}<article class="card"><h2>Ecodan-only COP reports</h2><div class="mini-stats">${report("Space heating COP",reports.heating)}${report("DHW COP",reports.dhw)}${report("Combined COP",reports.combined)}</div><p class="muted">Combined COP is the ratio of measured thermal sums to exactly matched electricity sums. COP values are never averaged. AC electricity and thermal estimates are excluded.</p>${provisional}</article><p class="muted">Performance curves require outdoor temperature and electricity and generated heat measured over matching intervals; monthly estimates do not create curve points.</p><section class="grid equipment-charts"><article class="card"><h2>Ecodan Space-Heating Performance Curve</h2>${this.responseCurve(points,{kind:"heating",thermal:true})}</article><article class="card"><h2>Ecodan DHW Performance Curve</h2>${this.responseCurve(this.v02Report?.ecodan_dhw||[],{kind:"dhw",thermal:true})}</article></section><article class="card page-card"><h2>Measured cumulative Ecodan generation readings</h2><p class="muted">Enter cumulative meter observations only. The first is a baseline. Negative differences are resets/corrections; no value is clamped. Multi-day spans remain clearly labelled interval COP.</p>${this.thermalLedger?`<p><button type="button" class="primary thermal-backfill">Backfill configured thermal counters for selected period</button></p>`:""}${form}</article>${this.monthlyView()}`;
   }
 
   recentTable(records = this.history.slice(0, 7)) {
