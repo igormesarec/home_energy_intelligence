@@ -8,6 +8,8 @@ from custom_components.home_energy_intelligence.monthly import (
     monthly_metric_catalog,
     normalize_monthly_snapshot,
     rolling_months,
+    _dhw_zero_proven,
+    _known_allocation_subtotal,
 )
 
 
@@ -98,6 +100,35 @@ def test_monthly_snapshot_is_distinct_nullable_and_unit_normalized():
     assert result["dhw_thermal_kwh"] is None
     assert result["cutoff_certainty"] == "day_only"
     assert result["cutoff_utc"] == "2026-10-31T23:00:00+00:00"
+
+
+def test_partial_electricity_subtotals_do_not_invent_missing_heat_pump():
+    equipment = [{"equipment_id": "hp_main", "kind": "heat_pump"},
+                 {"equipment_id": "ac", "kind": "air_conditioner"}]
+    record = daily_record()
+    record["allocations"]["hp_main"]["categories"] = {}
+    record["allocations"]["ac"] = {"meter_kwh": 3, "categories": {"heating": 1.2, "cooling": 1.8}}
+    row = build_rolling_month_report(daily_records=[record], snapshots=[], equipment=equipment,
+                                     timezone="Europe/Ljubljana", end_month="2026-10", count=1)["rows"][0]
+    assert row["known_ecodan_heating_electricity_kwh"] is None
+    assert row["known_ac_heating_electricity_kwh"] == pytest.approx(1.2)
+    assert row["known_ac_cooling_electricity_kwh"] == pytest.approx(1.8)
+    assert row["period_coverage"]["date_coverage"]["complete_through_available_cutoff"] is False
+
+
+def test_proven_zero_dhw_requires_complete_known_modes():
+    equipment = [{"equipment_id": "hp_main", "kind": "heat_pump"}]
+    record = daily_record()
+    allocation = record["allocations"]["hp_main"]
+    allocation.update(quality="good", residual_kwh=0, heating_assumed_unknown_mode_kwh=0,
+                      categories={"heating": 16, "dhw": 0})
+    assert _dhw_zero_proven([record], equipment)
+    allocation["categories"]["unknown"] = 1
+    assert not _dhw_zero_proven([record], equipment)
+    allocation["categories"] = {}
+    allocation["quality"] = "partial"
+    assert not _dhw_zero_proven([record], equipment)
+    assert _known_allocation_subtotal([record], equipment, "heat_pump", ("dhw",)) is None
 
 
 def test_monthly_snapshot_rejects_wrong_month_and_dst_gap():

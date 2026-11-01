@@ -95,3 +95,16 @@ p.load=async()=>{};p.loadTemperatureDiagnostics=async()=>{};p.temperatureBackfil
     data = json.loads(result.stdout)
     assert data["calls"] == 2
     assert data["job"]["job_id"] == 42 and data["job"]["status"] == "completed"
+
+
+def test_backfill_job_id_is_recovered_after_panel_refresh():
+    script = r"""
+const fs=require('fs'),vm=require('vm');let Panel;
+global.HTMLElement=class{attachShadow(){return {}}};global.customElements={define:(_,c)=>Panel=c};
+global.window={setInterval:()=>0,clearInterval:()=>{},sessionStorage:{getItem:()=> '42'}};
+vm.runInThisContext(fs.readFileSync(process.argv[1],'utf8'));const p=new Panel();
+p.load=()=>{};p.pollTemperatureBackfill=()=>{process.stdout.write(String(p.temperatureBackfillJob.job_id));};
+p.hass={callWS:async()=>{}};
+"""
+    result = subprocess.run(["node", "-e", script, str(PANEL)], text=True, capture_output=True, check=True)
+    assert result.stdout == "42"

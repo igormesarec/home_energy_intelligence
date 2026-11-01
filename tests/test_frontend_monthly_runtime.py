@@ -186,3 +186,49 @@ def test_monthly_mobile_contract_has_scroll_and_touch_sized_controls():
     assert ".monthly-chart-wrap{max-width:100%;overflow-x:auto" in source
     assert ".monthly-controls input{min-height:44px}" in source
     assert "monthly_report_csv" in source
+
+
+def test_house_profile_shows_partial_ac_and_only_proven_zero_dhw():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.profileOutdoorRows=[];
+const coverage={date_coverage:{complete_through_available_cutoff:true},allocation_coverage:{complete:true}};
+panel.monthlyReport={rows:[
+ {month:'2026-09',period_coverage:{},known_ac_heating_electricity_kwh:11.7,known_ac_cooling_electricity_kwh:78.7,known_ecodan_heating_electricity_kwh:null,quality:'partial'},
+ {month:'2026-10',period_coverage:coverage,ecodan_dhw_electricity_kwh:0,ecodan_dhw_zero_proven:true,quality:'good'},
+ {month:'2026-11',period_coverage:coverage,ecodan_dhw_electricity_kwh:0,ecodan_dhw_zero_proven:false,quality:'partial'}]};
+process.stdout.write(panel.monthlyHouseProfile());
+""", {})
+    assert "11.70" in output and "78.70" in output
+    assert "Partial known subtotal" in output
+    september = output.split('<tr><td>2026-09</td>', 1)[1].split('</tr>', 1)[0]
+    october = output.split('<tr><td>2026-10</td>', 1)[1].split('</tr>', 1)[0]
+    november = output.split('<tr><td>2026-11</td>', 1)[1].split('</tr>', 1)[0]
+    assert "Unavailable" in september
+    assert "<td>0.00</td>" in october
+    assert "<td>0.00</td>" not in november
+
+
+def test_scatter_rejects_positive_slope_and_uses_configured_area():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.heatingIntensity=true;
+panel.responseProfileData={points:Array.from({length:10},(_,i)=>({status:'validated',local_date:`2026-09-${String(i+1).padStart(2,'0')}`,outdoor_mean_c:i,heating_electricity_kwh:17+i,outdoor_coverage_percent:100,equipment_heating:[]}))};
+process.stdout.write(panel.scatterChart());
+""", {})
+    assert "Exploratory statistical fit, not a validated physical model" in output
+    assert "1.000" in output and "10 qualified days" in output
+    assert "0.100 kWh/m" in output and "170 m" in output
+    assert "observed 0.0" in output and "9.0" in output
+
+
+def test_monthly_outdoor_mean_uses_valid_elapsed_seconds_and_keeps_gaps():
+    output = run_panel(r"""
+panel.monthlyReport={months:['2026-10']};panel.representativeSource=()=>({source_id:'out'});
+panel._hass={callWS:async()=>({intervals:[
+ {local_date:'2026-10-24',temperatures:{out:{mean:5,valid_seconds:86400,expected_seconds:86400}}},
+ {local_date:'2026-10-25',temperatures:{out:{mean:10,valid_seconds:3600,expected_seconds:90000}}},
+ {local_date:'2026-10-26',temperatures:{out:{mean:null,valid_seconds:0,expected_seconds:86400}}}]})};
+(async()=>{await panel.loadProfileOutdoor();process.stdout.write(JSON.stringify(panel.profileOutdoorRows));})();
+""", {})
+    result = json.loads(output)[0]
+    assert result["mean"] == pytest.approx((5 * 86400 + 10 * 3600) / 90000)
+    assert result["coverage"] == pytest.approx(100 * 90000 / 262800)
