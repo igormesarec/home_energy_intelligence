@@ -217,14 +217,21 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
         air_conditioners = []
         cooling_units = []
         for item in devices:
+            allocation = (record.get("allocations") or {}).get(str(item.get("equipment_id"))) or {}
+            categories = allocation.get("categories") or {}
+            available = bool(item.get("available"))
+            resolved = bool(item.get("classification_complete")) and not float(categories.get("unknown") or 0) and abs(float(allocation.get("residual_kwh") or 0)) < 0.000001
             if item.get("kind") == "heat_pump":
                 value = sum(float(item.get(key) or 0) for key in (
                     "known_confirmed_heating_kwh", "known_assumed_heating_kwh",
                 ))
                 heat_pumps.append({"equipment_id": item.get("equipment_id"),
                                    "display_name": item.get("display_name"),
-                                   "electricity_kwh": value,
-                                   "quality": item.get("quality")})
+                                   "electricity_kwh": value if available and (resolved or value > 0 or any(key in categories for key in ("heating", "confirmed_heating", "heating_assumed"))) else None,
+                                   "quality": item.get("quality"), "coverage_percent": item.get("coverage_percent"),
+                                   "classification_complete": item.get("classification_complete"),
+                                   "confirmed_kwh": item.get("known_confirmed_heating_kwh"),
+                                   "assumed_kwh": item.get("known_assumed_heating_kwh")})
             elif item.get("kind") == "air_conditioner":
                 heating = sum(float(item.get(key) or 0) for key in (
                     "known_confirmed_heating_kwh", "known_selected_heating_kwh",
@@ -236,15 +243,20 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
                 ))
                 air_conditioners.append({"equipment_id": item.get("equipment_id"),
                                          "display_name": item.get("display_name"),
-                                         "electricity_kwh": heating,
-                                         "quality": item.get("quality")})
+                                         "electricity_kwh": heating if available and (resolved or heating > 0 or any(key in categories for key in ("heating", "heating_selected", "heating_estimated"))) else None,
+                                         "quality": item.get("quality"), "coverage_percent": item.get("coverage_percent"),
+                                         "classification_complete": item.get("classification_complete")})
                 cooling_units.append({"equipment_id": item.get("equipment_id"),
                                       "display_name": item.get("display_name"),
-                                      "electricity_kwh": cooling,
-                                      "quality": item.get("quality")})
-        whole = sum(item["electricity_kwh"] for item in heat_pumps + air_conditioners)
-        cooling = sum(item["electricity_kwh"] for item in cooling_units)
-        complete = all(bool(item.get("classification_complete")) for item in devices)
+                                      "electricity_kwh": cooling if available and (resolved or cooling > 0 or any(key in categories for key in ("cooling", "cooling_selected", "cooling_estimated"))) else None,
+                                      "quality": item.get("quality"), "coverage_percent": item.get("coverage_percent"),
+                                      "classification_complete": resolved})
+        heating_values = [item["electricity_kwh"] for item in heat_pumps + air_conditioners if item["electricity_kwh"] is not None]
+        cooling_values = [item["electricity_kwh"] for item in cooling_units if item["electricity_kwh"] is not None]
+        whole = sum(heating_values) if heating_values else None
+        cooling = sum(cooling_values) if cooling_values else None
+        complete = bool(devices) and all(bool(item.get("classification_complete")) for item in devices) and len(heating_values) == len(devices) and not float(energy.get("unknown_kwh") or 0)
+        cooling_complete = bool(cooling_units) and all(bool(item.get("classification_complete")) for item in cooling_units) and len(cooling_values) == len(cooling_units)
         points.append({
             "local_date": record.get("local_date"),
             "outdoor_mean_c": temperature.get("mean"),
@@ -254,14 +266,18 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
             "whole_house_heating_kwh": whole if complete else None,
             "whole_house_heating_known_subtotal_kwh": whole,
             "normalized_heating_kwh_m2_day": (
-                whole / float(floor_area_m2) if complete and floor_area_m2 else None
+                whole / float(floor_area_m2) if complete and whole is not None and floor_area_m2 else None
             ),
-            "ac_cooling_kwh": cooling if complete else None,
+            "ac_cooling_kwh": cooling if cooling_complete else None,
             "ac_cooling_known_subtotal_kwh": cooling,
             "normalized_cooling_kwh_m2_day": (
-                cooling / float(floor_area_m2) if complete and floor_area_m2 else None
+                cooling / float(floor_area_m2) if cooling_complete and cooling is not None and floor_area_m2 else None
             ),
             "classification_complete": complete,
+            "cooling_classification_complete": cooling_complete,
+            "unknown_kwh": energy.get("unknown_kwh"),
+            "heating_exclusion_reasons": [] if complete else ["incomplete_heating_classification"],
+            "cooling_exclusion_reasons": [] if cooling_complete else ["incomplete_ac_cooling_classification"],
         })
     return points
 

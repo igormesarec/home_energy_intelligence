@@ -54,3 +54,34 @@ def test_v02_response_calculations_read_canonical_temperature_mean():
         [interval], hourly, "outdoor"
     )
     assert evidence[(interval["start_utc"], interval["end_utc"])]["mean_c"] == 5.5
+
+
+def test_cooling_completeness_is_independent_of_missing_heat_pump():
+    functions = _load_response_functions()
+    functions["canonical_energy"] = lambda *_: {"equipment": [
+        {"equipment_id": "hp", "kind": "heat_pump", "available": False},
+        {"equipment_id": "ac", "kind": "air_conditioner", "available": True,
+         "classification_complete": True, "known_confirmed_cooling_kwh": 3,
+         "known_confirmed_heating_kwh": 1},
+    ]}
+    row = functions["_v02_daily_curves"]([{
+        "local_date": "2026-09-01", "allocations": {
+            "ac": {"categories": {"cooling": 3, "heating": 1}}},
+    }], [], "outside", 170)[0]
+    assert row["ac_cooling_kwh"] == 3
+    assert row["whole_house_heating_kwh"] is None
+    assert row["whole_house_heating_known_subtotal_kwh"] == 1
+    assert row["heat_pumps"][0]["electricity_kwh"] is None
+
+
+def test_missing_cooling_category_is_not_a_measured_zero():
+    functions = _load_response_functions()
+    functions["canonical_energy"] = lambda *_: {"equipment": [
+        {"equipment_id": "ac", "kind": "air_conditioner", "available": True,
+         "classification_complete": False, "known_confirmed_heating_kwh": 2},
+    ]}
+    row = functions["_v02_daily_curves"]([{
+        "allocations": {"ac": {"categories": {"heating": 2}}},
+    }], [], "outside", 170)[0]
+    assert row["ac_cooling_kwh"] is None
+    assert row["ac_cooling_known_subtotal_kwh"] is None
