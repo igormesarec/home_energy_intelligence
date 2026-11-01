@@ -21,6 +21,32 @@ EQUIPMENT = [
 ]
 
 
+def test_october_missing_pv_day_keeps_supported_subtotal_without_ratios():
+    rows = []
+    for index, pv in enumerate((12.0, None, 8.0), 1):
+        start = datetime(2026, 10, index, tzinfo=UTC)
+        rows.append({"local_date": start.date().isoformat(), "timezone": "UTC",
+                     "period_start_utc": start.isoformat(),
+                     "period_end_utc": (start + timedelta(days=1)).isoformat(),
+                     "day_seconds": 86400, "quality": "good", "pv_kwh": pv,
+                     "household_kwh": 30.0, "import_kwh": 20.0, "export_kwh": 2.0})
+    combined = combine_daily_records(rows, "2026-10-01", "2026-10-03", timezone="UTC")
+    assert combined["pv_kwh"] is None
+    assert combined["known_pv_kwh"] == 20
+    energy = canonical_energy(combined, [])
+    assert energy["pv_self_consumption_percent"] is None
+    assert energy["self_sufficiency_percent"] is None
+
+
+def test_unknown_mode_without_category_evidence_does_not_create_zero():
+    record = {"allocations": {"hp-a": {"meter_kwh": 5, "categories": {},
+                                           "coverage_percent": 0, "quality": "partial"}}}
+    energy = canonical_energy(record, EQUIPMENT)
+    assert energy["known_space_heating_kwh"] is None
+    assert energy["known_dhw_kwh"] is None
+    assert energy["known_cooling_kwh"] is None
+
+
 def test_canonical_contract_preserves_uncertain_categories_and_reconciles():
     record = {
         "household_kwh": 20.0, "pv_kwh": 8.0, "import_kwh": 15.0,

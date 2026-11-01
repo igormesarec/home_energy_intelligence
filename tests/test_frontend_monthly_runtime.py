@@ -232,3 +232,13 @@ panel._hass={callWS:async()=>({intervals:[
     result = json.loads(output)[0]
     assert result["mean"] == pytest.approx((5 * 86400 + 10 * 3600) / 90000)
     assert result["coverage"] == pytest.approx(100 * 90000 / 262800)
+
+
+def test_overview_partial_pv_and_signed_net_grid():
+    output = run_panel(r"""
+panel.historySummary={known_pv_kwh:20,energy:{pv_kwh:null,import_kwh:30,export_kwh:40}};
+process.stdout.write(JSON.stringify(panel.kpis())+'\n'+panel.pvPeriodMetrics(panel.historySummary));
+""", {})
+    assert '"PV Generation",null,"amber","kWh",20' in output
+    assert "known subtotal" in output and "-10.0 kWh" in output
+    assert "Self-sufficiency" in output and "Unavailable" in output

@@ -261,14 +261,22 @@ def canonical_energy(
     known_idle = totals["idle_kwh"]
     known_other_hvac = totals["other_hvac_kwh"]
     known_hvac_meter = totals["hvac_meter_kwh"]
-    known_heating_evidence = any(
-        item.get("available") for item in breakdown
-    )
-    known_dhw_evidence = any(
-        item.get("available") and item.get("kind") == "heat_pump"
-        for item in breakdown
-    )
-    known_cooling_evidence = known_heating_evidence
+    def category_evidence(item: dict[str, Any], names: tuple[str, ...]) -> bool:
+        allocation = allocations.get(str(item.get("equipment_id"))) or {}
+        categories = allocation.get("categories") or {}
+        return bool(item.get("available")) and (
+            any(name in categories and _number(categories[name]) is not None for name in names)
+            or (item.get("classification_complete") and not float(item.get("unknown_kwh") or 0)
+                and not float(item.get("residual_kwh") or 0))
+        )
+
+    known_heating_evidence = any(category_evidence(item, (
+        "heating", "confirmed_heating", "heating_assumed", "heating_selected", "heating_estimated"
+    )) or (item.get("available") and float(item.get("known_assumed_heating_kwh") or 0) > 0)
+        for item in breakdown)
+    known_dhw_evidence = any(item.get("kind") == "heat_pump" and category_evidence(item, ("dhw",)) for item in breakdown)
+    known_cooling_evidence = any(category_evidence(item, ("cooling", "cooling_selected", "cooling_estimated")) for item in breakdown)
+    known_meter_evidence = any(item.get("available") for item in breakdown)
     heating_complete = heat_pump_complete and ac_complete
     cooling_complete = heat_pump_complete and ac_complete
     category_requirements = {
@@ -292,11 +300,11 @@ def canonical_energy(
         ),
         "known_dhw_kwh": known_dhw if known_dhw_evidence else None,
         "known_cooling_kwh": known_cooling if known_cooling_evidence else None,
-        "known_idle_kwh": known_idle if known_heating_evidence else None,
+        "known_idle_kwh": known_idle if known_meter_evidence else None,
         "known_other_hvac_kwh": (
-            known_other_hvac if has_air_conditioners and known_heating_evidence else None
+            known_other_hvac if has_air_conditioners and known_meter_evidence else None
         ),
-        "known_hvac_meter_kwh": known_hvac_meter if known_heating_evidence else None,
+        "known_hvac_meter_kwh": known_hvac_meter if known_meter_evidence else None,
         "space_heating_kwh": known_space_heating if heating_complete else None,
         "dhw_kwh": known_dhw if has_heat_pumps and heat_pump_complete else None,
         "cooling_kwh": (
@@ -603,6 +611,12 @@ def combine_interval_records(
         values = [_number(item.get(key)) for item in records]
         return None if any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
 
+    def known_sum(key: str) -> float | None:
+        values = [_number(item.get(key)) for item in records
+                  if item.get("quality") not in {"missing", "poor", "unreconciled"}]
+        values = [value for value in values if value is not None and isfinite(value) and value >= 0]
+        return sum(values) if values else None
+
     def record_seconds(item: dict[str, Any]) -> float:
         seconds = _number(item.get("day_seconds"))
         if seconds is not None:
@@ -810,8 +824,8 @@ def combine_interval_records(
         "period_end_utc": (expected_end.isoformat() if expected_end else records[-1]["period_end_utc"]),
         "day_seconds": int((expected_end - expected_start).total_seconds())
         if expected_start and expected_end else sum(int(item.get("day_seconds", 0)) for item in records),
-        "known_household_kwh": household, "known_pv_kwh": pv,
-        "known_import_kwh": imported, "known_export_kwh": exported,
+        "known_household_kwh": known_sum("household_kwh"), "known_pv_kwh": known_sum("pv_kwh"),
+        "known_import_kwh": known_sum("import_kwh"), "known_export_kwh": known_sum("export_kwh"),
         "known_non_hvac_kwh": non_hvac,
         "household_kwh": household if interval_complete else None,
         "pv_kwh": pv if interval_complete else None,
