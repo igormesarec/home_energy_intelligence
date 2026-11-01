@@ -1294,6 +1294,7 @@ async def ws_csv(hass, connection, msg):
               "unallocated_discrepancy_kwh", "known_space_heating_kwh", "known_dhw_kwh",
               "known_cooling_kwh", "known_idle_kwh", "known_other_hvac_kwh",
               "pv_kwh", "import_kwh", "export_kwh", "net_grid_balance_kwh",
+              "net_grid_balance_quality", "net_grid_balance_cutoff_utc",
               "complete", "quality", "partial", "finalized", "cutoff_utc",
               "date_coverage_percent", "meter_coverage_percent",
               "allocation_coverage_percent", "allocation_coverage_known"]
