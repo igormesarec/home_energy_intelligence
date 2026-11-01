@@ -257,10 +257,30 @@ process.stdout.write(panel.pvPeriodMetrics(panel.historySummary));
 def test_overview_series_uses_independent_meter_and_equipment_evidence():
     output = run_panel(r"""
 panel.history=[{local_date:'2026-10-01',quality:'partial',energy:{pv_kwh:12,household_kwh:20,import_kwh:8,export_kwh:3},provenance:{counter_collection:{'site.pv':'recorder_states','site.import':'recorder_states_unreliable','site.export':'recorder_states'}}}];
-panel.v02Report={whole_house_heating:[{local_date:'2026-10-01',classification_complete:false,heat_pumps:[{display_name:'HP',electricity_kwh:3,heating_evidence_complete:false,quality:'partial'}],air_conditioners:[{display_name:'AC',electricity_kwh:2,heating_evidence_complete:true,quality:'good'}]}]};
+panel.v02Report={whole_house_heating:[{local_date:'2026-10-01',calendar_period_finalized:true,complete_through_cutoff:true,classification_complete:false,heat_pumps:[{display_name:'HP',electricity_kwh:3,heating_evidence_complete:false,quality:'partial'}],air_conditioners:[{display_name:'AC',electricity_kwh:2,heating_evidence_complete:true,quality:'good'}]}]};
 process.stdout.write(panel.overviewSeries('pv')+'\n'+panel.overviewSeries('heating'));
 """, {})
     assert 'opacity="1"><title>2026-10-01 · PV 12.00 kWh' in output
     assert 'Import 8.00 kWh' not in output and 'Net grid 5.00 kWh' not in output
     assert 'opacity="0.55"><title>2026-10-01 · Heat pump heating 3.00 kWh' in output
     assert 'opacity="1"><title>2026-10-01 · AC heating 2.00 kWh' in output
+
+
+def test_heating_series_distinguishes_finalized_cutoff_partial_and_estimates():
+    output = run_panel(r"""
+const device=(v,complete=true,extra={})=>({display_name:'Device',electricity_kwh:v,heating_evidence_complete:complete,quality:'good',...extra});
+panel.v02Report={whole_house_heating:[
+ {local_date:'2026-10-01',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(2)],air_conditioners:[device(0)]},
+ {local_date:'2026-10-02',calendar_period_finalized:false,complete_through_cutoff:true,cutoff_utc:'2026-10-02T12:00:00Z',heat_pumps:[device(3)],air_conditioners:[device(1)]},
+ {local_date:'2026-10-03',calendar_period_finalized:false,complete_through_cutoff:false,heat_pumps:[device(4)],air_conditioners:[device(1),device(null,false)]},
+ {local_date:'2026-10-04',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(5,true,{assumed_kwh:2})],air_conditioners:[device(2,true,{selected_kwh:1})]},
+ {local_date:'2026-10-05',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(null,false)],air_conditioners:[]} ]};
+process.stdout.write(panel.overviewSeries('heating'));
+""", {})
+    assert 'opacity="1"><title>2026-10-01 · Heat pump heating 2.00 kWh · complete finalized day' in output
+    assert 'opacity="1"><title>2026-10-01 · AC heating 0.00 kWh · complete finalized day' in output
+    assert 'opacity="0.55"><title>2026-10-02 · Heat pump heating 3.00 kWh · provisional through cutoff' in output
+    assert '2026-10-03 · AC heating 1.00 kWh · partial known subtotal' in output
+    assert '2026-10-04 · Heat pump heating 5.00 kWh · estimated or assumed heating' in output
+    assert '2026-10-04 · AC heating 2.00 kWh · estimated or assumed heating' in output
+    assert '2026-10-05 · Heat pump heating' not in output

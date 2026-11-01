@@ -218,9 +218,12 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
         cooling_units = []
         for item in devices:
             allocation = (record.get("allocations") or {}).get(str(item.get("equipment_id"))) or {}
-            categories = allocation.get("categories") or {}
-            available = bool(item.get("available"))
-            resolved = bool(item.get("classification_complete")) and not float(categories.get("unknown") or 0) and abs(float(allocation.get("residual_kwh") or 0)) < 0.000001
+            categories = allocation.get("known_categories", allocation.get("categories")) or {}
+            available = bool(item.get("known_available", item.get("available")))
+            resolved = (bool(item.get("classification_complete"))
+                        and item.get("quality") not in {"partial", "missing", "poor", "missing_counter", "unreconciled"}
+                        and not float(categories.get("unknown") or 0)
+                        and abs(float(allocation.get("residual_kwh") or 0)) < 0.000001)
             if item.get("kind") == "heat_pump":
                 value = sum(float(item.get(key) or 0) for key in (
                     "known_confirmed_heating_kwh", "known_assumed_heating_kwh",
@@ -259,11 +262,17 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
         cooling_values = [item["electricity_kwh"] for item in cooling_units if item["electricity_kwh"] is not None]
         whole = sum(heating_values) if heating_values else None
         cooling = sum(cooling_values) if cooling_values else None
-        finalized = energy.get("calendar_period_finalized") is True
+        finalized = energy.get("calendar_period_finalized") is True and record.get("provisional") is not True
+        coverage = record.get("period_coverage") or record.get("interval_coverage") or {}
+        dates = coverage.get("date_coverage") or {}
+        cutoff_complete = finalized or bool(dates.get("complete_through_available_cutoff", coverage.get("complete", False)))
         complete = finalized and bool(devices) and all(bool(item.get("classification_complete")) for item in devices) and len(heating_values) == len(devices) and not float(energy.get("unknown_kwh") or 0)
         cooling_complete = finalized and bool(cooling_units) and all(bool(item.get("classification_complete")) for item in cooling_units) and len(cooling_values) == len(cooling_units)
         points.append({
             "local_date": record.get("local_date"),
+            "calendar_period_finalized": finalized,
+            "complete_through_cutoff": cutoff_complete,
+            "cutoff_utc": record.get("period_end_utc"),
             "outdoor_mean_c": temperature.get("mean"),
             "outdoor_coverage_percent": temperature.get("coverage_percent"),
             "heat_pumps": heat_pumps, "air_conditioners": air_conditioners,
