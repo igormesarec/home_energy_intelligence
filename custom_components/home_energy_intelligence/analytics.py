@@ -336,10 +336,10 @@ def canonical_energy(
             if has_heat_pumps and heating_complete and heat_pump_complete else None
         ),
     })
-    household = _number(record.get("household_kwh"))
-    pv = _number(record.get("pv_kwh"))
-    imported = _number(record.get("import_kwh"))
-    exported = _number(record.get("export_kwh"))
+    household = _number(record.get("household_kwh")) if _valid_meter_value(record, "household_kwh") else None
+    pv = _number(record.get("pv_kwh")) if _valid_meter_value(record, "pv_kwh") else None
+    imported = _number(record.get("import_kwh")) if _valid_meter_value(record, "import_kwh") else None
+    exported = _number(record.get("export_kwh")) if _valid_meter_value(record, "export_kwh") else None
     other_household = _number(record.get("non_hvac_kwh"))
     classified_hvac = (
         known_space_heating + known_dhw + known_cooling

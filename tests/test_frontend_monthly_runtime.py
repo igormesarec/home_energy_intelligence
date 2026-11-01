@@ -252,3 +252,15 @@ process.stdout.write(panel.pvPeriodMetrics(panel.historySummary));
 """, {})
     assert "Partial" in output and "50.0%" in output
     assert "2026-10-01" in output and "2026-10-02" in output and "2026-10-03" in output
+
+
+def test_overview_series_uses_independent_meter_and_equipment_evidence():
+    output = run_panel(r"""
+panel.history=[{local_date:'2026-10-01',quality:'partial',energy:{pv_kwh:12,household_kwh:20,import_kwh:8,export_kwh:3},provenance:{counter_collection:{'site.pv':'recorder_states','site.import':'recorder_states_unreliable','site.export':'recorder_states'}}}];
+panel.v02Report={whole_house_heating:[{local_date:'2026-10-01',classification_complete:false,heat_pumps:[{display_name:'HP',electricity_kwh:3,heating_evidence_complete:false,quality:'partial'}],air_conditioners:[{display_name:'AC',electricity_kwh:2,heating_evidence_complete:true,quality:'good'}]}]};
+process.stdout.write(panel.overviewSeries('pv')+'\n'+panel.overviewSeries('heating'));
+""", {})
+    assert 'opacity="1"><title>2026-10-01 · PV 12.00 kWh' in output
+    assert 'Import 8.00 kWh' not in output and 'Net grid 5.00 kWh' not in output
+    assert 'opacity="0.55"><title>2026-10-01 · Heat pump heating 3.00 kWh' in output
+    assert 'opacity="1"><title>2026-10-01 · AC heating 2.00 kWh' in output

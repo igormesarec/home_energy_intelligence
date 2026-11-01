@@ -230,6 +230,7 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
                                    "electricity_kwh": value if available and (resolved or value > 0 or any(key in categories for key in ("heating", "confirmed_heating", "heating_assumed"))) else None,
                                    "quality": item.get("quality"), "coverage_percent": item.get("coverage_percent"),
                                    "classification_complete": item.get("classification_complete"),
+                                   "heating_evidence_complete": resolved,
                                    "confirmed_kwh": item.get("known_confirmed_heating_kwh"),
                                    "assumed_kwh": item.get("known_assumed_heating_kwh")})
             elif item.get("kind") == "air_conditioner":
@@ -245,7 +246,10 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
                                          "display_name": item.get("display_name"),
                                          "electricity_kwh": heating if available and (resolved or heating > 0 or any(key in categories for key in ("heating", "heating_selected", "heating_estimated"))) else None,
                                          "quality": item.get("quality"), "coverage_percent": item.get("coverage_percent"),
-                                         "classification_complete": item.get("classification_complete")})
+                                         "classification_complete": item.get("classification_complete"),
+                                         "heating_evidence_complete": resolved,
+                                         "selected_kwh": item.get("known_selected_heating_kwh"),
+                                         "estimated_kwh": item.get("known_estimated_heating_kwh")})
                 cooling_units.append({"equipment_id": item.get("equipment_id"),
                                       "display_name": item.get("display_name"),
                                       "electricity_kwh": cooling if available and (resolved or cooling > 0 or any(key in categories for key in ("cooling", "cooling_selected", "cooling_estimated"))) else None,

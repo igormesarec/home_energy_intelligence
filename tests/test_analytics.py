@@ -81,6 +81,16 @@ def test_pv_quality_is_independent_of_hvac_and_tracks_missing_and_invalid_dates(
     assert field["available_days"] == 1
 
 
+def test_unreliable_import_is_unavailable_in_canonical_daily_record():
+    record = {"pv_kwh": 12, "import_kwh": 8, "export_kwh": 3,
+              "household_kwh": 17, "quality": "partial",
+              "provenance": {"counter_collection": {"site.pv": "recorder_states",
+                                                       "site.import": "recorder_states_unreliable"}}}
+    energy = canonical_energy(record, [])
+    assert energy["pv_kwh"] == 12
+    assert energy["import_kwh"] is None
+
+
 def test_canonical_contract_preserves_uncertain_categories_and_reconciles():
     record = {
         "household_kwh": 20.0, "pv_kwh": 8.0, "import_kwh": 15.0,
