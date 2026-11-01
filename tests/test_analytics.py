@@ -21,6 +21,13 @@ EQUIPMENT = [
 ]
 
 
+def test_net_grid_balance_export_minus_import_preserves_raw_counters():
+    energy = canonical_energy({"import_kwh": 13.6, "export_kwh": 0.1}, [])
+    assert energy["net_grid_balance_kwh"] == pytest.approx(-13.5)
+    assert energy["import_kwh"] == 13.6 and energy["export_kwh"] == 0.1
+    assert canonical_energy({"import_kwh": 13.6}, [])["net_grid_balance_kwh"] is None
+
+
 def test_october_missing_pv_day_keeps_supported_subtotal_without_ratios():
     rows = []
     for index, pv in enumerate((12.0, None, 8.0), 1):

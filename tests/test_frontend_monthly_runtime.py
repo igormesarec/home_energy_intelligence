@@ -89,6 +89,38 @@ process.stdout.write(JSON.stringify({a:a[2],b:b[2],c:c[2],count:a.length}));
     assert result["a"]["mean"] == result["b"]["mean"]
     assert result["c"]["low"] is None
     assert result["a"]["cop"]["vendor_combined_cop"] == 3.8
+
+
+def test_no_selected_cop_evidence_has_explicit_empty_state():
+    output = run_panel(r"""
+panel.analysisData={mode:'month',period:'2026-10',source:{source_id:'outdoor'},daily:{intervals:[]},hourly:{intervals:[]},cop:{rows:[{month:'2026-10',vendor_combined_cop:null}]}};
+panel.analysisMetrics=['vendor_combined_cop'];process.stdout.write(panel.temperatureCopAnalysis());
+""", {})
+    assert "No selected COP evidence available" in output
+    assert 'aria-label="Monthly COP"' not in output
+
+
+def test_yesterday_history_survives_optional_thermal_report_failure():
+    output = run_panel(r"""
+panel.shadowRoot={querySelector:(selector)=>selector==='.period-select'?{value:'yesterday'}:null};
+panel.render=()=>{};panel.loadTemperatureTimeline=async()=>{};
+panel.loadV02=async()=>{throw new Error('thermal unavailable')};
+panel._hass={callWS:async()=>({records:[{local_date:'2026-10-31',energy:{household_kwh:44.2}}],total:1,summary:{energy:{household_kwh:44.2}},selected_period:{start_date:'2026-10-31',end_date:'2026-10-31'}})};
+(async()=>{await panel.loadPeriod();process.stdout.write(JSON.stringify({selected:panel.selectedRecord(),error:panel.refreshError,report:panel.v02Report}));})();
+""", {})
+    result = json.loads(output)
+    assert result["selected"]["energy"]["household_kwh"] == 44.2
+    assert "thermal unavailable" in result["error"] and result["report"] is None
+
+
+def test_net_grid_balance_is_export_minus_import_in_overview():
+    output = run_panel(r"""
+const record={local_date:'2026-10-31',energy:{import_kwh:13.6,export_kwh:.1}};
+panel.history=[record];process.stdout.write(panel.pvPeriodMetrics(record)+'\n'+panel.overviewSeries('pv'));
+""", {})
+    assert "-13.5 kWh" in output
+    assert "Net grid balance -13.50 kWh" in output
+    assert "export" in output and "import" in output
 def test_annual_cop_uses_matched_months_and_ratio_of_sums():
     output = run_panel(r"""
 panel.historyPreset='this_year';panel.selectedPeriod={start_date:'2026-01-01',end_date:'2026-10-31'};
@@ -240,7 +272,7 @@ panel.historySummary={known_pv_kwh:20,energy:{pv_kwh:null,import_kwh:30,export_k
 process.stdout.write(JSON.stringify(panel.kpis())+'\n'+panel.pvPeriodMetrics(panel.historySummary));
 """, {})
     assert '"PV Generation",null,"amber","kWh",20' in output
-    assert "known subtotal" in output and "-10.0 kWh" in output
+    assert "known subtotal" in output and "10.0 kWh" in output
     assert "Self-sufficiency" in output and "Unavailable" in output
 
 

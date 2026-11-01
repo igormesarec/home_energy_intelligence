@@ -379,6 +379,7 @@ def canonical_energy(
         "unallocated_discrepancy_kwh": discrepancy,
         "raw_residual_evidence_kwh": residual_evidence,
         "pv_kwh": pv, "import_kwh": imported, "export_kwh": exported,
+        "net_grid_balance_kwh": exported - imported if imported is not None and exported is not None else None,
         "pv_consumed_on_site_kwh": consumed_pv,
         "calculated_household_kwh": calculated_household,
         "household_balance_discrepancy_kwh": household_balance_discrepancy,
