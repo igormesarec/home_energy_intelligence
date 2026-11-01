@@ -255,8 +255,9 @@ def _v02_daily_curves(records, equipment, outdoor_source_id, floor_area_m2):
         cooling_values = [item["electricity_kwh"] for item in cooling_units if item["electricity_kwh"] is not None]
         whole = sum(heating_values) if heating_values else None
         cooling = sum(cooling_values) if cooling_values else None
-        complete = bool(devices) and all(bool(item.get("classification_complete")) for item in devices) and len(heating_values) == len(devices) and not float(energy.get("unknown_kwh") or 0)
-        cooling_complete = bool(cooling_units) and all(bool(item.get("classification_complete")) for item in cooling_units) and len(cooling_values) == len(cooling_units)
+        finalized = energy.get("calendar_period_finalized") is True
+        complete = finalized and bool(devices) and all(bool(item.get("classification_complete")) for item in devices) and len(heating_values) == len(devices) and not float(energy.get("unknown_kwh") or 0)
+        cooling_complete = finalized and bool(cooling_units) and all(bool(item.get("classification_complete")) for item in cooling_units) and len(cooling_values) == len(cooling_units)
         points.append({
             "local_date": record.get("local_date"),
             "outdoor_mean_c": temperature.get("mean"),

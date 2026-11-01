@@ -58,7 +58,7 @@ def test_v02_response_calculations_read_canonical_temperature_mean():
 
 def test_cooling_completeness_is_independent_of_missing_heat_pump():
     functions = _load_response_functions()
-    functions["canonical_energy"] = lambda *_: {"equipment": [
+    functions["canonical_energy"] = lambda *_: {"calendar_period_finalized": True, "equipment": [
         {"equipment_id": "hp", "kind": "heat_pump", "available": False},
         {"equipment_id": "ac", "kind": "air_conditioner", "available": True,
          "classification_complete": True, "known_confirmed_cooling_kwh": 3,
