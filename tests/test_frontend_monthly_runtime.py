@@ -242,3 +242,13 @@ process.stdout.write(JSON.stringify(panel.kpis())+'\n'+panel.pvPeriodMetrics(pan
     assert '"PV Generation",null,"amber","kWh",20' in output
     assert "known subtotal" in output and "-10.0 kWh" in output
     assert "Self-sufficiency" in output and "Unavailable" in output
+
+
+def test_pv_coverage_separates_missing_records_and_measurements():
+    output = run_panel(r"""
+panel.historyCoverage={meter_coverage:{fields:{pv_kwh:{complete:false,coverage_percent:50,available_days:2,missing_record_dates:['2026-10-01'],missing_measurement_dates:['2026-10-02'],invalid_measurement_dates:['2026-10-03']}}}};
+panel.historySummary={known_pv_kwh:20,energy:{pv_kwh:null}};
+process.stdout.write(panel.pvPeriodMetrics(panel.historySummary));
+""", {})
+    assert "Partial" in output and "50.0%" in output
+    assert "2026-10-01" in output and "2026-10-02" in output and "2026-10-03" in output

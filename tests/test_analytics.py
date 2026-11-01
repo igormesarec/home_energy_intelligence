@@ -47,6 +47,40 @@ def test_unknown_mode_without_category_evidence_does_not_create_zero():
     assert energy["known_cooling_kwh"] is None
 
 
+def test_multiday_known_heating_survives_missing_meter_without_becoming_complete():
+    rows = []
+    for index in (1, 2):
+        start = datetime(2026, 10, index, tzinfo=UTC)
+        allocation = {"meter_kwh": 4 if index == 1 else None,
+                      "categories": {"confirmed_heating": 3} if index == 1 else {},
+                      "quality": "good" if index == 1 else "missing_counter", "coverage_percent": 100}
+        rows.append({"local_date": start.date().isoformat(), "timezone": "UTC",
+                     "period_start_utc": start.isoformat(), "period_end_utc": (start + timedelta(days=1)).isoformat(),
+                     "day_seconds": 86400, "quality": "partial", "allocations": {"hp-a": allocation}})
+    combined = combine_daily_records(rows, "2026-10-01", "2026-10-02", timezone="UTC", equipment_ids=["hp-a"])
+    energy = canonical_energy(combined, EQUIPMENT[:1])
+    assert energy["space_heating_kwh"] is None
+    assert energy["known_space_heating_kwh"] == 3
+    assert energy["equipment"][0]["available"] is False
+
+
+def test_pv_quality_is_independent_of_hvac_and_tracks_missing_and_invalid_dates():
+    rows = []
+    for index, pv, source in ((1, 5, "recorder_states"), (2, None, "recorder_states"), (3, 99, "recorder_states_unreliable")):
+        start = datetime(2026, 10, index, tzinfo=UTC)
+        rows.append({"local_date": start.date().isoformat(), "timezone": "UTC",
+                     "period_start_utc": start.isoformat(), "period_end_utc": (start + timedelta(days=1)).isoformat(),
+                     "day_seconds": 86400, "quality": "missing", "pv_kwh": pv,
+                     "provenance": {"counter_collection": {"site.pv": source}}})
+    combined = combine_daily_records(rows, "2026-10-01", "2026-10-04", timezone="UTC")
+    assert combined["known_pv_kwh"] == 5 and combined["pv_kwh"] is None
+    field = combined["period_coverage"]["meter_coverage"]["fields"]["pv_kwh"]
+    assert field["missing_record_dates"] == ["2026-10-04"]
+    assert field["missing_measurement_dates"] == ["2026-10-02"]
+    assert field["invalid_measurement_dates"] == ["2026-10-03"]
+    assert field["available_days"] == 1
+
+
 def test_canonical_contract_preserves_uncertain_categories_and_reconciles():
     record = {
         "household_kwh": 20.0, "pv_kwh": 8.0, "import_kwh": 15.0,

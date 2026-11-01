@@ -24,3 +24,14 @@ jobs:
       - run: python -m pytest
       - run: python -m compileall -q custom_components tests
       - run: node --check custom_components/home_energy_intelligence/frontend/hei-panel.js
+  browser-layout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-save playwright
+      - run: node tests/overview_layout_check.cjs
+        env:
+          HEI_CHROME: /usr/bin/google-chrome
