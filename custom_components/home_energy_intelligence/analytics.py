@@ -29,6 +29,44 @@ def _valid_meter_value(record: dict[str, Any], field: str) -> bool:
     return quality not in {"missing", "poor", "invalid", "unreconciled"}
 
 
+def _net_grid_intervals(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Use only paired counter changes on the same explicit stored interval."""
+    intervals = []
+    for record in records:
+        sources = (record.get("provenance") or {}).get("counter_collection") or {}
+        if any(sources.get(f"site.{name}") in {"recorder_states_unreliable", "unavailable", "invalid", "unreconciled"} for name in ("import", "export")):
+            continue
+        if any((record.get("meter_quality") or {}).get(key) in {"missing", "poor", "invalid", "unreconciled"} for key in ("import_kwh", "export_kwh")):
+            continue
+        coverage = record.get("interval_coverage") or {}
+        period_partial = record.get("partial") is True or record.get("finalized") is False or record.get("provisional") is True
+        if record.get("net_grid_matched_intervals") and (period_partial or coverage.get("complete") is False):
+            candidates = record["net_grid_matched_intervals"]
+        elif (not period_partial or coverage.get("complete") is True) and _valid_meter_value(record, "import_kwh") and _valid_meter_value(record, "export_kwh"):
+            candidates = [{"start": record.get("period_start_utc"), "end": record.get("period_end_utc"),
+                           "import_kwh": record["import_kwh"], "export_kwh": record["export_kwh"]}]
+        elif all(record.get(key) is None or _valid_meter_value(record, key)
+                 for key in ("import_kwh", "export_kwh")):
+            candidates = record.get("net_grid_matched_intervals") or []
+        else:
+            candidates = []
+        for item in candidates:
+            try:
+                start = datetime.fromisoformat(item["start"])
+                end = datetime.fromisoformat(item["end"])
+                imported, exported = float(item["import_kwh"]), float(item["export_kwh"])
+                if start.tzinfo is None or end.tzinfo is None or end <= start or not all(isfinite(x) and x >= 0 for x in (imported, exported)):
+                    continue
+                intervals.append({"start": start.isoformat(), "end": end.isoformat(),
+                                  "import_kwh": imported, "export_kwh": exported})
+            except (KeyError, TypeError, ValueError):
+                continue
+    intervals.sort(key=lambda item: datetime.fromisoformat(item["start"]))
+    if any(datetime.fromisoformat(a["end"]) > datetime.fromisoformat(b["start"]) for a, b in zip(intervals, intervals[1:])):
+        return []
+    return intervals
+
+
 def _classification_coverage(allocation: dict[str, Any]) -> float | None:
     """Return evidenced classification coverage, never a legacy default.
 
@@ -340,6 +378,12 @@ def canonical_energy(
     pv = _number(record.get("pv_kwh")) if _valid_meter_value(record, "pv_kwh") else None
     imported = _number(record.get("import_kwh")) if _valid_meter_value(record, "import_kwh") else None
     exported = _number(record.get("export_kwh")) if _valid_meter_value(record, "export_kwh") else None
+    net_intervals = _net_grid_intervals([record])
+    net_value = sum(item["export_kwh"] - item["import_kwh"] for item in net_intervals) if net_intervals else None
+    net_full = bool(net_intervals and imported is not None and exported is not None and temporal_complete)
+    net_state = ("unavailable" if net_value is None else
+                 "complete" if net_full and calendar_period_finalized else
+                 "provisional_through_cutoff" if net_full else "partial_matched_subtotal")
     other_household = _number(record.get("non_hvac_kwh"))
     classified_hvac = (
         known_space_heating + known_dhw + known_cooling
@@ -379,6 +423,9 @@ def canonical_energy(
         "unallocated_discrepancy_kwh": discrepancy,
         "raw_residual_evidence_kwh": residual_evidence,
         "pv_kwh": pv, "import_kwh": imported, "export_kwh": exported,
+        "net_grid_balance_kwh": net_value,
+        "net_grid_balance_quality": net_state,
+        "net_grid_balance_cutoff_utc": net_intervals[-1]["end"] if net_intervals else None,
         "pv_consumed_on_site_kwh": consumed_pv,
         "calculated_household_kwh": calculated_household,
         "household_balance_discrepancy_kwh": household_balance_discrepancy,
@@ -856,6 +903,7 @@ def combine_interval_records(
         if expected_start and expected_end else sum(int(item.get("day_seconds", 0)) for item in records),
         "known_household_kwh": known_sum("household_kwh"), "known_pv_kwh": known_sum("pv_kwh"),
         "known_import_kwh": known_sum("import_kwh"), "known_export_kwh": known_sum("export_kwh"),
+        "net_grid_matched_intervals": _net_grid_intervals(records),
         "known_non_hvac_kwh": non_hvac,
         "household_kwh": household if interval_complete else None,
         "pv_kwh": pv if interval_complete else None,

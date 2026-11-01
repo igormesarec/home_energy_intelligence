@@ -21,6 +21,49 @@ EQUIPMENT = [
 ]
 
 
+def test_net_grid_balance_export_minus_import_preserves_raw_counters():
+    energy = canonical_energy({"import_kwh": 13.6, "export_kwh": 0.1,
+                               "period_start_utc": "2026-10-31T23:00:00+00:00",
+                               "period_end_utc": "2026-11-01T10:00:00+00:00"}, [])
+    assert energy["net_grid_balance_kwh"] == pytest.approx(-13.5)
+    assert energy["import_kwh"] == 13.6 and energy["export_kwh"] == 0.1
+    assert canonical_energy({"import_kwh": 13.6}, [])["net_grid_balance_kwh"] is None
+
+
+def test_net_grid_provisional_and_partial_use_only_matching_hourly_intervals():
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    def row(hour, imported, exported):
+        left = start + timedelta(hours=hour)
+        return {"local_date": "2026-11-01", "timezone": "UTC", "day_seconds": 3600,
+                "period_start_utc": left.isoformat(), "period_end_utc": (left + timedelta(hours=1)).isoformat(),
+                "import_kwh": imported, "export_kwh": exported, "quality": "good"}
+    complete = combine_interval_records([row(0, 13.6, .1)], expected_start=start, expected_end=start+timedelta(hours=1))
+    complete.update(partial=True, finalized=False)
+    energy = canonical_energy(complete, [])
+    assert energy["net_grid_balance_kwh"] == pytest.approx(-13.5)
+    assert energy["net_grid_balance_quality"] == "provisional_through_cutoff"
+    assert energy["net_grid_balance_cutoff_utc"] == (start+timedelta(hours=1)).isoformat()
+    partial = combine_interval_records([row(0, 13.6, .1), row(1, 3, None)], expected_start=start, expected_end=start+timedelta(hours=2))
+    partial.update(partial=True, finalized=False)
+    energy = canonical_energy(partial, [])
+    assert energy["net_grid_balance_kwh"] == pytest.approx(-13.5)
+    assert energy["net_grid_balance_quality"] == "partial_matched_subtotal"
+    mismatched = combine_interval_records([row(0, 13.6, None), row(1, None, .1)], expected_start=start, expected_end=start+timedelta(hours=2))
+    assert canonical_energy(mismatched, [])["net_grid_balance_kwh"] is None
+
+
+@pytest.mark.parametrize("imported,exported,source,expected", [
+    (13.6, 0, "recorder_states", -13.6), (1, 4, "recorder_states", 3),
+    (None, 1, "recorder_states", None), (1, None, "recorder_states", None),
+    (1, 2, "recorder_states_unreliable", None),
+])
+def test_net_grid_rejects_missing_or_unreliable_sources(imported, exported, source, expected):
+    record = {"import_kwh": imported, "export_kwh": exported,
+              "period_start_utc": "2026-11-01T00:00:00+00:00", "period_end_utc": "2026-11-01T01:00:00+00:00",
+              "provenance": {"counter_collection": {"site.import": source}}}
+    assert canonical_energy(record, [])["net_grid_balance_kwh"] == expected
+
+
 def test_october_missing_pv_day_keeps_supported_subtotal_without_ratios():
     rows = []
     for index, pv in enumerate((12.0, None, 8.0), 1):

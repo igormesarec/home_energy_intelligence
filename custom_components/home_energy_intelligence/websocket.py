@@ -347,6 +347,13 @@ async def ws_v02_report(hass, connection, msg):
         coordinator.database.history_period, start.isoformat(), end.isoformat()
     )
     local_today = datetime.now(UTC).astimezone(ZoneInfo(coordinator.timezone)).date()
+    local_yesterday = local_today - timedelta(days=1)
+    if (start <= local_yesterday <= end and not any(
+        str(item.get("local_date")) == local_yesterday.isoformat() and not item.get("temperature_only")
+        for item in records
+    )):
+        provisional_yesterday = await _provisional_completed_day_snapshot(hass, coordinator, local_yesterday)
+        records = prefer_authoritative_daily(records, provisional_yesterday)
     if start <= local_today <= end:
         partial_today, _hours, _coverage, _cutoff, _today = (
             await _current_day_snapshot(hass, coordinator)
@@ -1286,7 +1293,8 @@ async def ws_csv(hass, connection, msg):
               "idle_kwh", "other_hvac_kwh", "other_household_kwh", "unknown_kwh",
               "unallocated_discrepancy_kwh", "known_space_heating_kwh", "known_dhw_kwh",
               "known_cooling_kwh", "known_idle_kwh", "known_other_hvac_kwh",
-              "pv_kwh", "import_kwh", "export_kwh",
+              "pv_kwh", "import_kwh", "export_kwh", "net_grid_balance_kwh",
+              "net_grid_balance_quality", "net_grid_balance_cutoff_utc",
               "complete", "quality", "partial", "finalized", "cutoff_utc",
               "date_coverage_percent", "meter_coverage_percent",
               "allocation_coverage_percent", "allocation_coverage_known"]
