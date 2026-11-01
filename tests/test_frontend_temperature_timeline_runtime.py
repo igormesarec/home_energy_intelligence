@@ -89,6 +89,20 @@ def _timeline(*, missing=(), available_only=None):
     }
 
 
+def test_daily_temperature_axes_show_dates_for_both_sources():
+    timeline = _timeline()
+    timeline.update(resolution="daily", start_date="2026-10-01", end_date="2026-10-05",
+                    range_start_utc="2026-09-30T22:00:00+00:00",
+                    range_end_utc="2026-10-05T22:00:00+00:00", axis_ticks=[])
+    timeline["intervals"] = timeline["intervals"][:5]
+    for index, row in enumerate(timeline["intervals"], 1):
+        row["local_date"] = f"2026-10-0{index}"
+        row["start_utc"] = f"2026-10-0{index}T00:00:00+00:00"
+    html = _render({"timeline": timeline, "twice": True})
+    assert html.count(">10-01</text>") == 2
+    assert html.count(">10-05</text>") == 2
+
+
 def test_yesterday_renders_real_hourly_points_time_axis_and_accessible_details():
     html = _render({"timeline": _timeline()})
     assert html.count('class="temp-point') == 24

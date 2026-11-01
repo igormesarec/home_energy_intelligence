@@ -170,6 +170,46 @@ def _allocation_subtotal(item: dict[str, Any], *keys: str) -> float | None:
     return _sum_complete(item.get(key) for key in keys)
 
 
+def _known_allocation_subtotal(records, equipment, kind, categories):
+    """Sum explicitly recorded categories only, preserving absence as unknown."""
+    ids = {str(item.get("equipment_id")) for item in equipment
+           if item.get("enabled", True) and item.get("kind") == kind}
+    values = []
+    for record in records:
+        for equipment_id, allocation in (record.get("allocations") or {}).items():
+            if str(equipment_id) not in ids or not isinstance(allocation, dict):
+                continue
+            if allocation.get("meter_kwh") is None or allocation.get("quality") in {"missing_counter", "unreconciled"}:
+                continue
+            entries = allocation.get("categories") or {}
+            for key in categories:
+                value = entries.get(key)
+                if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    values.append(float(value))
+    return sum(values) if values else None
+
+
+def _dhw_zero_proven(records, equipment):
+    ids = [str(item.get("equipment_id")) for item in equipment
+           if item.get("enabled", True) and item.get("kind") == "heat_pump"]
+    if not ids or not records:
+        return False
+    for record in records:
+        for equipment_id in ids:
+            allocation = (record.get("allocations") or {}).get(equipment_id) or {}
+            categories = allocation.get("categories") or {}
+            if (allocation.get("quality") not in {"good", "filtered"}
+                    or allocation.get("meter_kwh") is None
+                    or float(allocation.get("coverage_percent") or 0) < 99.999
+                    or any(float(value or 0) != 0 for value in (
+                        categories.get("dhw"), categories.get("unknown"),
+                        categories.get("heating_assumed"), allocation.get("residual_kwh"),
+                        allocation.get("heating_assumed_unknown_mode_kwh"),
+                    ))):
+                return False
+    return True
+
+
 def _equipment_total(
     devices: list[dict[str, Any]], *keys: str, optional_when_empty: bool = False,
 ) -> float | None:
@@ -467,6 +507,7 @@ def build_rolling_month_report(
             "ecodan_confirmed_heating_electricity_kwh": confirmed,
             "ecodan_heating_electricity_kwh": shelly_heating,
             "ecodan_dhw_electricity_kwh": shelly_dhw,
+            "ecodan_dhw_zero_proven": _dhw_zero_proven(records, equipment),
             "ecodan_idle_other_kwh": shelly_idle_other,
             "ecodan_assumed_heating_kwh": assumed,
             "ecodan_assumed_heating_percent": (
@@ -475,6 +516,18 @@ def build_rolling_month_report(
             ),
             "ac_heating_electricity_kwh": ac_heating,
             "ac_cooling_electricity_kwh": ac_cooling,
+            "known_ecodan_heating_electricity_kwh": _known_allocation_subtotal(
+                records, equipment, "heat_pump", ("confirmed_heating", "heating", "heating_assumed")
+            ),
+            "known_ecodan_dhw_electricity_kwh": _known_allocation_subtotal(
+                records, equipment, "heat_pump", ("dhw",)
+            ),
+            "known_ac_heating_electricity_kwh": _known_allocation_subtotal(
+                records, equipment, "air_conditioner", ("heating", "heating_selected", "heating_estimated")
+            ),
+            "known_ac_cooling_electricity_kwh": _known_allocation_subtotal(
+                records, equipment, "air_conditioner", ("cooling", "cooling_selected", "cooling_estimated")
+            ),
             "whole_house_heating_electricity_kwh": whole_house_heating,
             "whole_house_heating_kwh_m2": (
                 float(whole_house_heating) / float(floor_area_m2)

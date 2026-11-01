@@ -106,6 +106,45 @@ process.stdout.write(panel.copView());
     assert "Space heating COP<b>Unavailable" in output
 
 
+def test_house_profile_uses_configured_area_qualified_points_and_separate_thermal():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.heatingIntensity=true;
+panel.responseProfileData={points:Array.from({length:10},(_,i)=>({status:'validated',outdoor_mean_c:i,heating_electricity_kwh:17+i*1.7,local_date:`2026-01-${String(i+1).padStart(2,'0')}`,outdoor_coverage_percent:100,equipment_heating:[]})).concat([{status:'excluded',outdoor_mean_c:50,heating_electricity_kwh:999,exclusion_reasons:['partial']}])};
+panel.monthlyReport={rows:[{month:'2026-09',period_coverage:{allocation_coverage:{complete:true},date_coverage:{complete_through_available_cutoff:true}},ecodan_heating_electricity_kwh:10,ac_heating_electricity_kwh:7,whole_house_heating_electricity_kwh:17,heating_thermal_kwh:34,dhw_thermal_kwh:8,ecodan_dhw_electricity_kwh:3,ac_cooling_electricity_kwh:2,quality:'good',snapshot_status:'final'},{month:'2026-10',period_coverage:{allocation_coverage:{complete:false},date_coverage:{complete_through_available_cutoff:true}},ecodan_heating_electricity_kwh:0,quality:'partial',snapshot_status:'partial'}]};
+process.stdout.write(panel.scatterChart()+'\n'+panel.monthlyHouseProfile());
+panel.responseProfileData.points=panel.responseProfileData.points.slice(0,2);process.stdout.write('\n---\n'+panel.scatterChart());
+""", {})
+    output, insufficient = output.split("\n---\n")
+    assert "Configured area: 170 m" in output
+    assert "0.100 kWh/m" in output
+    assert "y = 0.0100x + 0.1000" in output and "1.000" in output
+    assert "1 excluded day(s)" in output
+    assert "0.10" in output and "34.00" in output
+    assert "AC units provide measured electrical consumption" in output
+    assert "DHW controller kWh" in output and "Unavailable" in output
+    assert "max-width:100%;overflow-x:auto" in output
+    assert "Trendline: Unavailable" in insufficient
+
+
+def test_monthly_profile_loads_weighted_outdoor_and_separates_dhw_sources():
+    output = run_panel(r"""
+(async()=>{
+panel.overviewData={floor_area_m2:170};panel.monthlyProfileNormalized=true;
+panel.representativeSource=()=>({source_id:'outdoor',entity_id:'sensor.outdoor'});
+panel.monthlyReport={months:['2026-09'],rows:[{month:'2026-09',period_coverage:{allocation_coverage:{complete:true},date_coverage:{complete_through_available_cutoff:true}},whole_house_heating_electricity_kwh:17,heating_thermal_kwh:34,dhw_thermal_kwh:8,ecodan_dhw_electricity_kwh:0,provisional_shelly_dhw_electricity_kwh:5,vendor_dhw_electricity_kwh:6,ecodan_assumed_heating_kwh:10,quality:'partial',snapshot_status:'final'}]};
+panel._hass={callWS:async(msg)=>({intervals:[{local_date:'2026-09-01',temperatures:{outdoor:{mean:10,valid_seconds:82800,expected_seconds:82800}}},{local_date:'2026-09-02',temperatures:{outdoor:{mean:20,valid_seconds:3600,expected_seconds:90000}}}]})};
+await panel.loadProfileOutdoor();process.stdout.write(panel.monthlyHouseProfile());
+})();
+""", {})
+    assert "10.42" in output and "50% coverage" in output
+    assert "0.200 kWh thermal/m" in output
+    assert "DHW: 8.000 kWh thermal" in output
+    assert "Provisional Shelly DHW: 5.000 kWh" in output
+    assert "Vendor-reported DHW: 6.000 kWh" in output
+    assert "Classified Shelly DHW: 0.000" not in output
+    assert "alternative evidence, not additive" in output
+
+
 def test_rolling_13_month_chart_table_and_distinct_snapshot_form_render():
     output = run_panel(r"""
 panel.monthlyReport=input.report;panel.monthlyMetricIds=input.report.default_metric_ids;
@@ -147,3 +186,101 @@ def test_monthly_mobile_contract_has_scroll_and_touch_sized_controls():
     assert ".monthly-chart-wrap{max-width:100%;overflow-x:auto" in source
     assert ".monthly-controls input{min-height:44px}" in source
     assert "monthly_report_csv" in source
+
+
+def test_house_profile_shows_partial_ac_and_only_proven_zero_dhw():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.profileOutdoorRows=[];
+const coverage={date_coverage:{complete_through_available_cutoff:true},allocation_coverage:{complete:true}};
+panel.monthlyReport={rows:[
+ {month:'2026-09',period_coverage:{},known_ac_heating_electricity_kwh:11.7,known_ac_cooling_electricity_kwh:78.7,known_ecodan_heating_electricity_kwh:null,quality:'partial'},
+ {month:'2026-10',period_coverage:coverage,ecodan_dhw_electricity_kwh:0,ecodan_dhw_zero_proven:true,quality:'good'},
+ {month:'2026-11',period_coverage:coverage,ecodan_dhw_electricity_kwh:0,ecodan_dhw_zero_proven:false,quality:'partial'}]};
+process.stdout.write(panel.monthlyHouseProfile());
+""", {})
+    assert "11.70" in output and "78.70" in output
+    assert "Partial known subtotal" in output
+    september = output.split('<tr><td>2026-09</td>', 1)[1].split('</tr>', 1)[0]
+    october = output.split('<tr><td>2026-10</td>', 1)[1].split('</tr>', 1)[0]
+    november = output.split('<tr><td>2026-11</td>', 1)[1].split('</tr>', 1)[0]
+    assert "Unavailable" in september
+    assert "<td>0.00</td>" in october
+    assert "<td>0.00</td>" not in november
+
+
+def test_scatter_rejects_positive_slope_and_uses_configured_area():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.heatingIntensity=true;
+panel.responseProfileData={points:Array.from({length:10},(_,i)=>({status:'validated',local_date:`2026-09-${String(i+1).padStart(2,'0')}`,outdoor_mean_c:i,heating_electricity_kwh:17+i,outdoor_coverage_percent:100,equipment_heating:[]}))};
+process.stdout.write(panel.scatterChart());
+""", {})
+    assert "Exploratory statistical fit, not a validated physical model" in output
+    assert "1.000" in output and "10 qualified days" in output
+    assert "0.100 kWh/m" in output and "170 m" in output
+    assert "observed 0.0" in output and "9.0" in output
+
+
+def test_monthly_outdoor_mean_uses_valid_elapsed_seconds_and_keeps_gaps():
+    output = run_panel(r"""
+panel.monthlyReport={months:['2026-10']};panel.representativeSource=()=>({source_id:'out'});
+panel._hass={callWS:async()=>({intervals:[
+ {local_date:'2026-10-24',temperatures:{out:{mean:5,valid_seconds:86400,expected_seconds:86400}}},
+ {local_date:'2026-10-25',temperatures:{out:{mean:10,valid_seconds:3600,expected_seconds:90000}}},
+ {local_date:'2026-10-26',temperatures:{out:{mean:null,valid_seconds:0,expected_seconds:86400}}}]})};
+(async()=>{await panel.loadProfileOutdoor();process.stdout.write(JSON.stringify(panel.profileOutdoorRows));})();
+""", {})
+    result = json.loads(output)[0]
+    assert result["mean"] == pytest.approx((5 * 86400 + 10 * 3600) / 90000)
+    assert result["coverage"] == pytest.approx(100 * 90000 / 262800)
+
+
+def test_overview_partial_pv_and_signed_net_grid():
+    output = run_panel(r"""
+panel.historySummary={known_pv_kwh:20,energy:{pv_kwh:null,import_kwh:30,export_kwh:40}};
+process.stdout.write(JSON.stringify(panel.kpis())+'\n'+panel.pvPeriodMetrics(panel.historySummary));
+""", {})
+    assert '"PV Generation",null,"amber","kWh",20' in output
+    assert "known subtotal" in output and "-10.0 kWh" in output
+    assert "Self-sufficiency" in output and "Unavailable" in output
+
+
+def test_pv_coverage_separates_missing_records_and_measurements():
+    output = run_panel(r"""
+panel.historyCoverage={meter_coverage:{fields:{pv_kwh:{complete:false,coverage_percent:50,available_days:2,missing_record_dates:['2026-10-01'],missing_measurement_dates:['2026-10-02'],invalid_measurement_dates:['2026-10-03']}}}};
+panel.historySummary={known_pv_kwh:20,energy:{pv_kwh:null}};
+process.stdout.write(panel.pvPeriodMetrics(panel.historySummary));
+""", {})
+    assert "Partial" in output and "50.0%" in output
+    assert "2026-10-01" in output and "2026-10-02" in output and "2026-10-03" in output
+
+
+def test_overview_series_uses_independent_meter_and_equipment_evidence():
+    output = run_panel(r"""
+panel.history=[{local_date:'2026-10-01',quality:'partial',energy:{pv_kwh:12,household_kwh:20,import_kwh:8,export_kwh:3},provenance:{counter_collection:{'site.pv':'recorder_states','site.import':'recorder_states_unreliable','site.export':'recorder_states'}}}];
+panel.v02Report={whole_house_heating:[{local_date:'2026-10-01',calendar_period_finalized:true,complete_through_cutoff:true,classification_complete:false,heat_pumps:[{display_name:'HP',electricity_kwh:3,heating_evidence_complete:false,quality:'partial'}],air_conditioners:[{display_name:'AC',electricity_kwh:2,heating_evidence_complete:true,quality:'good'}]}]};
+process.stdout.write(panel.overviewSeries('pv')+'\n'+panel.overviewSeries('heating'));
+""", {})
+    assert 'opacity="1"><title>2026-10-01 · PV 12.00 kWh' in output
+    assert 'Import 8.00 kWh' not in output and 'Net grid 5.00 kWh' not in output
+    assert 'opacity="0.55"><title>2026-10-01 · Heat pump heating 3.00 kWh' in output
+    assert 'opacity="1"><title>2026-10-01 · AC heating 2.00 kWh' in output
+
+
+def test_heating_series_distinguishes_finalized_cutoff_partial_and_estimates():
+    output = run_panel(r"""
+const device=(v,complete=true,extra={})=>({display_name:'Device',electricity_kwh:v,heating_evidence_complete:complete,quality:'good',...extra});
+panel.v02Report={whole_house_heating:[
+ {local_date:'2026-10-01',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(2)],air_conditioners:[device(0)]},
+ {local_date:'2026-10-02',calendar_period_finalized:false,complete_through_cutoff:true,cutoff_utc:'2026-10-02T12:00:00Z',heat_pumps:[device(3)],air_conditioners:[device(1)]},
+ {local_date:'2026-10-03',calendar_period_finalized:false,complete_through_cutoff:false,heat_pumps:[device(4)],air_conditioners:[device(1),device(null,false)]},
+ {local_date:'2026-10-04',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(5,true,{assumed_kwh:2})],air_conditioners:[device(2,true,{selected_kwh:1})]},
+ {local_date:'2026-10-05',calendar_period_finalized:true,complete_through_cutoff:true,heat_pumps:[device(null,false)],air_conditioners:[]} ]};
+process.stdout.write(panel.overviewSeries('heating'));
+""", {})
+    assert 'opacity="1"><title>2026-10-01 · Heat pump heating 2.00 kWh · complete finalized day' in output
+    assert 'opacity="1"><title>2026-10-01 · AC heating 0.00 kWh · complete finalized day' in output
+    assert 'opacity="0.55"><title>2026-10-02 · Heat pump heating 3.00 kWh · provisional through cutoff' in output
+    assert '2026-10-03 · AC heating 1.00 kWh · partial known subtotal' in output
+    assert '2026-10-04 · Heat pump heating 5.00 kWh · estimated or assumed heating' in output
+    assert '2026-10-04 · AC heating 2.00 kWh · estimated or assumed heating' in output
+    assert '2026-10-05 · Heat pump heating' not in output

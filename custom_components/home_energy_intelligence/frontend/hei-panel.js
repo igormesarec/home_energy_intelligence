@@ -56,6 +56,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.monthlyEndMonth = null;
     this.monthlyMetricIds = null;
     this.temperatureChartSequence = 0;
+    this.heatingIntensity=false;this.heatingTrendVisible=true;this.monthlyProfileNormalized=false;
+    this.profileOutdoorRows=[];
   }
 
   set hass(value) {
@@ -64,6 +66,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if (first) {
       this.load();
       this._poll = window.setInterval(() => this.load(false), 5 * 60 * 1000);
+      try {const id=Number(window.sessionStorage?.getItem("hei_temperature_backfill_job"));if(id>0){this.temperatureBackfillJob={job_id:id};this.pollTemperatureBackfill();}} catch (_) { /* Storage can be disabled by the browser. */ }
     }
   }
   set panel(value) { this._panel = value; }
@@ -130,9 +133,24 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     if(!this.monthlyEndMonth)return;
     this.monthlyReport=await this._hass.callWS({type:"home_energy_intelligence/monthly_report",end_month:this.monthlyEndMonth,count:13});
     this.monthlyMetricIds ||= [...(this.monthlyReport.default_metric_ids||[])];
+    await this.loadProfileOutdoor();
     try{this.monthlyLedger=await this._hass.callWS({type:"home_energy_intelligence/monthly_ecodan_snapshots",start_month:this.monthlyReport.months?.[0],end_month:this.monthlyReport.months?.at(-1)});}
     catch(error){if(!String(error?.code||error?.message||error).includes("unauthorized"))throw error;this.monthlyLedger=null;}
     if(shouldRender)this.render();
+  }
+
+  async loadProfileOutdoor() {
+    this.profileOutdoorRows=[];
+    const source=this.representativeSource("outdoor"),months=this.monthlyReport?.months||[];
+    if(!source||!months.length)return;
+    const last=months.at(-1),year=Number(last.slice(0,4)),month=Number(last.slice(5,7));
+    const days=[31,(year%4===0&&(year%100!==0||year%400===0))?29:28,31,30,31,30,31,31,30,31,30,31][month-1];
+    try {
+      const data=await this._hass.callWS({type:"home_energy_intelligence/temperature_timeline",start_date:`${months[0]}-01`,end_date:`${last}-${days}`,resolution:"daily",source_ids:[source.source_id]});
+      const grouped=new Map();
+      for(const interval of data.intervals||[]){const key=interval.local_date.slice(0,7),item=interval.temperatures?.[source.source_id];if(!item)continue;const row=grouped.get(key)||{key,valid:0,expected:0,total:0};row.expected+=Number(item.expected_seconds)||0;if(item.mean!=null&&item.valid_seconds>0){row.valid+=Number(item.valid_seconds);row.total+=Number(item.mean)*Number(item.valid_seconds);}grouped.set(key,row);}
+      this.profileOutdoorRows=[...grouped.values()].map((row)=>({key:row.key,mean:row.valid?row.total/row.valid:null,coverage:row.expected?100*row.valid/row.expected:null}));
+    }catch(error){this.profileOutdoorRows=[];this.profileOutdoorError=error?.message||String(error);}
   }
 
   fullCalendarMonth(period) {
@@ -219,9 +237,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       ["mdi:flash", "Whole-House Electricity", energy.household_kwh, "blue", "kWh", r.known_household_kwh],
       ["mdi:radiator", "Heating Electricity", energy.space_heating_kwh, "red", "kWh", energy.known_space_heating_kwh],
       ["mdi:water", "DHW Electricity", energy.dhw_kwh, "orange", "kWh", energy.known_dhw_kwh],
-      ["mdi:heat-wave", "Heating + DHW", energy.heating_and_dhw_kwh, "orange", "kWh", energy.known_space_heating_kwh == null ? null : energy.known_space_heating_kwh + (energy.known_dhw_kwh || 0)],
+      ["mdi:heat-wave", "Heating + DHW", energy.heating_and_dhw_kwh, "orange", "kWh"],
       ["mdi:snowflake", "Cooling Electricity", energy.cooling_kwh, "blue", "kWh", energy.known_cooling_kwh],
-      ["mdi:white-balance-sunny", "PV Generation", energy.pv_kwh, "amber"],
+      ["mdi:white-balance-sunny", "PV Generation", energy.pv_kwh, "amber", "kWh", r.known_pv_kwh],
       ["mdi:leaf", "Self-Sufficiency", energy.self_sufficiency_percent, "green", "%"],
     ];
   }
@@ -280,34 +298,39 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       const segment=(name,value,css)=>Number.isFinite(value)&&value>0?`<i class="seg ${css}" style="height:${value*scale}px" title="${esc(name)}: ${n(value)} kWh · ${n(total>0?100*value/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}"></i>`:"";
       const unavailable=[["heating",heat],["DHW",dhw],["cooling",cool],["idle",idle],["other HVAC",otherHvac],["other household",other],["unallocated",unknown]].filter(([,value])=>value==null).map(([name])=>name);
       return `<div class="bar-col" title="${esc(r.local_date)}">
-        <div class="bar" style="height:${Math.max(2,(total||0)*scale)}px">${segment("Unallocated",unknown,"unknown")}${segment("Other household",other,"other")}${segment("Other HVAC (fan/dry)",otherHvac,"other-hvac")}${segment("Idle/standby",idle,"idle")}${segment(r.energy?.cooling_kwh==null&&cool!=null?"Known partial cooling":"Cooling",cool,"cool")}${segment(r.energy?.dhw_kwh==null&&dhw!=null?"Known partial DHW":"DHW",dhw,"dhw")}${segment(r.energy?.space_heating_kwh==null&&heat!=null?"Known partial space heating":"Space heating",heat,"heat")}</div>
-        <div class="split-quality">${this.splitQuality(r)}</div>
-        ${unavailable.length?`<small class="muted" title="Unavailable is not measured zero">Unavailable: ${unavailable.map(esc).join(", ")}</small>`:""}${discrepancy!=null&&Math.abs(discrepancy)>.05?`<b class="discrepancy" title="Discrepancy: ${n(discrepancy)} kWh · ${n(total?100*discrepancy/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Δ ${n(discrepancy)}</b>`:""}${other!=null&&other<0?`<b class="discrepancy" title="Other household: ${n(other)} kWh · ${n(total?100*other/total:null)}% · ${esc(r.energy?.quality || r.quality)} · ${esc(r.local_date)}">Other ${n(other)}</b>`:""}<span>${esc(r.local_date.slice(5))}${r.partial===true||r.finalized===false?" partial":""}</span></div>`;
+        <div class="bar-plot"><div class="bar" style="height:${Math.max(2,(total||0)*scale)}px">${segment("Unallocated",unknown,"unknown")}${segment("Other household",other,"other")}${segment("Other HVAC (fan/dry)",otherHvac,"other-hvac")}${segment("Idle/standby",idle,"idle")}${segment(r.energy?.cooling_kwh==null&&cool!=null?"Known partial cooling":"Cooling",cool,"cool")}${segment(r.energy?.dhw_kwh==null&&dhw!=null?"Known partial DHW":"DHW",dhw,"dhw")}${segment(r.energy?.space_heating_kwh==null&&heat!=null?"Known partial space heating":"Space heating",heat,"heat")}</div></div>
+        <span>${esc(r.local_date.slice(5))}</span><details class="split-details"><summary>Quality</summary><div class="split-quality">${this.splitQuality(r)}</div>${unavailable.length?`<small title="Unavailable is not measured zero">Unavailable: ${unavailable.map(esc).join(", ")}</small>`:""}${discrepancy!=null&&Math.abs(discrepancy)>.05?`<b class="discrepancy">Δ ${n(discrepancy)} kWh</b>`:""}${other!=null&&other<0?`<b class="discrepancy">Other ${n(other)} kWh</b>`:""}</details></div>`;
     }).join("")}</div></div><div class="legend"><i class="dot heat"></i>Heating <i class="dot dhw"></i>DHW <i class="dot cool"></i>Cooling <i class="dot idle"></i>Idle <i class="dot other-hvac"></i>Other HVAC <i class="dot other"></i>Other household <i class="dot unknown"></i>Unallocated <b class="discrepancy">Δ discrepancy (signed)</b></div>`;
   }
 
   scatterChart() {
     const evidence=this.responseProfileData?.points||[];
     const excluded=evidence.filter((point)=>point.status!=="validated");
-    const points=evidence.filter((point)=>point.status==="validated").map((point)=>[
-      Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh),point.local_date,
+    const area=Number(this.overviewData?.floor_area_m2);
+    const points=evidence.filter((point)=>point.status==="validated"&&point.outdoor_mean_c!=null&&point.heating_electricity_kwh!=null&&(!this.heatingIntensity||area>0)).map((point)=>[
+      Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh)/(this.heatingIntensity?area:1),point.local_date,
       point.outdoor_coverage_percent,point.equipment_heating||[],
     ]);
     const diagnostics=excluded.length?`<details><summary>${excluded.length} excluded day(s) — qualification evidence</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Outdoor</th><th>Coverage</th><th>Heating</th><th>Reason</th></tr></thead><tbody>${excluded.map((point)=>`<tr><td>${esc(point.local_date)}</td><td>${n(point.outdoor_mean_c)} °C</td><td>${point.outdoor_coverage_percent==null?"Unavailable":n(point.outdoor_coverage_percent,2)+"%"}</td><td>${n(point.heating_electricity_kwh)} kWh</td><td>${esc((point.exclusion_reasons||[]).join(", "))}</td></tr>`).join("")}</tbody></table></div></details>`:"";
-    if (!points.length) return `<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
+    const controls=`<div class="monthly-controls"><label>Y-axis <select class="heating-axis"><option value="energy" ${!this.heatingIntensity?"selected":""}>kWh/day</option><option value="intensity" ${this.heatingIntensity?"selected":""}>kWh/m²/day</option></select></label><label><input class="heating-trend" type="checkbox" ${this.heatingTrendVisible?"checked":""}> Show Trendline</label><span>Configured area: ${area>0?n(area,0)+" m²":"Unavailable"}</span></div>`;
+    if (!points.length) return `${controls}<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
     const xs = points.map((p) => p[0]); const ys = points.map((p) => p[1]);
     const xmin = Math.min(...xs) - 1, xmax = Math.max(...xs) + 1;
     const ymax = Math.max(1, ...ys) * 1.1;
     const px = (x) => 42 + ((x - xmin) / Math.max(1, xmax - xmin)) * 480;
     const py = (y) => 180 - (y / ymax) * 145;
-    const numericAxes=this.axisTicks(0,ymax).map((value)=>`<text x="4" y="${py(value)+4}">${n(value,1)} kWh</text>`).join("")+this.axisTicks(xmin,xmax).map((value)=>`<text x="${px(value)}" y="205" text-anchor="middle">${n(value,1)} °C</text>`).join("");
-    return `<svg viewBox="0 0 550 215" class="chart" role="img" aria-label="Heating electricity versus outdoor temperature">
+    const unit=this.heatingIntensity?"kWh/m²/day":"kWh/day";
+    const numericAxes=this.axisTicks(0,ymax).map((value)=>`<text x="4" y="${py(value)+4}">${n(value,this.heatingIntensity?3:1)}</text>`).join("")+this.axisTicks(xmin,xmax).map((value)=>`<text x="${px(value)}" y="205" text-anchor="middle">${n(value,1)} °C</text>`).join("");
+    const meanX=xs.reduce((a,b)=>a+b,0)/xs.length,meanY=ys.reduce((a,b)=>a+b,0)/ys.length,varianceX=xs.reduce((s,x)=>s+(x-meanX)**2,0),varianceY=ys.reduce((s,y)=>s+(y-meanY)**2,0);
+    const slope=points.length>=3&&varianceX>0&&varianceY>0?xs.reduce((s,x,i)=>s+(x-meanX)*(ys[i]-meanY),0)/varianceX:null;
+    const intercept=slope==null?null:meanY-slope*meanX,r2=slope==null?null:1-ys.reduce((s,y,i)=>s+(y-(intercept+slope*xs[i]))**2,0)/varianceY;
+    const observedMin=Math.min(...xs),observedMax=Math.max(...xs),validated=slope!=null&&slope<0&&points.length>=10&&observedMax-observedMin>=8&&r2>=.5;
+    const trend=slope==null?"Unavailable":`${validated?"Validated physical heating response":"Exploratory statistical fit, not a validated physical model"} · y = ${n(slope,4)}x ${intercept<0?"−":"+"} ${n(Math.abs(intercept),4)} ${unit} · slope ${n(slope,4)} ${unit}/°C · R² ${n(r2,3)} · ${points.length} qualified days · ${excluded.length} excluded days · observed ${n(observedMin)}–${n(observedMax)} °C`;
+    return `${controls}<svg viewBox="0 0 550 215" class="chart" style="overflow:hidden" role="img" aria-label="Heating electricity versus outdoor temperature"><defs><clipPath id="heating-scatter-plot"><rect x="42" y="35" width="480" height="145"/></clipPath></defs>
       ${numericAxes}
       ${[0, .25, .5, .75, 1].map((v) => `<line x1="42" x2="522" y1="${35 + v * 145}" y2="${35 + v * 145}" />`).join("")}
-      <text x="8" y="40">${n(ymax)}</text><text x="22" y="183">0</text>
-      ${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1])} kWh electric · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh`).join(" · ")}</title></circle>`).join("")}
-      <text x="42" y="205">${n(xmin)} °C</text><text x="480" y="205">${n(xmax)} °C</text>
-    </svg>${diagnostics}`;
+      <g clip-path="url(#heating-scatter-plot)">${this.heatingTrendVisible&&slope!=null?`<line x1="${px(observedMin)}" y1="${py(intercept+slope*observedMin)}" x2="${px(observedMax)}" y2="${py(intercept+slope*observedMax)}" style="stroke:#ef4444;stroke-width:2;${validated?"":"stroke-dasharray:5 4"}"/>`:""}${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1],this.heatingIntensity?3:1)} ${unit} · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh (confirmed ${n(item.confirmed_heating_kwh)}, assumed/selected/estimated ${n(item.uncertain_heating_kwh)}; ${esc(item.classification_quality)})`).join(" · ")}</title></circle>`).join("")}</g>
+    </svg><p class="muted">${unit} · Trendline: ${esc(trend)}</p>${diagnostics}`;
   }
 
   responseProfile() {
@@ -326,21 +349,25 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   responseCurve(points, {kind="heating", thermal=false}={}) {
-    const usable=(points||[]).filter((point)=>point.outdoor_mean_c!=null);
-    if(!usable.length)return `<div class="empty">No matched measured intervals with a validated outdoor temperature.</div>`;
+    const valueFor=(point)=>kind==="cooling"?(point.ac_cooling_kwh??point.ac_cooling_known_subtotal_kwh):(point.whole_house_heating_kwh??point.whole_house_heating_known_subtotal_kwh);
+    const validOutdoor=(point)=>point.outdoor_mean_c!=null&&Number.isFinite(Number(point.outdoor_mean_c))&&![-55,155].includes(Number(point.outdoor_mean_c))&&point.outdoor_coverage_percent!=null&&Number(point.outdoor_coverage_percent)>=95;
+    const missingOutdoor=thermal?[]:(points||[]).filter((point)=>valueFor(point)!=null&&!validOutdoor(point));
+    const fallback=missingOutdoor.length?`<div class="table-wrap"><p class="muted">Daily electricity by date — not a temperature-response curve (outdoor evidence unavailable or incomplete).</p><table><thead><tr><th>Date</th><th>Known electricity kWh</th><th>Evidence</th></tr></thead><tbody>${missingOutdoor.map((point)=>`<tr><td>${esc(point.local_date)}</td><td>${n(valueFor(point),2)}</td><td>${(kind==="cooling"?point.ac_cooling_kwh:point.whole_house_heating_kwh)==null?"Partial known subtotal":"Complete classification"}</td></tr>`).join("")}</tbody></table></div>`:"";
+    const usable=(points||[]).filter((point)=>thermal?point.outdoor_mean_c!=null:validOutdoor(point));
+    if(!usable.length)return `<div class="empty">No matched measured intervals with a validated outdoor temperature.</div>${fallback}`;
     const values=usable.flatMap((point)=>thermal
       ? [point[`${kind}_electricity_kwh`],point[`${kind}_thermal_delta_kwh`]].filter((value)=>value!=null)
-      : [kind==="cooling"?point.ac_cooling_kwh:point.whole_house_heating_kwh].filter((value)=>value!=null));
-    if(!values.length)return `<div class="empty">Measurements exist, but this category is unavailable for the exact selected interval.</div>`;
+      : [valueFor(point)].filter((value)=>value!=null));
+    if(!values.length)return `<div class="empty">Measurements exist, but this category is unavailable for the exact selected interval.</div>${fallback}`;
     if(kind==="cooling"&&!thermal&&values.every((value)=>Number(value)===0))return `<div class="empty">Measured AC cooling electricity: 0.0 kWh for the selected intervals.</div>`;
     const minX=Math.min(...usable.map((point)=>point.outdoor_mean_c)),maxX=Math.max(...usable.map((point)=>point.outdoor_mean_c));
     const maxY=Math.max(1,...values);const px=(value)=>45+(Number(value)-minX)*450/Math.max(1,maxX-minX);const py=(value)=>175-Number(value)*140/maxY;
     const numericAxes=this.axisTicks(0,maxY).map((value)=>`<g><line x1="45" x2="495" y1="${py(value)}" y2="${py(value)}"/><text x="4" y="${py(value)+4}">${n(value,1)} kWh</text></g>`).join("")+this.axisTicks(minX,maxX).map((value)=>`<g><line x1="${px(value)}" x2="${px(value)}" y1="35" y2="175"/><text x="${px(value)}" y="202" text-anchor="middle">${n(value,1)} °C</text></g>`).join("");
     const marks=numericAxes+usable.map((point)=>{
       if(thermal){const electricity=point[`${kind}_electricity_kwh`],heat=point[`${kind}_thermal_delta_kwh`],cop=point[`${kind}_cop`];return `${electricity==null?"":`<circle class="electric" cx="${px(point.outdoor_mean_c)}" cy="${py(electricity)}" r="5"><title>${n(point.outdoor_mean_c)} °C · electricity ${n(electricity,2)} kWh · ${esc(point.start_utc)}–${esc(point.end_utc)}</title></circle>`}${heat==null?"":`<rect class="thermal" x="${px(point.outdoor_mean_c)-5}" y="${py(heat)-5}" width="10" height="10"><title>${n(point.outdoor_mean_c)} °C · measured thermal ${n(heat,2)} kWh thermal</title></rect>`}${cop==null?"":`<text class="cop-label" x="${px(point.outdoor_mean_c)+7}" y="${py(heat??electricity)-7}">Interval COP ${n(cop,2)}</text>`}`;}
-      const total=kind==="cooling"?point.ac_cooling_kwh:point.whole_house_heating_kwh;const contributions=(kind==="cooling"?point.cooling_units:point.heat_pumps.concat(point.air_conditioners)).map((item)=>`${item.display_name}: ${n(item.electricity_kwh,2)} kWh (${item.quality||"unknown quality"})`).join(" · ");return total==null?"":`<circle cx="${px(point.outdoor_mean_c)}" cy="${py(total)}" r="6"><title>${esc(point.local_date)} · ${n(point.outdoor_mean_c)} °C · ${n(total,2)} kWh · ${esc(contributions)} · normalized ${n(kind==="cooling"?point.normalized_cooling_kwh_m2_day:point.normalized_heating_kwh_m2_day,3)} kWh/m²/day</title></circle>`;
+      const total=valueFor(point),devices=kind==="cooling"?(point.cooling_units||[]):(point.heat_pumps||[]).concat(point.air_conditioners||[]),estimated=kind!=="cooling"&&devices.some(item=>Number(item.assumed_kwh||0)>0||Number(item.selected_kwh||0)>0||Number(item.estimated_kwh||0)>0||["uncertain","estimated"].includes(item.quality)),complete=(kind==="cooling"?point.ac_cooling_kwh:point.whole_house_heating_kwh)!=null&&!estimated,cutoff=kind!=="cooling"&&point.calendar_period_finalized===false&&point.complete_through_cutoff===true&&devices.length>0&&devices.every(item=>item.electricity_kwh!=null&&item.heating_evidence_complete===true);const contributions=devices.map((item)=>`${item.display_name}: ${n(item.electricity_kwh,2)} kWh (${item.quality||"unknown quality"}, coverage ${n(item.coverage_percent,0)}%)`).join(" · ");return total==null?"":`<circle cx="${px(point.outdoor_mean_c)}" cy="${py(total)}" r="6" style="fill:${complete?"#238ee8":"#fff"};stroke:${complete?"#fff":"#d97706"};stroke-width:2"><title>${esc(point.local_date)} · ${complete?"Complete":cutoff?"Provisional through cutoff":estimated?"Estimated or assumed heating":"Partial known subtotal"}${cutoff&&estimated?" · estimated or assumed heating":""} · ${n(point.outdoor_mean_c)} °C (${n(point.outdoor_coverage_percent,0)}% coverage) · ${n(total,2)} kWh · ${esc(contributions)} · normalized ${n(kind==="cooling"?point.normalized_cooling_kwh_m2_day:point.normalized_heating_kwh_m2_day,3)} kWh/m²/day</title></circle>`;
     }).join("");
-    return `<svg viewBox="0 0 530 210" class="chart response-curve" role="img" aria-label="${thermal?`Ecodan ${kind} measured electricity thermal energy and COP`:kind==="cooling"?"Air conditioner cooling electricity versus outdoor temperature":"Whole house heating electricity versus outdoor temperature"}"><line x1="45" x2="495" y1="175" y2="175"/>${marks}<text x="7" y="38">${n(maxY,1)} kWh</text><text x="45" y="201">${n(minX)} °C</text><text x="450" y="201">${n(maxX)} °C</text></svg><div class="legend">${thermal?'<i class="dot electric"></i>Electricity <i class="dot thermal"></i>Measured thermal · COP is ratio on the exact interval':kind==="cooling"?'Per-device AC cooling and combined total':'Ecodan and each AC heating contribution; total and kWh/m²/day in tooltips'}</div>`;
+    return `<svg viewBox="0 0 530 210" class="chart response-curve" style="overflow:hidden;max-width:100%" role="img" aria-label="${thermal?`Ecodan ${kind} measured electricity thermal energy and COP`:kind==="cooling"?"Air conditioner cooling electricity versus outdoor temperature":"Whole house heating electricity versus outdoor temperature"}"><line x1="45" x2="495" y1="175" y2="175"/>${marks}<text x="7" y="38">${n(maxY,1)} kWh</text><text x="45" y="201">${n(minX)} °C</text><text x="450" y="201">${n(maxX)} °C</text></svg><div class="legend">${thermal?'<i class="dot electric"></i>Electricity <i class="dot thermal"></i>Measured thermal · COP is ratio on the exact interval':'Filled: complete · outlined: partial known subtotal'}</div>${fallback}`;
   }
 
   axisTicks(minimum, maximum, count=4) {
@@ -393,12 +420,32 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const hpHeating=addNullable(energy.confirmed_heat_pump_heating_kwh,energy.assumed_heat_pump_heating_kwh);const hpKnown=addNullable(energy.known_confirmed_heat_pump_heating_kwh,energy.known_assumed_heat_pump_heating_kwh);
     const acRows=(energy.equipment||[]).filter((item)=>item.kind==="air_conditioner"),acComplete=acRows.length&&acRows.every((item)=>item.classification_complete);const acKnown=acRows.length?acRows.reduce((sum,item)=>sum+Number(item.known_confirmed_heating_kwh||0)+Number(item.known_selected_heating_kwh||0)+Number(item.known_estimated_heating_kwh||0),0):null;const acHeating=acComplete?acKnown:null;
     const thermalEvidence=(item)=>item?`${n(item.value)} kWh thermal <span class="quality partial">${item.count} exact interval(s); not a filled period total</span>`:`<span class="missing">Unavailable</span>`;
-    return `<article class="card page-card"><h2><ha-icon icon="mdi:home-lightning-bolt-outline"></ha-icon>Whole-House Energy / Toplotni profil hiše</h2><div class="table-wrap"><table><thead><tr><th>Energy path</th><th>Electricity</th><th>Measured thermal</th><th>Evidence</th></tr></thead><tbody><tr><td>Whole-house electricity</td><td>${this.evidence(energy.household_kwh,energy.known_household_kwh)}</td><td>—</td><td>physical household balance; missing remains unavailable</td></tr><tr><td>Ecodan space heating</td><td>${this.evidence(hpHeating,hpKnown)}</td><td>${thermalEvidence(heat)}</td><td>classified Shelly meter / fully contained cumulative intervals</td></tr><tr><td>Ecodan DHW</td><td>${this.evidence(energy.dhw_kwh,energy.known_dhw_kwh)}</td><td>${thermalEvidence(dhw)}</td><td>matched intervals only</td></tr><tr><td>AC heating</td><td>${this.evidence(acHeating,acKnown)}</td><td><span class="missing">Unavailable</span></td><td>AC thermal output unavailable</td></tr><tr><td>AC cooling</td><td>${this.evidence(energy.cooling_kwh,energy.known_cooling_kwh)}</td><td><span class="missing">Unavailable</span></td><td>no AC COP inferred</td></tr><tr><td>Idle / other / unknown</td><td>${this.evidence(addNullable(energy.idle_kwh,energy.other_hvac_kwh,energy.unknown_kwh),addNullable(energy.known_idle_kwh,energy.known_other_hvac_kwh,energy.unknown_kwh))}</td><td>—</td><td>preserved separately</td></tr></tbody></table></div><p class="quality partial">Whole-house thermal total is unavailable while AC thermal output or interval coverage is missing. Known measured subtotals are shown without filling gaps.</p></article>`;
+    const month=this.fullCalendarMonth(this.selectedPeriod),snapshot=month===this.selectedMonthReport?.month?this.selectedMonthReport:null;
+    const source=(this.monthlyLedger?.snapshots||[]).filter((item)=>item.report_month===month).map((item)=>[item.source_label,item.source_reference].filter(Boolean).join(" · ")).join(", ");
+    const thermalDifference=snapshot?.vendor_combined_thermal_kwh!=null&&snapshot?.ecodan_total_generated_thermal_kwh!=null?Number(snapshot.vendor_combined_thermal_kwh)-Number(snapshot.ecodan_total_generated_thermal_kwh):null;
+    const controller=month?`<section><h3>Controller-reported monthly thermal production · ${esc(month)}</h3><p>Heating ${n(snapshot?.heating_thermal_kwh,1)} kWh thermal · DHW ${n(snapshot?.dhw_thermal_kwh,1)} kWh thermal · controller combined ${n(snapshot?.vendor_combined_thermal_kwh,1)} kWh thermal</p><p class="muted">Status ${esc(snapshot?.snapshot_status||"unavailable")} · cutoff ${esc(snapshot?.snapshot_cutoff_utc||"unavailable")} · source ${esc(source||"monthly controller snapshot")} · quality ${esc(snapshot?.quality||"unavailable")}. Category sum ${n(snapshot?.ecodan_total_generated_thermal_kwh,1)} kWh thermal; controller combined minus category sum ${n(thermalDifference,1)} kWh thermal. Monthly reports are not matched interval measurements.</p></section>`:"";
+    return `<article class="card page-card"><h2><ha-icon icon="mdi:home-lightning-bolt-outline"></ha-icon>Whole-House Energy / Toplotni profil hiše</h2><div class="table-wrap"><table><thead><tr><th>Energy path</th><th>Electricity</th><th>Measured interval thermal</th><th>Evidence</th></tr></thead><tbody><tr><td>Whole-house electricity</td><td>${this.evidence(energy.household_kwh,energy.known_household_kwh)}</td><td>—</td><td>physical household balance; missing remains unavailable</td></tr><tr><td>Ecodan space heating</td><td>${this.evidence(hpHeating,hpKnown)}</td><td>${thermalEvidence(heat)}</td><td>classified Shelly meter / fully contained cumulative intervals</td></tr><tr><td>Ecodan DHW</td><td>${this.evidence(energy.dhw_kwh,energy.known_dhw_kwh)}</td><td>${thermalEvidence(dhw)}</td><td>matched intervals only</td></tr><tr><td>AC heating</td><td>${this.evidence(acHeating,acKnown)}</td><td><span class="missing">Unavailable</span></td><td>AC thermal output unavailable</td></tr><tr><td>AC cooling</td><td>${this.evidence(energy.cooling_kwh,energy.known_cooling_kwh)}</td><td><span class="missing">Unavailable</span></td><td>no AC COP inferred</td></tr><tr><td>Idle / other / unknown</td><td>${this.evidence(addNullable(energy.idle_kwh,energy.other_hvac_kwh,energy.unknown_kwh),addNullable(energy.known_idle_kwh,energy.known_other_hvac_kwh,energy.unknown_kwh))}</td><td>—</td><td>preserved separately</td></tr></tbody></table></div><p class="quality partial">Whole-house thermal total is unavailable while AC thermal output or interval coverage is missing. Known measured subtotals are shown without filling gaps.</p>${controller}</article>`;
+  }
+
+  monthlyHouseProfile() {
+    const rows=this.monthlyReport?.rows||[],area=Number(this.overviewData?.floor_area_m2),normalize=this.monthlyProfileNormalized;
+    const outdoorRows=this.profileOutdoorRows||[];
+    const number=(v)=>v==null?"Unavailable":n(v,2);
+    const complete=(row)=>row.period_coverage?.allocation_coverage?.complete===true&&row.period_coverage?.date_coverage?.complete_through_available_cutoff===true;
+    const knownKey={ecodan_heating_electricity_kwh:"known_ecodan_heating_electricity_kwh",ecodan_dhw_electricity_kwh:"known_ecodan_dhw_electricity_kwh",ac_heating_electricity_kwh:"known_ac_heating_electricity_kwh",ac_cooling_electricity_kwh:"known_ac_cooling_electricity_kwh"};
+    const classified=(row,key)=>complete(row)?row[key]:(row[knownKey[key]]??null);
+    const classifiedDhw=(row)=>{const value=classified(row,"ecodan_dhw_electricity_kwh");return value===0&&!(complete(row)&&row.ecodan_dhw_zero_proven)?null:value;};
+    const divided=(value)=>value!=null&&area>0?Number(value)/area:null;
+    const normalized=(value)=>normalize?divided(value):value;
+    const sections=[{title:"Space-heating electricity by equipment",unit:"kWh",series:[["Ecodan (includes assumed)",(r)=>classified(r,"ecodan_heating_electricity_kwh")],["AC (includes selected/estimated)",(r)=>classified(r,"ac_heating_electricity_kwh")]]},{title:"Whole-house space-heating electricity",unit:normalize?"kWh/m²/month":"kWh",series:[["Whole-house",(r)=>normalized(classified(r,"whole_house_heating_electricity_kwh"))]]},{title:"Ecodan space-heating generated thermal energy",unit:normalize?"kWh thermal/m²/month":"kWh thermal",series:[["Heating",(r)=>normalized(r.heating_thermal_kwh)]]},{title:"Ecodan DHW generated thermal energy",unit:"kWh thermal",series:[["DHW",(r)=>r.dhw_thermal_kwh]]},{title:"DHW electricity — alternative evidence, not additive",unit:"kWh",series:[["Classified Shelly DHW",classifiedDhw],["Provisional Shelly DHW",(r)=>r.provisional_shelly_dhw_electricity_kwh],["Vendor-reported DHW",(r)=>r.vendor_dhw_electricity_kwh]]},{title:"AC cooling electricity",unit:"kWh",series:[["AC cooling",(r)=>classified(r,"ac_cooling_electricity_kwh")]]}];
+    const chart=(section)=>{const width=Math.max(520,rows.length*65),step=(width-45)/Math.max(1,rows.length),max=Math.max(1,...rows.flatMap((row)=>section.series.map(([,get])=>Number(get(row))||0)));return `<section><h3>${esc(section.title)} · ${esc(section.unit)}</h3><div style="max-width:100%;overflow-x:auto"><svg viewBox="0 0 ${width} 180" style="width:100%;min-width:${width}px;height:180px" role="img" aria-label="${esc(section.title)}"><text x="0" y="20" font-size="10">${n(max,1)}</text><text x="15" y="145" font-size="10">0</text>${rows.map((row,i)=>section.series.map(([name,get],j)=>{const value=get(row);if(value==null)return "";const bw=step*.75/section.series.length,partial=!complete(row)&&["Ecodan (includes assumed)","AC (includes selected/estimated)","Classified Shelly DHW","AC cooling"].includes(name);return `<rect x="${40+i*step+j*bw}" y="${145-Number(value)*120/max}" width="${Math.max(1,bw-1)}" height="${Number(value)*120/max}" fill="${["#ef4444","#238ee8","#159b5b"][j]}" ${partial?'opacity="0.5" stroke="#222" stroke-dasharray="3 2"':""}><title>${esc(row.month)} · ${esc(name)}: ${n(value,3)} ${esc(section.unit)} · ${partial?"Partial known subtotal · ":""}${esc(row.quality)} · ${esc(row.snapshot_status)}</title></rect>`;}).join("")+`<text x="${40+i*step+step/2}" y="165" text-anchor="middle" font-size="9">${esc(row.month)}</text>`).join("")}</svg></div><div class="legend">${section.series.map(([name],i)=>`<span><i class="dot" style="display:inline-block;background:${["#ef4444","#238ee8","#159b5b"][i]}"></i>${esc(name)}</span>`).join("")} · faded outlined bars: partial known subtotals</div></section>`;};
+    const table=rows.map((r)=>{const heating=classified(r,"whole_house_heating_electricity_kwh"),thermal=r.heating_thermal_kwh,outdoor=outdoorRows.find((item)=>item.key===r.month);const evidence=(key)=>{const value=key==="ecodan_dhw_electricity_kwh"?classifiedDhw(r):classified(r,key);return `${number(value)}${value!=null&&!complete(r)?' <span class="quality partial">Partial known subtotal</span>':""}`;};return `<tr><td>${esc(r.month)}</td><td>${number(outdoor?.mean)}${outdoor?.coverage!=null?` (${n(outdoor.coverage,0)}% coverage${outdoor.coverage<99.999?" · partial":""})`:""}</td><td>${evidence("ecodan_heating_electricity_kwh")}</td><td>${evidence("ac_heating_electricity_kwh")}</td><td>${number(heating)}</td><td>${number(divided(heating))}</td><td>${number(thermal)}</td><td>${number(divided(thermal))}</td><td>${evidence("ecodan_dhw_electricity_kwh")}</td><td>${number(r.provisional_shelly_dhw_electricity_kwh)}</td><td>${number(r.vendor_dhw_electricity_kwh)}</td><td>${number(r.dhw_thermal_kwh)}</td><td>${evidence("ac_cooling_electricity_kwh")}</td><td>Vendor ${number(r.vendor_dhw_cop)} / provisional ${number(r.provisional_shelly_dhw_cop)} / primary ${number(r.primary_dhw_cop)}</td><td>${esc(r.quality)} · snapshot ${esc(r.snapshot_status)}</td></tr>`;}).join("");
+    return `<article class="card page-card"><h2>Monthly Whole-House Energy Summary</h2><p>Configured heated floor area: ${area>0?n(area,0)+" m²":"Unavailable"}. Change it in integration options if needed.</p><p class="warning">AC units provide measured electrical consumption, but do not provide measured heating or cooling thermal output. Therefore, total whole-house thermal energy delivered is unavailable without additional measurements or separately identified estimates. Ecodan-generated thermal energy is reported independently.</p><label><input class="profile-normalize" type="checkbox" ${normalize?"checked":""}> Normalize space-heating electricity and Ecodan space-heating thermal energy per m²/month</label><p class="muted">Partial known subtotals are labelled and do not represent complete monthly totals. Controller-proportion estimates are provisional. Snapshot status identifies partial month-to-date thermal figures.</p>${rows.length?sections.map(chart).join(""):'<div class="empty">Monthly evidence is unavailable.</div>'}<div class="table-wrap"><table><thead><tr>${["Month","Outdoor mean °C","Ecodan heating kWh","AC heating kWh","House heating kWh","House heating kWh/m²","Ecodan heating kWh thermal","Heating thermal kWh/m²","DHW Shelly kWh","DHW provisional kWh","DHW controller kWh","DHW kWh thermal","AC cooling kWh","DHW COP evidence","Quality / source"].map((label)=>`<th>${esc(label)}</th>`).join("")}</tr></thead><tbody>${table}</tbody></table></div><p class="muted">Provisional Ecodan heating: ${rows.map((r)=>`${esc(r.month)} ${number(r.provisional_shelly_heating_electricity_kwh)} kWh`).join(" · ")||"Unavailable"}. These estimates are not added to classified whole-house totals. Zero classified DHW requires complete mode evidence; alternative DHW estimates are not additive. Outdoor means use stored daily temperature summaries.</p><button class="primary profile-csv">Export monthly fields CSV</button></article>`;
   }
 
   thermalView() {
     const daily=this.v02Report?.whole_house_heating||[];const thermal=this.v02Report?.ecodan_space_heating||[];
-    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section><section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
+    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section>${this.monthlyHouseProfile()}<section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
   }
 
   async loadTemperatureCopAnalysis() {
@@ -486,8 +533,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return `${this.periodControls()}<div class="toolbar"><div><b>${esc(this.selectedPeriod?.label || "Today")} <span class="quality ${this.historyCoverage?.complete?"good":"partial"}">${this.historyCoverage?.complete?"Complete":"Partial"}</span></b><span>${esc(status)}${isToday?` · ${n(hourlyCoverage?.coverage_percent,0)}% hourly coverage · cutoff ${esc(this.overviewData?.cutoff_local || "—")} (${esc(this.overviewData?.timezone || "HA timezone")})`:""} · updated ${esc(selected?.updated_at || "—")}</span>${isToday&&hourlyCoverage?.missing_intervals?.length?`<span class="warning">Missing: ${hourlyCoverage.missing_intervals.map((item)=>esc(item.start)).join(", ")}</span>`:""}</div><button class="refresh">Refresh now</button></div>
     <section class="kpis">${this.kpis().map(([icon, label, value, color, unit = "kWh", known]) => {const shown=value??known;return `
       <article class="card kpi"><div class="kpi-icon ${color}"><ha-icon icon="${icon}"></ha-icon></div>
-      <div><span>${label}</span><strong>${n(shown)} ${shown == null ? "" : unit}</strong>
-      ${value==null&&known!=null?`<small><b>Known/provisional subtotal</b> · complete total unavailable</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
+      <div><span>${label}</span><strong>${shown==null?"Unavailable":`${n(shown)} ${unit}`}</strong>
+      ${value==null&&known!=null?`<small><b>Partial known subtotal</b> · complete total unavailable</small>`:shown==null?`<small>Missing or incomplete source evidence</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
     <section class="grid top-grid">
       <article class="card wide"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Heating Energy vs Outdoor Temperature</h2>${this.scatterChart()}</article>
       <article class="card"><h2><ha-icon icon="mdi:chart-box-outline"></ha-icon>Daily Energy Split</h2>${this.splitChart()}</article>
@@ -495,9 +542,29 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     </section>
     <section class="grid bottom-grid">
       ${this.temperatureCard("indoor")}${this.temperatureCard("outdoor")}
-      <article class="card"><h2><ha-icon icon="mdi:solar-power"></ha-icon>Solar PV</h2><div class="mini-stats"><span>On-site use <b>${n(selected?.energy?.pv_consumed_on_site_kwh)} kWh</b></span><span>Self-consumption <b>${n(selected?.energy?.pv_self_consumption_percent)}%</b></span><span>Export <b>${n(selected?.energy?.export_kwh)} kWh</b></span></div><p class="muted">Unavailable inputs remain unavailable.</p></article>
+      <article class="card"><h2><ha-icon icon="mdi:solar-power"></ha-icon>Solar PV and grid</h2>${this.pvPeriodMetrics(selected)}</article>
       <article class="card wide"><h2><ha-icon icon="mdi:clock-outline"></ha-icon>Recent History</h2>${this.recentTable(this.history.slice(0, 5))}</article>
-    </section><section class="card page-card"><h2>Equipment breakdown</h2>${this.equipmentBreakdown()}</section>`;
+    </section><section class="grid overview-series"><article class="card"><h2>PV / grid daily electricity</h2>${this.overviewSeries("pv")}</article><article class="card"><h2>Heating electricity by equipment</h2>${this.overviewSeries("heating")}</article></section><section class="card page-card"><h2>Equipment breakdown</h2>${this.equipmentBreakdown()}</section>`;
+  }
+
+  pvPeriodMetrics(record) {
+    const energy=record?.energy||{},value=(key,known)=>this.evidence(energy[key],record?.[known]);
+    const net=energy.import_kwh!=null&&energy.export_kwh!=null?Number(energy.import_kwh)-Number(energy.export_kwh):null;
+    const missing=this.historyCoverage?.missing_dates||[];
+    const fields=this.historyCoverage?.meter_coverage?.fields||{};
+    const coverage=[["PV","pv_kwh"],["Import","import_kwh"],["Export","export_kwh"],["Household","household_kwh"]].map(([label,key])=>{const f=fields[key];if(!f)return `<li>${label}: coverage unavailable</li>`;return `<li>${label}: ${f.complete?"Complete":"Partial"} · ${n(f.coverage_percent,1)}% · ${f.available_days} days · missing records: ${esc((f.missing_record_dates||[]).join(", ")||"none")} · missing measurements: ${esc((f.missing_measurement_dates||[]).join(", ")||"none")} · invalid or unreliable: ${esc((f.invalid_measurement_dates||[]).join(", ")||"none")}</li>`;}).join("");
+    return `<div class="mini-stats pv-metrics"><span>PV generation <b>${value("pv_kwh","known_pv_kwh")}</b></span><span>Grid import <b>${value("import_kwh","known_import_kwh")}</b></span><span>Grid export <b>${value("export_kwh","known_export_kwh")}</b></span><span>Net grid <b>${net==null?"Unavailable":n(net)+" kWh"}</b></span><span>On-site PV use <b>${energy.pv_consumed_on_site_kwh==null?"Unavailable":n(energy.pv_consumed_on_site_kwh)+" kWh"}</b></span><span>Self-consumption <b>${energy.pv_self_consumption_percent==null?"Unavailable":n(energy.pv_self_consumption_percent)+"%"}</b></span><span>Self-sufficiency <b>${energy.self_sufficiency_percent==null?"Unavailable":n(energy.self_sufficiency_percent)+"%"}</b></span></div><p class="muted">Net grid = import − export; negative means net export. Ratios require complete matching inputs. Partial values use stored supported evidence.${missing.length?` Missing dates (${missing.length}): ${missing.map(esc).join(", ")}.`:""}</p><details><summary>Meter coverage and missing evidence</summary><ul>${coverage}</ul><p>Counter source quality can limit availability; missing evidence is not zero.</p></details>`;
+  }
+
+  overviewSeries(kind) {
+    const records=kind==="pv"?[...this.history].reverse():(this.v02Report?.whole_house_heating||[]);
+    const meter=(r,key)=>{const alias={pv_kwh:"pv",import_kwh:"import",export_kwh:"export"}[key],source=r.provenance?.counter_collection?.[`site.${alias}`],quality=r.meter_quality?.[key],raw=r.energy?.[key],known=r[`known_${key}`];if(["recorder_states_unreliable","unavailable","invalid","unreconciled"].includes(source)||["missing","poor","invalid","unreconciled"].includes(quality))return null;const v=raw??known;if(v==null||!Number.isFinite(Number(v))||Number(v)<0)return null;const field=r.period_coverage?.meter_coverage?.fields?.[key];const complete=raw!=null&&r.partial!==true&&r.finalized!==false&&r.provisional!==true&&field?.complete!==false;return {value:Number(v),complete,detail:`${complete?"complete":"partial known evidence"} · ${quality||"field quality not recorded"} · ${source||"source not recorded"}`};};
+    const heating=(r,key)=>{const devices=r[key]||[],known=devices.filter(x=>x.electricity_kwh!=null&&Number.isFinite(Number(x.electricity_kwh)));if(!known.length)return null;const estimated=known.some(x=>Number(x.assumed_kwh||0)>0||Number(x.selected_kwh||0)>0||Number(x.estimated_kwh||0)>0||["filtered","uncertain","estimated"].includes(x.quality));const classified=known.length===devices.length&&known.every(x=>(x.heating_evidence_complete??x.classification_complete)===true&&!['partial','missing','poor','unreconciled'].includes(x.quality));const throughCutoff=classified&&r.complete_through_cutoff===true;const complete=throughCutoff&&r.calendar_period_finalized===true&&!estimated;const status=!classified||!throughCutoff?"partial known subtotal":r.calendar_period_finalized!==true?"provisional through cutoff":estimated?"estimated or assumed heating":"complete finalized day";return {value:known.reduce((a,x)=>a+Number(x.electricity_kwh),0),complete,detail:`${status}${estimated?" · estimated or assumed heating":""}${r.cutoff_utc?` · cutoff ${r.cutoff_utc}`:""} · ${known.map(x=>`${x.display_name||x.equipment_id||"equipment"}: ${x.quality||"unknown quality"}`).join(", ")}`};};
+    const series=kind==="pv"?[["PV",r=>meter(r,"pv_kwh")],["Household",r=>meter(r,"household_kwh")],["Import",r=>meter(r,"import_kwh")],["Export",r=>meter(r,"export_kwh")],["Net grid",r=>{const a=meter(r,"import_kwh"),b=meter(r,"export_kwh");return a?.complete&&b?.complete?{value:a.value-b.value,complete:true,detail:"complete matched import and export"}:null;}]]:[["Heat pump heating",r=>heating(r,"heat_pumps")],["AC heating",r=>heating(r,"air_conditioners")]];
+    const values=records.flatMap(r=>series.map(([,get])=>get(r)?.value).filter(v=>v!=null&&Number.isFinite(Number(v))));
+    if(!values.length)return `<div class="empty">No evidenced daily values in the loaded period.</div>`;
+    const min=Math.min(0,...values),max=Math.max(0,...values),span=Math.max(1,max-min),width=Math.max(360,records.length*28+55),step=(width-55)/Math.max(1,records.length),y=v=>12+(max-v)/span*125;
+    return `<div class="series-scroll"><svg viewBox="0 0 ${width} 170" style="width:${width}px;height:170px" role="img" aria-label="${kind==="pv"?"PV and grid":"Heating split"} daily electricity"><line x1="40" x2="${width-10}" y1="${y(0)}" y2="${y(0)}" stroke="currentColor"/><text x="1" y="18">${n(max,1)}</text><text x="1" y="140">${n(min,1)}</text>${records.map((r,i)=>series.map(([name,get],j)=>{const evidence=get(r);if(!evidence)return "";const v=evidence.value,z=y(0),p=y(v),bw=Math.max(2,(step-3)/series.length);return `<rect x="${40+i*step+j*bw}" y="${Math.min(z,p)}" width="${Math.max(1,bw-1)}" height="${Math.max(1,Math.abs(z-p))}" fill="${["#ef4444","#238ee8","#159b5b","#f59e0b","#8b5cf6"][j]}" opacity="${evidence.complete?1:.55}"><title>${esc(r.local_date)} · ${esc(name)} ${n(v,2)} kWh · ${esc(evidence.detail)}</title></rect>`;}).join("")+((i===0||i===records.length-1||i%Math.max(1,Math.ceil(records.length/6))===0)?`<text x="${40+i*step}" y="160">${esc(String(r.local_date||"").slice(5))}</text>`:"")).join("")}</svg></div><div class="legend">${series.map(([name],i)=>`<span><i class="dot" style="display:inline-block;background:${["#ef4444","#238ee8","#159b5b","#f59e0b","#8b5cf6"][i]}"></i>${esc(name)}</span>`).join("")}</div><p class="muted">${kind==="pv"&&this.historyTotal>records.length?`Showing ${records.length} loaded dates of ${this.historyTotal}; `:""}Faded bars indicate provisional through cutoff, partial or estimated evidence. Missing values are gaps.</p>`;
   }
 
   equipmentBreakdown() {
@@ -587,9 +654,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       }).join("");
       return `${segments.map((segment)=>segment.length>1?`<polyline points="${segment.join(" ")}" class="temp-line t${sourceIndex%4}"></polyline>`:"").join("")}${markers}`;
     }).join("");
-    const allTicks=timeline.axis_ticks||[];
+    const allTicks=timeline.resolution==="daily"?(timeline.intervals||[]).map((row)=>({timestamp_utc:row.start_utc,label:String(row.local_date||"").slice(5)})):(timeline.axis_ticks||[]);
     const tickStride=Math.max(1,Math.ceil((allTicks.length-1)/4));
-    const visibleTicks=allTicks.filter((_tick,index)=>index===0||index===allTicks.length-1||index%tickStride===0);
+    const visibleTicks=allTicks.filter((_tick,index)=>index===0||index===allTicks.length-1||(index%tickStride===0&&allTicks.length-1-index>=tickStride));
     const ticks=visibleTicks.map((tick,index,array)=>`<text x="${xFor(tick.timestamp_utc)}" y="172" text-anchor="${index===0?"start":index===array.length-1?"end":"middle"}">${esc(tick.label)}</text>`).join("");
     const label=`${timeline.start_date}${timeline.start_date===timeline.end_date?"":`–${timeline.end_date}`} · ${timeline.timezone} · ${timeline.resolution}`;
     const clipId=`hei-temp-plot-${++this.temperatureChartSequence}`;
@@ -708,6 +775,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelectorAll(".thermal-delete").forEach((button)=>button.addEventListener("click",()=>this.deleteThermalReading(Number(button.dataset.id))));
     this.shadowRoot.querySelector(".thermal-backfill")?.addEventListener("click",()=>this.backfillThermalReadings());
     this.shadowRoot.querySelector(".monthly-apply")?.addEventListener("click",()=>{this.monthlyEndMonth=this.shadowRoot.querySelector(".monthly-end")?.value||this.monthlyEndMonth;this.loadMonthly();});
+    this.shadowRoot.querySelector(".heating-axis")?.addEventListener("change",(event)=>{this.heatingIntensity=event.target.value==="intensity";this.render();});
+    this.shadowRoot.querySelector(".heating-trend")?.addEventListener("change",(event)=>{this.heatingTrendVisible=event.target.checked;this.render();});
+    this.shadowRoot.querySelector(".profile-normalize")?.addEventListener("change",(event)=>{this.monthlyProfileNormalized=event.target.checked;this.render();});
+    this.shadowRoot.querySelector(".profile-csv")?.addEventListener("click",()=>this.exportHouseProfile());
     this.shadowRoot.querySelectorAll(".monthly-metric").forEach((checkbox)=>checkbox.addEventListener("change",()=>{this.monthlyMetricIds=[...this.shadowRoot.querySelectorAll(".monthly-metric:checked")].map((item)=>item.value);this.render();}));
     this.shadowRoot.querySelector(".monthly-csv")?.addEventListener("click",()=>this.exportMonthlyCsv());
     this.shadowRoot.querySelector(".monthly-form")?.addEventListener("submit",(event)=>this.saveMonthlySnapshot(event));
@@ -721,6 +792,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelector(".analysis-reset")?.addEventListener("click",()=>{this.analysisLower=0;this.analysisUpper=5;this.render();});
     this.shadowRoot.querySelectorAll(".analysis-metric").forEach((item)=>item.addEventListener("change",()=>{this.analysisMetrics=[...this.shadowRoot.querySelectorAll(".analysis-metric:checked")].map((selected)=>selected.value);this.render();}));
     this.shadowRoot.querySelector(".analysis-export")?.addEventListener("click",()=>this.exportTemperatureCopAnalysis());
+  }
+
+  exportHouseProfile() {
+    const rows=this.monthlyReport?.rows||[],area=Number(this.overviewData?.floor_area_m2);
+    const outdoorRows=this.profileOutdoorRows||[];
+    const fields=[["month","configured_area_m2","outdoor_mean_c","outdoor_coverage_percent","ecodan_heating_kwh","ecodan_provisional_heating_kwh","ac_heating_kwh","house_heating_kwh","house_heating_kwh_m2","ecodan_heating_thermal_kwh","heating_thermal_kwh_m2","dhw_shelly_kwh","dhw_provisional_kwh","dhw_vendor_kwh","dhw_thermal_kwh","ac_cooling_kwh","dhw_vendor_cop","dhw_provisional_cop","dhw_primary_cop","quality","snapshot_status"]];
+    for(const row of rows){const complete=row.period_coverage?.allocation_coverage?.complete===true&&row.period_coverage?.date_coverage?.complete_through_available_cutoff===true;const get=(key)=>complete?row[key]:null;const heat=get("whole_house_heating_electricity_kwh"),thermal=row.heating_thermal_kwh,outdoor=outdoorRows.find((item)=>item.key===row.month);fields.push([row.month,area>0?area:null,outdoor?.mean,outdoor?.coverage,get("ecodan_heating_electricity_kwh"),row.provisional_shelly_heating_electricity_kwh,get("ac_heating_electricity_kwh"),heat,heat!=null&&area>0?heat/area:null,thermal,thermal!=null&&area>0?thermal/area:null,(get("ecodan_dhw_electricity_kwh")===0?null:get("ecodan_dhw_electricity_kwh")),row.provisional_shelly_dhw_electricity_kwh,row.vendor_dhw_electricity_kwh,row.dhw_thermal_kwh,get("ac_cooling_electricity_kwh"),row.vendor_dhw_cop,row.provisional_shelly_dhw_cop,row.primary_dhw_cop,row.quality,row.snapshot_status]);}
+    const csv=fields.map((row)=>row.map((v)=>`"${String(v??"").replaceAll('"','""')}"`).join(",")).join("\r\n"),link=document.createElement("a");link.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));link.download="whole-house-monthly-energy.csv";link.click();URL.revokeObjectURL(link.href);
   }
 
   exportTemperatureCopAnalysis() {
@@ -826,15 +905,17 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
         type:`home_energy_intelligence/temperature_backfill_${dryRun?"preview":"start"}`,
         ...range,attest_current_mapping:attest,
       });
+      try {window.sessionStorage?.setItem("hei_temperature_backfill_job",String(this.temperatureBackfillJob.job_id));} catch (_) { /* Polling continues without browser storage. */ }
       this.refreshError=null;this.render();this.pollTemperatureBackfill();
     } catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
   async pollTemperatureBackfill() {
-    if(!this.temperatureBackfillJob?.job_id)return;
+    const jobId=this.temperatureBackfillJob?.job_id??this.temperatureBackfillJob?.id;
+    if(!jobId)return;
     try {
-      const job=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_status",job_id:this.temperatureBackfillJob.job_id});
-      this.temperatureBackfillJob=job;this.render();
+      const job=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_status",job_id:jobId});
+      this.temperatureBackfillJob={...job,job_id:job.job_id??job.id??jobId};this.refreshError=null;this.render();
       if(["queued","running","interrupted"].includes(job.status)){
         this.temperatureBackfillPolling=window.setTimeout(()=>this.pollTemperatureBackfill(),1000);
       }else{
@@ -844,8 +925,9 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   async cancelTemperatureBackfill() {
-    if(!this.temperatureBackfillJob?.job_id)return;
-    try { this.temperatureBackfillJob=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_cancel",job_id:this.temperatureBackfillJob.job_id});this.render(); }
+    const jobId=this.temperatureBackfillJob?.job_id??this.temperatureBackfillJob?.id;
+    if(!jobId)return;
+    try { const job=await this._hass.callWS({type:"home_energy_intelligence/temperature_backfill_cancel",job_id:jobId});this.temperatureBackfillJob={...job,job_id:job.job_id??job.id??jobId};this.render(); }
     catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
@@ -867,6 +949,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     .period .conditional{display:none}.period .conditional.visible{display:flex}button:disabled{opacity:.45;cursor:not-allowed}
     @media(max-width:800px){main{padding:12px 9px}.brand>ha-icon{--mdc-icon-size:42px}.brand h1{font-size:23px}.brand p{font-size:13px}.connection{display:none}.tabs{gap:2px}.tab{padding:13px 11px;min-height:44px}.tab span{display:none}.kpis{grid-template-columns:1fr}.top-grid,.bottom-grid,.settings-grid,.equipment-charts,.thermal-form{grid-template-columns:1fr}.status-card,.bottom-grid .wide,.notice{grid-column:auto}.section-head{align-items:flex-start}.mapping>div{grid-template-columns:1fr}.mini-stats{flex-wrap:wrap}.device-bars>div{grid-template-columns:1fr}.period,.monthly-controls{align-items:stretch;flex-direction:column}.period label,.monthly-controls label{justify-content:space-between}.period input,.period select,.period button,.toolbar button,.pager button,.primary,.monthly-controls input{min-height:44px}.metric-selector{display:grid;grid-template-columns:1fr}.metric-selector label{min-height:36px}.card{padding:14px}.chart,.pv-chart{height:180px}.bars{height:120px}.empty,.upcoming{min-height:72px}.table-wrap,.monthly-chart-wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.table-wrap th:first-child,.table-wrap td:first-child{position:sticky;left:0;background:var(--card-background-color,#fff);z-index:1}.table-wrap th:first-child{background:var(--secondary-background-color,#f2f6fa)}.pager{flex-wrap:wrap}.pager span{order:-1;width:100%;text-align:center}}
     .bar-chart-shell{position:relative;padding-left:48px}.bar-axis{position:absolute;left:0;top:10px;bottom:0;width:48px}.bar-axis span{position:absolute;right:5px;transform:translateY(50%);font-size:10px;color:var(--secondary-text-color,#66758d);white-space:nowrap}
+    .kpis{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}.kpi strong{font-size:clamp(16px,1.4vw,24px);white-space:normal;overflow-wrap:anywhere}.bottom-grid .wide{grid-column:1/-1}.overview-series{grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.series-scroll{max-width:100%;overflow-x:auto}.series-scroll svg{display:block;max-width:none;font-size:10px;fill:var(--secondary-text-color,#66758d)}.pv-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}.pv-metrics b{overflow-wrap:anywhere}.bar-chart-shell{overflow-x:auto}.bar-axis{top:0;bottom:auto;height:150px}.bars{height:auto;min-width:260px;align-items:flex-start;padding:0;gap:6px;border:0}.bar-col{height:auto;justify-content:flex-start;min-width:36px;max-width:120px}.bar-plot{height:150px;display:flex;align-items:flex-end;border-bottom:1px solid var(--divider-color,#dbe4ee)}.split-details{font-size:10px;max-width:110px;overflow-wrap:anywhere}.split-details summary{cursor:pointer}.split-quality{align-items:flex-start}.split-details .quality{white-space:normal}.bottom-grid .wide .table-wrap{max-width:100%}
     .pv-chart line{stroke:var(--divider-color,#dbe4ee);stroke-width:.7}.pv-chart text{font-size:7px;fill:var(--secondary-text-color,#66758d)}
   `;
 }

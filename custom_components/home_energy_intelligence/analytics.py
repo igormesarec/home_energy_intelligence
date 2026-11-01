@@ -14,6 +14,21 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _valid_meter_value(record: dict[str, Any], field: str) -> bool:
+    """Validate a field independently of unrelated HVAC/temperature quality."""
+    value = _number(record.get(field))
+    if value is None or not isfinite(value) or value < 0:
+        return False
+    aliases = {"pv_kwh": "pv", "import_kwh": "import", "export_kwh": "export"}
+    provenance = record.get("provenance") or {}
+    sources = provenance.get("counter_collection") or {}
+    source = sources.get(f"site.{aliases.get(field)}") if field in aliases else None
+    if source in {"recorder_states_unreliable", "unavailable", "invalid", "unreconciled"}:
+        return False
+    quality = (record.get("meter_quality") or {}).get(field)
+    return quality not in {"missing", "poor", "invalid", "unreconciled"}
+
+
 def _classification_coverage(allocation: dict[str, Any]) -> float | None:
     """Return evidenced classification coverage, never a legacy default.
 
@@ -135,6 +150,10 @@ def canonical_energy(
                 ac_complete = False
         else:
             totals["hvac_meter_kwh"] += meter
+        known_available = bool(allocation.get("known_available", meter is not None))
+        if "known_categories" in allocation:
+            allocation = {**allocation, "categories": allocation["known_categories"],
+                          "reported_assumed_heating_kwh": allocation.get("known_reported_assumed_heating_kwh")}
         kind = item.get("kind")
         if kind == "heat_pump":
             confirmed = _category(allocation, ("confirmed_heating", "heating"))
@@ -192,7 +211,7 @@ def canonical_energy(
             not in {"missing", "poor", "missing_counter", "unreconciled"}
         )
         breakdown.append({
-            **item, "available": device_complete, "meter_kwh": meter,
+            **item, "available": device_complete, "known_available": known_available, "meter_kwh": meter,
             "known_confirmed_heating_kwh": confirmed,
             "known_assumed_heating_kwh": assumed if kind == "heat_pump" else 0.0,
             "known_selected_heating_kwh": selected,
@@ -261,14 +280,22 @@ def canonical_energy(
     known_idle = totals["idle_kwh"]
     known_other_hvac = totals["other_hvac_kwh"]
     known_hvac_meter = totals["hvac_meter_kwh"]
-    known_heating_evidence = any(
-        item.get("available") for item in breakdown
-    )
-    known_dhw_evidence = any(
-        item.get("available") and item.get("kind") == "heat_pump"
-        for item in breakdown
-    )
-    known_cooling_evidence = known_heating_evidence
+    def category_evidence(item: dict[str, Any], names: tuple[str, ...]) -> bool:
+        allocation = allocations.get(str(item.get("equipment_id"))) or {}
+        categories = allocation.get("known_categories", allocation.get("categories")) or {}
+        return bool(item.get("known_available", item.get("available"))) and (
+            any(name in categories and _number(categories[name]) is not None for name in names)
+            or (item.get("classification_complete") and not float(item.get("unknown_kwh") or 0)
+                and not float(item.get("residual_kwh") or 0))
+        )
+
+    known_heating_evidence = any(category_evidence(item, (
+        "heating", "confirmed_heating", "heating_assumed", "heating_selected", "heating_estimated"
+    )) or (item.get("known_available", item.get("available")) and float(item.get("known_assumed_heating_kwh") or 0) > 0)
+        for item in breakdown)
+    known_dhw_evidence = any(item.get("kind") == "heat_pump" and category_evidence(item, ("dhw",)) for item in breakdown)
+    known_cooling_evidence = any(category_evidence(item, ("cooling", "cooling_selected", "cooling_estimated")) for item in breakdown)
+    known_meter_evidence = any(item.get("available") for item in breakdown)
     heating_complete = heat_pump_complete and ac_complete
     cooling_complete = heat_pump_complete and ac_complete
     category_requirements = {
@@ -292,11 +319,11 @@ def canonical_energy(
         ),
         "known_dhw_kwh": known_dhw if known_dhw_evidence else None,
         "known_cooling_kwh": known_cooling if known_cooling_evidence else None,
-        "known_idle_kwh": known_idle if known_heating_evidence else None,
+        "known_idle_kwh": known_idle if known_meter_evidence else None,
         "known_other_hvac_kwh": (
-            known_other_hvac if has_air_conditioners and known_heating_evidence else None
+            known_other_hvac if has_air_conditioners and known_meter_evidence else None
         ),
-        "known_hvac_meter_kwh": known_hvac_meter if known_heating_evidence else None,
+        "known_hvac_meter_kwh": known_hvac_meter if known_meter_evidence else None,
         "space_heating_kwh": known_space_heating if heating_complete else None,
         "dhw_kwh": known_dhw if has_heat_pumps and heat_pump_complete else None,
         "cooling_kwh": (
@@ -309,10 +336,10 @@ def canonical_energy(
             if has_heat_pumps and heating_complete and heat_pump_complete else None
         ),
     })
-    household = _number(record.get("household_kwh"))
-    pv = _number(record.get("pv_kwh"))
-    imported = _number(record.get("import_kwh"))
-    exported = _number(record.get("export_kwh"))
+    household = _number(record.get("household_kwh")) if _valid_meter_value(record, "household_kwh") else None
+    pv = _number(record.get("pv_kwh")) if _valid_meter_value(record, "pv_kwh") else None
+    imported = _number(record.get("import_kwh")) if _valid_meter_value(record, "import_kwh") else None
+    exported = _number(record.get("export_kwh")) if _valid_meter_value(record, "export_kwh") else None
     other_household = _number(record.get("non_hvac_kwh"))
     classified_hvac = (
         known_space_heating + known_dhw + known_cooling
@@ -600,8 +627,17 @@ def combine_interval_records(
     records = sorted(records, key=lambda item: item["period_start_utc"])
 
     def optional_sum(key: str) -> float | None:
+        if key in {"household_kwh", "pv_kwh", "import_kwh", "export_kwh"} and not all(
+            _valid_meter_value(item, key) for item in records
+        ):
+            return None
         values = [_number(item.get(key)) for item in records]
         return None if any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
+
+    def known_sum(key: str) -> float | None:
+        values = [_number(item.get(key)) for item in records if _valid_meter_value(item, key)]
+        values = [value for value in values if value is not None and isfinite(value) and value >= 0]
+        return sum(values) if values else None
 
     def record_seconds(item: dict[str, Any]) -> float:
         seconds = _number(item.get("day_seconds"))
@@ -620,6 +656,9 @@ def combine_interval_records(
     for equipment_id in equipment_ids:
         parts = [item.get("allocations", {}).get(equipment_id) for item in records]
         available = [part for part in parts if isinstance(part, dict)]
+        known_parts = [part for part in available if _number(part.get("meter_kwh")) is not None
+                       and isfinite(float(part["meter_kwh"])) and float(part["meter_kwh"]) >= 0
+                       and part.get("quality") not in {"missing", "missing_counter", "unreconciled", "poor"}]
         categories = set().union(*(set(part.get("categories", {})) for part in available))
         seconds = 0.0
         covered = 0.0
@@ -650,6 +689,11 @@ def combine_interval_records(
             ) else sum(float(part["meter_kwh"]) for part in available)),
             "categories": {name: sum(float(part.get("categories", {}).get(name, 0) or 0)
                                       for part in available) for name in categories},
+            "known_categories": {name: sum(float(part.get("categories", {}).get(name, 0) or 0)
+                                             for part in known_parts)
+                                 for name in set().union(*(set(part.get("categories", {})) for part in known_parts))},
+            "known_available": bool(known_parts),
+            "known_reported_assumed_heating_kwh": sum(float(part.get("reported_assumed_heating_kwh", 0) or 0) for part in known_parts),
             "residual_kwh": (None if len(available) != len(records) or any(
                 _number(part.get("residual_kwh")) is None for part in available
             ) else sum(float(part["residual_kwh"]) for part in available)),
@@ -810,8 +854,8 @@ def combine_interval_records(
         "period_end_utc": (expected_end.isoformat() if expected_end else records[-1]["period_end_utc"]),
         "day_seconds": int((expected_end - expected_start).total_seconds())
         if expected_start and expected_end else sum(int(item.get("day_seconds", 0)) for item in records),
-        "known_household_kwh": household, "known_pv_kwh": pv,
-        "known_import_kwh": imported, "known_export_kwh": exported,
+        "known_household_kwh": known_sum("household_kwh"), "known_pv_kwh": known_sum("pv_kwh"),
+        "known_import_kwh": known_sum("import_kwh"), "known_export_kwh": known_sum("export_kwh"),
         "known_non_hvac_kwh": non_hvac,
         "household_kwh": household if interval_complete else None,
         "pv_kwh": pv if interval_complete else None,
@@ -957,7 +1001,7 @@ def daily_coverage(
         return calendar_seconds(day)
 
     def field_coverage(field: str) -> dict[str, Any]:
-        unavailable = [day for day in expected if _number(by_date.get(day, {}).get(field)) is None]
+        unavailable = [day for day in expected if not _valid_meter_value(by_date.get(day, {}), field)]
         total_seconds = sum(expected_seconds(day) for day in expected)
         available_seconds = sum(
             expected_seconds(day) for day in expected if day not in unavailable
@@ -965,6 +1009,9 @@ def daily_coverage(
         return {
             "available_days": len(expected) - len(unavailable),
             "unavailable_dates": unavailable,
+            "missing_record_dates": [day for day in unavailable if day not in by_date],
+            "missing_measurement_dates": [day for day in unavailable if day in by_date and _number(by_date[day].get(field)) is None],
+            "invalid_measurement_dates": [day for day in unavailable if day in by_date and _number(by_date[day].get(field)) is not None],
             "available_seconds": available_seconds, "expected_seconds": total_seconds,
             "coverage_percent": 100 * available_seconds / total_seconds
             if total_seconds else None,
