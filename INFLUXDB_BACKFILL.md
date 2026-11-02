@@ -24,3 +24,31 @@ Unicode measurement and field names, including `°C`, are supported through esca
 Queries use HTTP `POST`; credentials are sent using the Authorization header and never appear in URL query parameters. The client exposes no write, retention, purge, or administrative operation.
 
 Influx schemas vary. Verify the measurement, field, entity tag, unit, and counter semantics against your own database before enabling a mapping. If returned history cannot be verified, leave the mapping absent; the resulting period remains unavailable.
+
+The experimental administrator-only historical energy preview is in Settings.
+Choose up to 31 local dates and, where the mapping predates known history, attest
+that the current mapping applied. It does not write historical records. Configure
+Influx entries by stable equipment ID: energy entries use `measurement`,
+`entity_tag`, and either a configured `unit` or the live entity's known unit.
+An `entity_id` must match the configured energy entity, or an administrator
+must explicitly attest that a mapping without it identifies the same source. State entries
+require their `entity_id`; `equipment.<id>.fallback_state` names the selected
+mode, while `equipment.<id>.actual_dhw_state` additionally requires
+`actual_operation: true`. State freshness defaults to 60 minutes.
+
+The preview reports observed counter increments inside the day and excludes
+unsupported boundary contributions and gaps longer than one hour. Mixed-mode
+increments remain unknown unless power covers the whole increment and agrees
+with the measured counter change; such splits are labelled power-informed
+estimates. Recorder and Influx counter observations are combined only when
+identity is established and overlapping timestamps agree. This is not a
+historical backfill: recovery execution and persistence are not implemented.
+
+Conflicting values at an identical timestamp are retained as a reported gap:
+the ambiguous observation and adjacent increments are excluded, while other
+supported increments remain available. A CSV rounded to milliseconds cannot
+establish whether those timestamps conflict at InfluxDB's native precision.
+
+Offline fixture replay uses `HEI_REPLAY_FIXTURE` pointing to a JSON file in the
+format described in `tests/test_historical_fixture_replay.py`; it does not connect
+to Home Assistant or write historical records.

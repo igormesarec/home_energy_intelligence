@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from datetime import UTC, datetime, timedelta
 import json
+from math import isfinite
 import ssl
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -46,7 +47,7 @@ class InfluxBackfillClient:
         return (
             f'SELECT {self.quote_identifier(field)} FROM {measurement_ref} '
             f"WHERE time >= '{start.isoformat()}' AND time < '{end.isoformat()}'"
-            f"{tag_filter} ORDER BY time ASC LIMIT {self.max_points}"
+            f"{tag_filter} ORDER BY time ASC LIMIT {self.max_points + 1}"
         )
 
     def query(self, measurement: str, field: str, start: datetime,
@@ -58,9 +59,14 @@ class InfluxBackfillClient:
         cursor = start
         while cursor < end:
             chunk_end = min(end, cursor + timedelta(days=1))
-            for timestamp, value in self._query(
+            chunk = self._query(
                 self.build_query(measurement, field, cursor, chunk_end, entity_tag=entity_tag)
-            ):
+            )
+            if len(chunk) > self.max_points:
+                raise InfluxBackfillError("historical query exceeded configured point limit")
+            for timestamp, value in chunk:
+                if timestamp in rows and rows[timestamp] != value:
+                    raise InfluxBackfillError("conflicting numeric timestamps")
                 rows[timestamp] = value
             if len(rows) > self.max_points:
                 raise InfluxBackfillError("historical query exceeded configured point limit")
@@ -68,6 +74,10 @@ class InfluxBackfillClient:
         return sorted(rows.items())
 
     def _query(self, query: str) -> list[tuple[datetime, float]]:
+        return [(timestamp, float(value)) for timestamp, value in self._query_values(query)
+                if value is not None]
+
+    def _query_values(self, query: str) -> list[tuple[datetime, object]]:
         params = {"db": self.database, "q": query, "epoch": "ns"}
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if self.username:
@@ -77,11 +87,86 @@ class InfluxBackfillClient:
         context = None if self.verify_ssl else ssl._create_unverified_context()  # noqa: SLF001
         with urlopen(request, timeout=30, context=context) as response:  # noqa: S310 - configured endpoint
             payload = json.load(response)
+        if not isinstance(payload, dict):
+            raise InfluxBackfillError("malformed InfluxDB response")
         if payload.get("error"):
-            raise InfluxBackfillError(payload["error"])
+            raise InfluxBackfillError("InfluxDB query failed")
+        if any(result.get("error") for result in payload.get("results", [])):
+            raise InfluxBackfillError("InfluxDB query failed")
         try:
-            values = payload["results"][0]["series"][0]["values"]
-        except (KeyError, IndexError):
-            return []
-        return [(datetime.fromtimestamp(row[0] / 1_000_000_000, tz=UTC), float(row[1]))
-                for row in values if row[1] is not None]
+            results = payload["results"]
+            if not isinstance(results, list):
+                raise ValueError("invalid result")
+            values = [row for result in results for series in result.get("series", [])
+                      for row in series["values"]]
+            return [(datetime.fromtimestamp(row[0] / 1_000_000_000, tz=UTC), row[1])
+                    for row in values if row[1] is not None]
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError) as error:
+            raise InfluxBackfillError("malformed InfluxDB response") from error
+
+    def query_states(self, start: datetime, end: datetime, *, entity_id: str,
+                     domain: str, maximum_age: timedelta = timedelta(hours=1)) -> list[tuple[datetime, str]]:
+        """Read bounded text state changes and at most one fresh preceding state."""
+        if (start.tzinfo is None or end.tzinfo is None or end <= start
+                or end - start > timedelta(days=31) or maximum_age <= timedelta(0)
+                or maximum_age > timedelta(days=1) or not entity_id or not domain):
+            raise InfluxBackfillError("state query requires a valid bounded interval and source")
+        tag = entity_id.split(".", 1)[1] if entity_id.startswith(domain + ".") else entity_id
+        where = f'"entity_id" = {self.quote_string(tag)} AND "domain" = {self.quote_string(domain)}'
+        measurement = f'{self.quote_identifier(self.retention_policy)}.{self.quote_identifier("state")}'
+        before = (f'SELECT "state" FROM {measurement} WHERE time >= {self.quote_string((start-maximum_age).isoformat())} '
+                  f'AND time < {self.quote_string(start.isoformat())} AND {where} ORDER BY time DESC LIMIT 1')
+        rows: dict[datetime, str] = {}
+        def add(items, lower, upper):
+            for stamp, value in items:
+                if not isinstance(stamp, datetime) or stamp.tzinfo is None or not lower <= stamp < upper or not isinstance(value, str):
+                    raise InfluxBackfillError("malformed state response")
+                if stamp in rows and rows[stamp] != value:
+                    raise InfluxBackfillError("conflicting state timestamps")
+                rows[stamp] = value
+                if len(rows) > self.max_points:
+                    raise InfluxBackfillError("historical query exceeded configured point limit")
+        add(self._query_values(before), start-maximum_age, start)
+        cursor = start
+        while cursor < end:
+            stop = min(end, cursor+timedelta(days=1))
+            query = (f'SELECT "state" FROM {measurement} WHERE time >= {self.quote_string(cursor.isoformat())} '
+                     f'AND time < {self.quote_string(stop.isoformat())} AND {where} ORDER BY time ASC LIMIT {self.max_points+1}')
+            chunk = self._query_values(query)
+            if len(chunk) > self.max_points:
+                raise InfluxBackfillError("historical query exceeded configured point limit")
+            add(chunk, cursor, stop)
+            cursor = stop
+        return sorted(rows.items())
+
+    def query_counter(self, measurement: str, field: str, start: datetime, end: datetime,
+                      *, entity_tag: str, maximum_age: timedelta = timedelta(hours=1),
+                      include_following: bool = False) -> list[tuple[datetime, float]]:
+        """Read bounded observations around a range without inventing boundary values."""
+        if (start.tzinfo is None or end.tzinfo is None or end <= start
+                or end-start > timedelta(days=31) or maximum_age <= timedelta(0)
+                or maximum_age > timedelta(days=1) or not entity_tag):
+            raise InfluxBackfillError("counter query requires a valid bounded interval and source")
+        ref = f"{self.quote_identifier(self.retention_policy)}.{self.quote_identifier(measurement)}"
+        query = (f'SELECT {self.quote_identifier(field)} FROM {ref} '
+                 f'WHERE time >= {self.quote_string((start-maximum_age).isoformat())} '
+                 f'AND time < {self.quote_string(start.isoformat())} '
+                 f'AND "entity_id" = {self.quote_string(entity_tag)} ORDER BY time DESC LIMIT 1')
+        before = self._query(query)
+        if len(before) > 1 or any(stamp.tzinfo is None or not start-maximum_age <= stamp < start
+                                  or not isfinite(value) or value < 0 for stamp, value in before):
+            raise InfluxBackfillError("malformed counter baseline")
+        rows = self.query(measurement, field, start, end, entity_tag=entity_tag)
+        after = []
+        if include_following:
+            following = (f'SELECT {self.quote_identifier(field)} FROM {ref} '
+                         f'WHERE time >= {self.quote_string(end.isoformat())} '
+                         f'AND time <= {self.quote_string((end+maximum_age).isoformat())} '
+                         f'AND "entity_id" = {self.quote_string(entity_tag)} ORDER BY time ASC LIMIT 1')
+            after = self._query(following)
+            if len(after) > 1 or any(stamp.tzinfo is None or not end <= stamp <= end+maximum_age
+                                     or not isfinite(value) or value < 0 for stamp, value in after):
+                raise InfluxBackfillError("malformed following counter observation")
+        if len(before)+len(rows)+len(after) > self.max_points:
+            raise InfluxBackfillError("historical query exceeded configured point limit")
+        return before + rows + after

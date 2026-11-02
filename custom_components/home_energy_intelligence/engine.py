@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from .allocation import allocate_interval, configurable_classifier, counter_delta
+from .allocation import allocate_interval, allocate_historical_counter_increments, configurable_classifier, counter_delta
 from .configuration import TemperatureQuality
 from .models import DailyRecord, NumericSample, StateSample
 from .temperature import DEFAULT_LIMITS, time_weighted_temperature
@@ -48,7 +48,8 @@ class DailyAggregator:
                  seasonal_fallback: bool = False,
                  maximum_power_gap: timedelta = timedelta(minutes=30),
                  maximum_counter_delta_kwh: float = 500.0,
-                 assumed_heating_reporting: str = "separate") -> None:
+                 assumed_heating_reporting: str = "separate",
+                 strict_historical: bool = False) -> None:
         self.timezone = timezone
         self.cycle_hours = cycle_hours
         self.temperature_freshness = temperature_freshness
@@ -56,6 +57,7 @@ class DailyAggregator:
         self.maximum_power_gap = maximum_power_gap
         self.maximum_counter_delta_kwh = maximum_counter_delta_kwh
         self.assumed_heating_reporting = assumed_heating_reporting
+        self.strict_historical = strict_historical
 
     def aggregate(self, day: date, source: DailyInput) -> DailyRecord:
         start, end = local_day_bounds(day, self.timezone)
@@ -89,6 +91,7 @@ class DailyAggregator:
                 history.state_map, kind=history.kind,
                 state_attribute=history.state_attribute,
                 seasonal_fallback=self.seasonal_fallback,
+                strict_historical=self.strict_historical,
             )
             stored = {
                 (item.get("interval_start_utc"), item.get("interval_end_utc")): item
@@ -112,7 +115,12 @@ class DailyAggregator:
                     interval_rejected = int(checkpoint.get("rejected_count", 0))
                     interval_quality = str(checkpoint.get("quality", "missing"))
                 else:
-                    result = allocate_interval(
+                    result = (allocate_historical_counter_increments(
+                        start=interval_start, end=interval_end, mode_samples=history.mode,
+                        counter_samples=history.counter, classifier=classifier,
+                        power_samples=history.power,
+                        maximum_delta_kwh=self.maximum_counter_delta_kwh,
+                    ) if self.strict_historical else allocate_interval(
                         start=interval_start,
                         end=interval_end,
                         mode_samples=history.mode,
@@ -121,7 +129,7 @@ class DailyAggregator:
                         classifier=classifier,
                         maximum_power_gap=self.maximum_power_gap,
                         maximum_counter_delta_kwh=self.maximum_counter_delta_kwh,
-                    )
+                    ))
                     interval_meter = result.meter_kwh
                     interval_residual = result.residual_kwh
                     interval_categories = result.allocations_kwh
@@ -143,7 +151,7 @@ class DailyAggregator:
                 resets += interval_resets
                 rejected += interval_rejected
                 qualities.append(interval_quality)
-            authoritative, daily_resets, daily_rejected = counter_delta(
+            authoritative, daily_resets, daily_rejected = (None, 0, 0) if self.strict_historical else counter_delta(
                 history.counter, start, end,
                 maximum_delta_kwh=self.maximum_counter_delta_kwh,
             )
@@ -170,10 +178,12 @@ class DailyAggregator:
             )
             assumed_from_modes = (
                 categories.get("heating_assumed", 0.0)
-                + (categories.get("unknown", 0.0) if history.kind == "heat_pump" else 0.0)
+                + (categories.get("unknown", 0.0) if history.kind == "heat_pump" and not self.strict_historical else 0.0)
             )
-            reporting_assumed = assumed_from_modes + positive_residual
-            remaining_unassigned = 0.0 if residual_known else None
+            reporting_assumed = assumed_from_modes + (0.0 if self.strict_historical else positive_residual)
+            remaining_unassigned = (categories.get("unknown", 0.0) + positive_residual
+                                    if self.strict_historical and residual_known else
+                                    0.0 if residual_known else None)
             meter_totals.append(meter_value)
             allocations[device] = {
                 "meter_kwh": meter_value,
@@ -189,8 +199,9 @@ class DailyAggregator:
                 "checkpoint_intervals": checkpoint_intervals,
                 "classification_source": "persisted_checkpoints" if checkpoint_intervals else "history_recovery",
                 "authoritative_counter_source": (
-                    counter_source or "daily_recorder" if authoritative is not None
-                    else "checkpoints" if meter_value is not None else "unavailable"
+                    (counter_source or ("historical_counter" if self.strict_historical else
+                                        "daily_recorder" if authoritative is not None else "checkpoints"))
+                    if meter_value is not None else "unavailable"
                 ),
                 "source_provenance": history.provenance,
                 "checkpoint_source_provenance": checkpoint_sources,
@@ -203,11 +214,12 @@ class DailyAggregator:
                 "idle_other_kwh": (
                     categories.get("idle", 0.0) + categories.get("cooling", 0.0)
                 ),
-                "heating_assumed_unknown_mode_kwh": assumed_from_modes,
+                "heating_assumed_unknown_mode_kwh": 0.0 if self.strict_historical else assumed_from_modes,
                 "positive_reconciliation_residual_kwh": positive_residual,
-                "heating_assumed_residual_kwh": positive_residual,
+                "heating_assumed_residual_kwh": 0.0 if self.strict_historical else positive_residual,
                 "raw_unassigned_before_fallback_kwh": (
-                    assumed_from_modes + positive_residual
+                    categories.get("unknown", 0.0) + positive_residual if self.strict_historical
+                    else assumed_from_modes + positive_residual
                 ),
                 "remaining_unassigned_after_fallback_kwh": remaining_unassigned,
                 "signed_overallocation_or_reconciliation_error_kwh": (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from bisect import bisect_right, bisect_left
 from datetime import datetime, timedelta
 from math import isfinite
 
@@ -36,6 +37,7 @@ def configurable_classifier(
     kind: str,
     state_attribute: str | None = None,
     seasonal_fallback: bool = False,
+    strict_historical: bool = False,
 ) -> Callable[[StateSample], str]:
     """Build a classifier from UI configuration without vendor assumptions."""
     normalized = {str(key).lower(): str(value) for key, value in state_map.items()}
@@ -48,6 +50,8 @@ def configurable_classifier(
         mapped = normalized.get(str(raw).lower())
         if mapped:
             return mapped
+        if strict_historical:
+            return "unknown"
         if kind == "heat_pump":
             return "heating_assumed"
         return ac_category(sample, seasonal_fallback=seasonal_fallback)
@@ -230,3 +234,98 @@ def allocate_interval(
         total_rejected,
         quality,
     )
+
+
+def historical_counter_observations(samples: list[NumericSample]) -> tuple[list[NumericSample], list[datetime]]:
+    """Turn conflicting equal-timestamp readings into gaps, never choose a value."""
+    grouped: dict[datetime, NumericSample] = {}
+    conflicts: set[datetime] = set()
+    for sample in samples:
+        previous = grouped.get(sample.timestamp)
+        if previous is not None and previous.value != sample.value:
+            conflicts.add(sample.timestamp)
+        else:
+            grouped[sample.timestamp] = sample
+    return ([NumericSample(stamp, None) if stamp in conflicts else grouped[stamp]
+             for stamp in sorted(grouped)], sorted(conflicts))
+
+
+def allocate_historical_counter_increments(*, start: datetime, end: datetime,
+                                           mode_samples: list[StateSample],
+                                           counter_samples: list[NumericSample],
+                                           classifier: Callable[[StateSample], str],
+                                           power_samples: list[NumericSample] | None = None,
+                                           maximum_gap: timedelta = timedelta(hours=1),
+                                           maximum_delta_kwh: float = 500.0) -> AllocationResult:
+    """Allocate whole observed increments only; never interpolate across a boundary."""
+    samples, conflicts = historical_counter_observations(
+        [item for item in counter_samples if start <= item.timestamp <= end])
+    def valid_value(item):
+        return item.value is not None and isfinite(item.value) and item.value >= 0
+    modes = sorted((item for item in mode_samples if item.timestamp < end), key=lambda item: item.timestamp)
+    mode_times = [item.timestamp for item in modes]
+    allocations: dict[str, float] = {}
+    measured = covered = 0.0
+    accepted = resets = 0
+    rejected = len(conflicts)
+    suppressed: set[int] = set()
+    for index, (left, right) in enumerate(zip(samples, samples[1:])):
+        if valid_value(left) and valid_value(right) and right.value < left.value:
+            for recovery in range(index + 2, len(samples)):
+                if samples[recovery].timestamp - left.timestamp > maximum_gap * 2:
+                    break
+                if not valid_value(samples[recovery]):
+                    break
+                if samples[recovery].value >= left.value:
+                    suppressed.update(range(index, recovery))
+                    break
+    for pair_index, (left, right) in enumerate(zip(samples, samples[1:])):
+        duration = right.timestamp-left.timestamp
+        if not valid_value(left) or not valid_value(right):
+            rejected += 1
+            continue
+        delta = right.value-left.value
+        if pair_index in suppressed:
+            resets += int(delta < 0)
+            rejected += 1
+            continue
+        if duration <= timedelta(0) or duration > maximum_gap:
+            rejected += 1
+            continue
+        if delta < 0:
+            resets += 1
+            continue
+        if delta > maximum_delta_kwh:
+            rejected += 1
+            continue
+        index = bisect_right(mode_times, left.timestamp)
+        state = modes[index-1] if index else None
+        category = classifier(state) if state else "unknown"
+        changes = [classifier(item) for item in modes[index:bisect_left(mode_times, right.timestamp)]]
+        if any(item != category for item in changes):
+            refined = allocate_interval(start=left.timestamp, end=right.timestamp,
+                mode_samples=modes, power_samples=power_samples or [], counter_samples=[left, right],
+                classifier=classifier, maximum_counter_delta_kwh=maximum_delta_kwh)
+            supported = (refined.covered_seconds >= duration.total_seconds()
+                         and "unknown" not in refined.allocations_kwh
+                         and refined.residual_kwh is not None
+                         and abs(refined.residual_kwh) <= 0.05
+                         and sum(refined.allocations_kwh.values()) > 0
+                         and abs(sum(refined.allocations_kwh.values()) - delta) <= 1e-9)
+            if supported:
+                for name, amount in refined.allocations_kwh.items():
+                    key = name + "_power_estimate"
+                    allocations[key] = allocations.get(key, 0.0) + amount
+                category = "power_estimate"
+            else:
+                category = "unknown"
+        if category != "power_estimate":
+            allocations[category] = allocations.get(category, 0.0) + delta
+        measured += delta
+        if category != "unknown":
+            covered += duration.total_seconds()
+        accepted += 1
+    period = elapsed_seconds(start, end)
+    quality = "missing_counter" if not accepted else "partial" if covered < period or resets or rejected else "uncertain" if any(key in allocations or any(k.endswith("_power_estimate") for k in allocations) for key in ("unknown", "heating_assumed", "heating_selected", "cooling_selected")) else "good"
+    return AllocationResult(measured if accepted else None, allocations, 0.0 if accepted else None,
+                            covered, period, resets, rejected, quality)
