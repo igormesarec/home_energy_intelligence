@@ -29,7 +29,8 @@ from .const import (
 from .database import EnergyDatabase
 from .engine import DailyAggregator, DailyInput, DeviceHistory
 from .influx import InfluxBackfillClient
-from .models import NumericSample
+from .models import NumericSample, StateSample
+from .historical_modes import historical_heat_pump_modes, historical_selected_modes
 from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
@@ -83,6 +84,123 @@ class HomeEnergyCoordinator:
             "attribute": item.attribute, "role": item.role, "enabled": item.enabled,
             "mapping_effective_at": self.mapping_revision.get("effective_at"),
         }
+
+    async def async_preview_historical_energy(self, day: date, *, attest_current_mapping: bool = False) -> dict[str, object]:
+        """Read-only single-day preview; no database mutations or automatic execution.
+
+        The caller must be an administrator and explicitly attest older current
+        mappings. This method is not registered as a WebSocket command.
+        """
+        start, end = local_day_bounds(day, self.timezone)
+        try:
+            effective = datetime.fromisoformat(str(self.mapping_revision["effective_at"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError):
+            effective = None
+        if not attest_current_mapping and (effective is None or effective.tzinfo is None or effective > start):
+            raise ValueError("historical mapping identity requires administrator attestation")
+        source = await self._async_collect_range(start, end, store_mapping_revision=False)
+        try:
+            mappings = json.loads(self.config.get(CONF_INFLUX_MAPPING, "{}") or "{}")
+            if not isinstance(mappings, dict):
+                mappings = {}
+        except (TypeError, ValueError):
+            mappings = {}
+        influx = None
+        if self.config.get(CONF_INFLUX_ENABLED) and self.config.get(CONF_INFLUX_HOST) and self.config.get(CONF_INFLUX_DATABASE):
+            influx = InfluxBackfillClient(
+                host=self.config[CONF_INFLUX_HOST], port=int(self.config.get(CONF_INFLUX_PORT, 8086)),
+                database=self.config[CONF_INFLUX_DATABASE], username=self.config.get(CONF_INFLUX_USERNAME),
+                password=self.config.get(CONF_INFLUX_PASSWORD), use_ssl=bool(self.config.get("influx_use_ssl", False)),
+                verify_ssl=bool(self.config.get("influx_verify_ssl", True)),
+                retention_policy=str(self.config.get("influx_retention_policy", "autogen")))
+        errors = []
+        freshness_minutes = int(self.config.get("historical_mode_freshness_minutes", 60))
+        if not 1 <= freshness_minutes <= 1440:
+            raise ValueError("historical mode freshness must be between 1 and 1440 minutes")
+        freshness = timedelta(minutes=freshness_minutes)
+        for item in equipment_from_config(self.config):
+            if not item.enabled or item.equipment_id not in source.devices:
+                continue
+            device = source.devices[item.equipment_id]
+            base = f"equipment.{item.equipment_id}"
+            mode_source = "recorder"
+
+            async def influx_states(key: str, expected_entity: str | None) -> list[StateSample]:
+                mapping = mappings.get(key)
+                if not influx or not isinstance(mapping, dict) or not expected_entity or mapping.get("entity_id") != expected_entity:
+                    return []
+                try:
+                    domain = expected_entity.split(".", 1)[0]
+                    rows = await self.hass.async_add_executor_job(partial(influx.query_states, start, end,
+                                                                         entity_id=expected_entity, domain=domain,
+                                                                         maximum_age=freshness))
+                    return [StateSample(timestamp, state, {"source": "influx"}) for timestamp, state in rows]
+                except Exception as error:
+                    errors.append({"source": key, "error": type(error).__name__})
+                    return []
+
+            archive_modes = await influx_states(base + ".state", item.state_entity)
+            if archive_modes:
+                recorder_modes = device.mode
+                merged = {sample.timestamp: sample for sample in archive_modes}
+                merged.update({sample.timestamp: sample for sample in recorder_modes})
+                device.mode = sorted(merged.values(), key=lambda sample: sample.timestamp)
+                mode_source = "recorder_and_influx" if recorder_modes else "influx"
+            fallback_config = mappings.get(base + ".fallback_state")
+            fallback_entity = fallback_config.get("entity_id") if isinstance(fallback_config, dict) else None
+            fallback = []
+            if item.kind == "heat_pump" and fallback_entity:
+                try:
+                    fallback_history = await self.reader.async_history([fallback_entity], start, end)
+                    fallback = states_to_modes(fallback_history.get(fallback_entity, []))
+                except Exception as error:
+                    errors.append({"source": base + ".fallback_state", "error": type(error).__name__})
+                if not fallback:
+                    fallback = await influx_states(base + ".fallback_state", fallback_entity)
+            if item.kind == "heat_pump":
+                primary = ([StateSample(sample.timestamp, str(sample.attributes.get(item.state_attribute, "unavailable")),
+                                        sample.attributes) for sample in device.mode]
+                           if item.state_attribute else device.mode)
+                device.mode = historical_heat_pump_modes(start, end, primary=primary, actual_dhw=[], fallback=fallback,
+                                                         state_map=item.state_map, maximum_age=freshness)
+                device.state_map = {name: name for name in ("confirmed_heating", "dhw", "cooling", "idle", "heating_assumed", "unknown")}
+            else:
+                device.mode = historical_selected_modes(start, end, device.mode, maximum_age=freshness)
+                device.state_map = {name: name for name in ("heating", "cooling", "heating_selected", "cooling_selected", "standby", "unknown")}
+            device.state_attribute = None
+            device.provenance.update({"historical_mode_source": mode_source, "fallback_entity": fallback_entity,
+                                      "mapping_attested": bool(attest_current_mapping)})
+            mapping = mappings.get(base + ".energy")
+            def complete_counter(samples):
+                valid = sorted((s for s in samples if s.value is not None and s.timestamp <= end), key=lambda s: s.timestamp)
+                before = [s for s in valid if s.timestamp <= start]
+                covered = ([before[-1]] if before else []) + [s for s in valid if start < s.timestamp <= end]
+                delta, _, rejected = counter_delta(samples, start, end,
+                    maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)))
+                return bool(covered and covered[0].timestamp == start and covered[-1].timestamp == end
+                            and all(b.timestamp-a.timestamp <= timedelta(hours=1) for a,b in zip(covered, covered[1:]))
+                            and delta is not None and not rejected)
+
+            if not complete_counter(device.counter) and influx and isinstance(mapping, dict) and mapping.get("entity_id") == item.energy_entity and mapping.get("entity_tag") and mapping.get("unit"):
+                try:
+                    rows = await self.hass.async_add_executor_job(partial(influx.query_counter, mapping["measurement"],
+                        mapping.get("field", "value"), start, end + timedelta(microseconds=1), entity_tag=mapping["entity_tag"]))
+                    converted = states_to_numeric([SimpleNamespace(last_updated=stamp, state=value,
+                        attributes={"unit_of_measurement": mapping["unit"]}) for stamp, value in rows], dimension="energy")
+                    if complete_counter(converted):
+                        device.counter = converted
+                        source.provenance.setdefault("counter_collection", {})[base + ".energy"] = "influx"
+                except Exception as error:
+                    errors.append({"source": base + ".energy", "error": type(error).__name__})
+            # A complete day needs an observed boundary and no long counter gap.
+            if not complete_counter(device.counter):
+                device.counter = []
+                errors.append({"source": base + ".energy", "error": "counter_coverage_incomplete"})
+        report = DailyAggregator(self.timezone, strict_historical=True,
+                                 maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
+                                 assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate"))).aggregate(day, source)
+        return {"local_date": day.isoformat(), "preview": True, "allocations": report.allocations,
+                "errors": errors, "provenance": source.provenance}
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
         explicit = list(temperatures_from_config(self.config))

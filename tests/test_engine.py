@@ -1,11 +1,11 @@
-from datetime import date
+from datetime import date, timedelta
 import json
 from pathlib import Path
 
 import pytest
 
 from custom_components.home_energy_intelligence.engine import DailyAggregator, DailyInput, DeviceHistory
-from custom_components.home_energy_intelligence.models import NumericSample
+from custom_components.home_energy_intelligence.models import NumericSample, StateSample
 from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
 
@@ -26,6 +26,36 @@ def test_october_25_whole_house_reconciliation_and_25_hour_day():
 def test_required_recorder_fixture_values_are_preserved():
     fixture = json.loads((Path(__file__).parent / "fixtures" / "october_2026_stats.json").read_text())
     assert list(fixture["ecodan_daily_kwh"].values()) == [15.87707, 15.26269, 20.19328, 28.78444]
+
+
+def test_strict_historical_preview_preserves_unknown_and_residual():
+    day = date(2026, 9, 25)
+    start, _ = local_day_bounds(day, "Europe/Ljubljana")
+    end = start + timedelta(hours=1)
+    source = DailyInput(devices={"hp": DeviceHistory(
+        kind="heat_pump", state_map={}, mode=[StateSample(start, "unsupported")],
+        power=[NumericSample(start, 1000)], counter=[NumericSample(start, 10), NumericSample(end, 11)],
+    )}, site_counters={}, temperatures={})
+    result = DailyAggregator("Europe/Ljubljana", strict_historical=True,
+                             assumed_heating_reporting="include_in_heating_total").aggregate_range(day, start, end, source)
+    hp = result.allocations["hp"]
+    assert hp["meter_kwh"] == pytest.approx(1)
+    assert hp["categories"]["unknown"] == pytest.approx(.5)
+    assert hp["residual_kwh"] == pytest.approx(.5)
+    assert hp["reported_assumed_heating_kwh"] == 0
+    assert hp["remaining_unassigned_after_fallback_kwh"] == pytest.approx(1)
+
+
+def test_synthetic_reference_sized_meter_is_not_promoted_to_heating():
+    day = date(2026, 9, 25)
+    start, end = local_day_bounds(day, "Europe/Ljubljana")
+    source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump", counter=[
+        NumericSample(start, 1000), NumericSample(end, 1186.105)], mode=[], power=[])},
+        site_counters={}, temperatures={})
+    hp = DailyAggregator("Europe/Ljubljana", strict_historical=True).aggregate(day, source).allocations["hp"]
+    assert hp["meter_kwh"] == pytest.approx(186.105)
+    assert hp["reported_assumed_heating_kwh"] == 0
+    assert hp["residual_kwh"] == pytest.approx(186.105)
 
 
 def test_persisted_checkpoints_survive_recorder_expiration_and_are_primary():

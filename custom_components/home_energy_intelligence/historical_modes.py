@@ -56,3 +56,38 @@ def historical_heat_pump_modes(
         if not result or result[-1].state != category or result[-1].attributes.get("source") != source:
             result.append(StateSample(moment, category, {"source": source}))
     return result
+
+
+def historical_selected_modes(start: datetime, end: datetime, samples: list[StateSample],
+                              *, maximum_age: timedelta = timedelta(hours=1)) -> list[StateSample]:
+    """Keep selected AC modes distinct from confirmed compressor operation."""
+    mapping = {"heat": "heating_selected", "cool": "cooling_selected", "off": "standby"}
+    if start.tzinfo is None or end.tzinfo is None or end <= start or maximum_age <= timedelta(0):
+        raise ValueError("a bounded aware interval and positive freshness are required")
+    ordered = sorted((s for s in samples if s.timestamp.tzinfo is not None and s.timestamp < end),
+                     key=lambda s: s.timestamp)
+    if any(a.timestamp == b.timestamp and a.state != b.state for a, b in zip(ordered, ordered[1:])):
+        raise ValueError("conflicting states at one timestamp")
+    boundaries = {start}
+    for sample in ordered:
+        for moment in (sample.timestamp, sample.timestamp + maximum_age):
+            if start < moment < end:
+                boundaries.add(moment)
+    cursor, latest, result = 0, None, []
+    for moment in sorted(boundaries):
+        while cursor < len(ordered) and ordered[cursor].timestamp <= moment:
+            latest = ordered[cursor]
+            cursor += 1
+        category = "unknown"
+        if latest and moment-latest.timestamp < maximum_age:
+            selected = latest.state.lower()
+            action = str(latest.attributes.get("hvac_action", "")).lower()
+            if selected == "off" and action in {"heating", "cooling"}:
+                category = "unknown"
+            elif selected not in {"unknown", "unavailable"} and action in {"heating", "cooling"}:
+                category = action
+            else:
+                category = mapping.get(selected, "unknown")
+        if not result or result[-1].state != category:
+            result.append(StateSample(moment, category, {"source": "selected_mode"}))
+    return result

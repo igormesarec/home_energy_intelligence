@@ -36,6 +36,7 @@ def configurable_classifier(
     kind: str,
     state_attribute: str | None = None,
     seasonal_fallback: bool = False,
+    strict_historical: bool = False,
 ) -> Callable[[StateSample], str]:
     """Build a classifier from UI configuration without vendor assumptions."""
     normalized = {str(key).lower(): str(value) for key, value in state_map.items()}
@@ -48,6 +49,8 @@ def configurable_classifier(
         mapped = normalized.get(str(raw).lower())
         if mapped:
             return mapped
+        if strict_historical:
+            return "unknown"
         if kind == "heat_pump":
             return "heating_assumed"
         return ac_category(sample, seasonal_fallback=seasonal_fallback)

@@ -25,9 +25,19 @@ Queries use HTTP `POST`; credentials are sent using the Authorization header and
 
 Influx schemas vary. Verify the measurement, field, entity tag, unit, and counter semantics against your own database before enabling a mapping. If returned history cannot be verified, leave the mapping absent; the resulting period remains unavailable.
 
-The bounded text-state and preceding-counter reader methods and the historical
-state-priority helper are preparation only: they are **not connected to energy
-recovery or the dashboard**. Historical energy preview, execution, mapping
-attestation, safe record merging and job resumption are not implemented. Do not
-use this change to run a historical energy backfill. The existing temperature
-recovery remains separate.
+The coordinator has an experimental, read-only single-day preview, not exposed
+to the dashboard or a WebSocket command. It requires the current source mapping
+to have been effective for the requested date or explicit administrator
+attestation. Configure Influx mapping entries by stable equipment ID, with an
+explicit `entity_id`; energy entries also require `measurement`, `unit`, and
+`entity_tag`. The optional `equipment.<id>.fallback_state` entry names the
+selected-mode source. State freshness defaults to 60 minutes. The preview uses
+the strict historical policy: unknown and residual electricity remain separate.
+
+The preview conservatively requires counter samples at both exact day boundaries and
+no counter gap longer than one hour. It may therefore report unavailable even
+when partial measured evidence exists. It does not yet implement separately
+configured actual-DHW evidence, a user-facing authorized preview, safe recovery
+execution, historical record merging, cancellation, or job resumption. Do not
+use it for a historical energy backfill. Existing temperature recovery remains
+separate.

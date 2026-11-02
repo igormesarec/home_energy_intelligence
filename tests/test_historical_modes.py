@@ -2,7 +2,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from custom_components.home_energy_intelligence.historical_modes import historical_heat_pump_modes
+from custom_components.home_energy_intelligence.historical_modes import historical_heat_pump_modes, historical_selected_modes
 from custom_components.home_energy_intelligence.models import StateSample
 from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
@@ -45,3 +45,16 @@ def test_fresh_primary_idle_is_authoritative_over_fallback_and_dhw():
         primary=[StateSample(start, "idle")], actual_dhw=[StateSample(start, "heating_water")],
         fallback=[StateSample(start, "heat")], state_map={"idle": "idle"})
     assert [(item.state, item.attributes["source"]) for item in result] == [("idle", "primary")]
+
+
+def test_ac_modes_preserve_selected_transitions_and_explicit_gaps():
+    start = datetime(2026, 9, 26, tzinfo=UTC)
+    result = historical_selected_modes(start, start+timedelta(hours=4), [
+        StateSample(start, "heat"), StateSample(start+timedelta(minutes=30), "cool"),
+        StateSample(start+timedelta(hours=1), "off"),
+        StateSample(start+timedelta(hours=3), "unavailable"),
+    ])
+    assert [(item.timestamp-start, item.state) for item in result] == [
+        (timedelta(), "heating_selected"), (timedelta(minutes=30), "cooling_selected"),
+        (timedelta(hours=1), "standby"), (timedelta(hours=2), "unknown"),
+    ]
