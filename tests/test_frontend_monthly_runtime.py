@@ -39,6 +39,33 @@ process.stdout.write(panel.settingsView());
     assert 'Unknown / residual' in output
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_historical_preview_shows_status_and_preserves_selection(failure):
+    result = json.loads(run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.shadowRoot={querySelector:(selector)=>({'.temperature-start':{value:'2026-09-01'},'.temperature-end':{value:'2026-09-30'},'.temperature-attest':{checked:true}}[selector])};
+let resolve,reject,request; const frames=[];
+panel.render=()=>frames.push(panel.settingsView());
+panel._hass={callWS:(msg)=>{request=msg;return new Promise((ok,fail)=>{resolve=ok;reject=fail})}};
+(async()=>{const pending=panel.previewHistoricalEnergy();
+if(input.failure)reject({code:'bad_<code>',message:'Invalid <range>'});else resolve({records:[]});
+await pending;process.stdout.write(JSON.stringify({frames,request}));})();
+""", {"failure": failure}))
+    loading, final = result["frames"]
+    assert 'Loading historical energy preview' in loading
+    assert 'historical-energy-preview" disabled' in loading
+    for frame in (loading, final):
+        assert 'value="2026-09-01"' in frame and 'value="2026-09-30"' in frame
+        assert 'class="temperature-attest" type="checkbox" checked' in frame
+    assert result["request"]["attest_current_mapping"] is True
+    if failure:
+        assert 'Preview failed (bad_&lt;code&gt;): Invalid &lt;range&gt;' in final
+        assert 'role="alert"' in final
+    else:
+        assert 'Historical energy preview completed.' in final
+        assert 'No configured equipment evidence.' in final
+
+
 def monthly_payload():
     months = [f"2025-{month:02d}" for month in range(10, 13)] + [
         f"2026-{month:02d}" for month in range(1, 11)
