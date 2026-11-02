@@ -24,3 +24,10 @@ Unicode measurement and field names, including `°C`, are supported through esca
 Queries use HTTP `POST`; credentials are sent using the Authorization header and never appear in URL query parameters. The client exposes no write, retention, purge, or administrative operation.
 
 Influx schemas vary. Verify the measurement, field, entity tag, unit, and counter semantics against your own database before enabling a mapping. If returned history cannot be verified, leave the mapping absent; the resulting period remains unavailable.
+
+The bounded text-state and preceding-counter reader methods and the historical
+state-priority helper are preparation only: they are **not connected to energy
+recovery or the dashboard**. Historical energy preview, execution, mapping
+attestation, safe record merging and job resumption are not implemented. Do not
+use this change to run a historical energy backfill. The existing temperature
+recovery remains separate.

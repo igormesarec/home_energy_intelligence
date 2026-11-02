@@ -1,6 +1,8 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from custom_components.home_energy_intelligence.influx import InfluxBackfillClient
+import pytest
+
+from custom_components.home_energy_intelligence.influx import InfluxBackfillClient, InfluxBackfillError
 import custom_components.home_energy_intelligence.influx as influx_module
 
 
@@ -61,3 +63,48 @@ def test_bounded_historical_temperature_backfill_preserves_timestamps_and_dedupl
     assert rows == [(first, 10.5), (second, 11.0)]
     assert len(calls) == 2
     assert all("LIMIT" in query and "time >=" in query and "time <" in query for query in calls)
+
+
+def test_text_states_keep_fresh_preceding_value_and_exact_timestamps(monkeypatch):
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    client = InfluxBackfillClient(host="localhost", port=8086, database="homeassistant")
+    queries = []
+    def query(statement):
+        queries.append(statement)
+        if "ORDER BY time DESC" in statement:
+            return [(start-timedelta(minutes=30), "heat")]
+        return [(start+timedelta(minutes=5), "heating_water"),
+                (start+timedelta(minutes=10), "unavailable")]
+    monkeypatch.setattr(client, "_query_values", query)
+    rows = client.query_states(start, start+timedelta(hours=1), entity_id="climate.aurora", domain="climate")
+    assert [state for _, state in rows] == ["heat", "heating_water", "unavailable"]
+    assert '"entity_id" = \'aurora\'' in queries[0]
+    assert '"domain" = \'climate\'' in queries[0]
+    assert all('FROM "autogen"."state"' in item and "SELECT" in item for item in queries)
+
+
+def test_state_queries_reject_conflicting_duplicates_and_budget_overflow(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    client = InfluxBackfillClient(host="localhost", port=8086, database="homeassistant", max_points=2)
+    def conflicting(query):
+        return [] if "ORDER BY time DESC" in query else [(start, "heat"), (start, "cool")]
+    monkeypatch.setattr(client, "_query_values", conflicting)
+    with pytest.raises(InfluxBackfillError, match="conflicting"):
+        client.query_states(start, start+timedelta(hours=1), entity_id="sensor.mode", domain="sensor")
+    client.max_points = 1
+    monkeypatch.setattr(client, "_query_values", lambda q: [] if "DESC" in q else [(start, "heat"), (start+timedelta(minutes=1), "cool")])
+    with pytest.raises(InfluxBackfillError, match="point limit"):
+        client.query_states(start, start+timedelta(hours=1), entity_id="sensor.mode", domain="sensor")
+
+
+def test_counter_baseline_is_bounded_and_missing_is_not_invented(monkeypatch):
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    client = InfluxBackfillClient(host="localhost", port=8086, database="homeassistant")
+    calls = []
+    monkeypatch.setattr(client, "_query", lambda q: calls.append(q) or [(start-timedelta(minutes=15), 100.0)])
+    monkeypatch.setattr(client, "query", lambda *args, **kwargs: [(start+timedelta(minutes=30), 101.0)])
+    result = client.query_counter("kWh", "value", start, start+timedelta(hours=1), entity_tag="energy")
+    assert result[0] == (start-timedelta(minutes=15), 100.0)
+    assert "ORDER BY time DESC LIMIT 1" in calls[0]
+    monkeypatch.setattr(client, "_query", lambda q: [])
+    assert client.query_counter("kWh", "value", start, start+timedelta(hours=1), entity_tag="energy") == [(start+timedelta(minutes=30), 101.0)]

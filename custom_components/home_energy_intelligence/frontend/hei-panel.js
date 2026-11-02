@@ -37,6 +37,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.historyTotal = 0;
     this.responseProfileData = null;
     this.temperatureDiagnostics = null;
+    this.temperatureRecoveryStart = null;
+    this.temperatureRecoveryEnd = null;
     this.temperatureRepairResult = null;
     this.temperatureBackfillJob = null;
     this.temperatureBackfillPolling = null;
@@ -720,8 +722,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const diagnosticRows=(this.temperatureDiagnostics?.sources||[]).map((row)=>`<tr><td>${esc(row.display_name)}<br>${row.configured&&row.enabled?"configured · enabled":"disabled or unavailable"}</td><td><code>${esc(row.source_id)}</code><br><code>${esc(row.entity_id)}</code><br>${row.attribute?`attribute <code>${esc(row.attribute)}</code>`:"entity state"}</td><td>${esc(row.live_state??"unavailable")} ${esc(row.live_unit||"")}<br>${esc(row.live_last_updated||"no update")}<br>${row.attribute_available?"attribute valid":"attribute unavailable"} · ${esc(row.unit_validation||"unknown unit")}</td><td>${row.recorder_state_rows||0} states / ${row.recorder_statistics_rows||0} statistics<br>${esc(row.available_start||"—")}–${esc(row.available_end||"—")}<br>${n(row.validated_coverage_seconds,0)} validated seconds</td><td>${row.persisted_valid_hourly_summaries||0} hourly / ${row.persisted_valid_daily_summaries||0} daily<br>${row.temperature_only_hourly_summaries||0} / ${row.temperature_only_daily_summaries||0} temperature-only<br>${n(row.persisted_hourly_coverage_percent,1)}% · ${row.missing_interval_count||0} missing</td><td>${esc(row.pipeline_stage).replaceAll("_"," ")}<br>${esc(row.mapping_eligibility?.reason||"mapping checked").replaceAll("_"," ")}<br>${row.recoverable_missing_interval_count||0} recoverable / ${row.nonrecoverable_interval_count||0} blocked</td><td>${esc((row.invalid_reasons||[]).join(", ")||"—")}<br>${esc((row.rejected_samples||[]).map((item)=>item.reason).join(", ")||"—")}</td></tr>`).join("");
     const diagnosticSetup=this.temperatureDiagnostics?.configuration_status==="not_configured"?'<p class="warning">No temperature source is configured. <a href="/config/integrations/integration/home_energy_intelligence">Open integration options</a> to add one; no source will be inferred.</p>':"";
     const localToday=String(this.overviewData?.cutoff_local||"").slice(0,10);
-    const startDefault=this.temperatureBackfillJob?.start_date||this.temperatureDiagnostics?.requested_start||localToday;
-    const endDefault=this.temperatureBackfillJob?.end_date||this.temperatureDiagnostics?.requested_end||localToday;
+    const startDefault=this.temperatureRecoveryStart||this.temperatureBackfillJob?.start_date||this.temperatureDiagnostics?.requested_start||localToday;
+    const endDefault=this.temperatureRecoveryEnd||this.temperatureBackfillJob?.end_date||this.temperatureDiagnostics?.requested_end||localToday;
     const job=this.temperatureBackfillJob; const jobDetails=job?.details||job||{};
     const jobOutcome=jobDetails.outcome||job?.status;
     const jobOutcomeLabel={records_recovered:"Records recovered",no_changes_needed:"No changes needed",no_records_recovered_action_required:"No records recovered — action required",preview_no_recoverable_records_action_required:"No recoverable records in preview — action required",preview_ready:"Preview ready"}[jobOutcome]||String(jobOutcome||"queued").replaceAll("_"," ");
@@ -768,6 +770,8 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.shadowRoot.querySelector(".next")?.addEventListener("click", () => { this.historyOffset += 90; this.loadPeriod(); });
     this.shadowRoot.querySelector(".previous")?.addEventListener("click", () => { this.historyOffset = Math.max(0, this.historyOffset - 90); this.loadPeriod(); });
     this.shadowRoot.querySelector(".temperature-diagnostics")?.addEventListener("click", () => this.loadTemperatureDiagnostics());
+    this.shadowRoot.querySelector(".temperature-start")?.addEventListener("input", (event) => { this.temperatureRecoveryStart=event.target.value; });
+    this.shadowRoot.querySelector(".temperature-end")?.addEventListener("input", (event) => { this.temperatureRecoveryEnd=event.target.value; });
     this.shadowRoot.querySelector(".temperature-repair")?.addEventListener("click", () => this.repairTemperatureHistory());
     this.shadowRoot.querySelector(".temperature-backfill-preview")?.addEventListener("click", () => this.startTemperatureBackfill(true));
     this.shadowRoot.querySelector(".temperature-backfill-start")?.addEventListener("click", () => this.startTemperatureBackfill(false));

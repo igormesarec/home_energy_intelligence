@@ -100,6 +100,17 @@ panel.analysisMetrics=['vendor_combined_cop'];process.stdout.write(panel.tempera
     assert 'aria-label="Monthly COP"' not in output
 
 
+def test_temperature_recovery_dates_survive_old_job_status():
+    output = run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.temperatureRecoveryStart='2026-09-01';panel.temperatureRecoveryEnd='2026-09-30';
+panel.temperatureBackfillJob={start_date:'2026-08-01',end_date:'2026-08-10',status:'completed'};
+process.stdout.write(panel.settingsView());
+""", {})
+    assert 'class="temperature-start" type="date" value="2026-09-01"' in output
+    assert 'class="temperature-end" type="date" value="2026-09-30"' in output
+
+
 def test_yesterday_history_survives_optional_thermal_report_failure():
     output = run_panel(r"""
 panel.shadowRoot={querySelector:(selector)=>selector==='.period-select'?{value:'yesterday'}:null};
