@@ -83,6 +83,30 @@ def test_corrupt_evidence_is_excluded_from_reporting_candidates(tmp_path):
     assert result["ambiguous"][0]["reason"] == "checksum_mismatch"
 
 
+def test_reporting_evidence_requires_persisted_exact_mapping_event(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    mapping = {"equipment_id": "hp", "energy_entity": "sensor.hp", "state_entity": "sensor.mode",
+               "state_attribute": None, "state_map": {"heat": "confirmed_heating"}, "enabled": True}
+    event = db.ensure_mapping_revision({"effective_at": "2026-01-01T00:00:00+00:00", "equipment": [mapping]})
+    record = evidence("2026-09-25")
+    record["mapping_applicability"] = {"status": "verified", "source_entity_id": "sensor.hp",
+        "effective_start_utc": "2026-01-01T00:00:00+00:00", "effective_end_utc": "2026-12-01T00:00:00+00:00",
+        "mapping_event_id": event["mapping_event_id"],
+        "mapping_identity": {key: mapping[key] for key in ("equipment_id", "energy_entity", "state_entity", "state_attribute", "state_map")}}
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [record])
+    assert len(db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")["records"]) == 1
+    fallback_record = {**evidence("2026-09-26"), "mapping_applicability": record["mapping_applicability"],
+                       "source_provenance": {"fallback_entity": "climate.zone"}}
+    fallback_job = db.create_electricity_recovery_job("2026-09-26", "2026-09-26", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(fallback_job, "2026-09-26", [fallback_record])
+    assert db.electricity_recovery_evidence_range("2026-09-26", "2026-09-26")["ambiguous"][0]["reason"] == "mapping_interval_unverified"
+    db.ensure_mapping_revision({"effective_at": "2026-09-25T12:00:00+00:00", "equipment": [{**mapping, "state_entity": "sensor.changed"}]})
+    blocked = db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")
+    assert blocked["records"] == [] and blocked["ambiguous"][0]["reason"] == "mapping_interval_unverified"
+
+
 def test_atomic_failure_and_overlap_cancellation(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()

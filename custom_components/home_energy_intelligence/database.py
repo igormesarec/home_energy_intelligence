@@ -802,6 +802,8 @@ class EnergyDatabase:
             rows = connection.execute("""SELECT local_date,source_key,payload_json,checksum
                 FROM electricity_recovery_evidence WHERE local_date>=? AND local_date<=?
                 ORDER BY local_date,source_key,checksum""", (start_date, end_date)).fetchall()
+            events = connection.execute("""SELECT id,effective_at,payload_json FROM temperature_mapping_events
+                ORDER BY effective_at,id""").fetchall()
         grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
         for row in rows:
             grouped.setdefault((row["local_date"], row["source_key"]), []).append(row)
@@ -814,7 +816,46 @@ class EnergyDatabase:
             if _checksum(row["payload_json"]) != row["checksum"]:
                 ambiguous.append({"local_date": local_day, "source_key": key, "reason": "checksum_mismatch"})
                 continue
-            records.append(json.loads(row["payload_json"]))
+            record = json.loads(row["payload_json"])
+            applicability = record.get("mapping_applicability")
+            if not isinstance(applicability, dict) or applicability.get("source_entity_id") != record.get("source_entity_id") or applicability.get("status") != "verified":
+                ambiguous.append({"local_date": local_day, "source_key": key, "reason": "mapping_applicability_unverified"})
+                continue
+            try:
+                interval_start = datetime.fromisoformat(record["interval_start_utc"])
+                interval_end = datetime.fromisoformat(record["interval_end_utc"])
+                effective_start = datetime.fromisoformat(applicability["effective_start_utc"])
+                effective_end = datetime.fromisoformat(applicability["effective_end_utc"])
+                if any(value.tzinfo is None for value in (interval_start, interval_end, effective_start, effective_end)) or effective_start > interval_start or effective_end < interval_end:
+                    raise ValueError("mapping does not cover interval")
+                # Never trust an applicability assertion in the evidence alone.
+                # It must reference the active, unchanged persisted mapping event.
+                timed = [(datetime.fromisoformat(item["effective_at"]), item) for item in events]
+                if any(stamp.tzinfo is None for stamp, _ in timed):
+                    raise ValueError("naive mapping event")
+                prior = [(stamp, item) for stamp, item in timed if stamp <= interval_start]
+                if not prior or any(interval_start < stamp < interval_end for stamp, _ in timed):
+                    raise ValueError("mapping event unavailable or changed")
+                event = prior[-1][1]
+                if event["id"] != applicability.get("mapping_event_id"):
+                    raise ValueError("mapping event mismatch")
+                mapping = json.loads(event["payload_json"])
+                if not key.startswith("equipment."):
+                    raise ValueError("site mapping identity is not stored in this schema")
+                equipment = [item for item in mapping.get("equipment", []) if item.get("equipment_id") == key.removeprefix("equipment.")]
+                if len(equipment) != 1 or not equipment[0].get("enabled", True) or equipment[0].get("energy_entity") != record.get("source_entity_id"):
+                    raise ValueError("source entity mismatch")
+                # Fallback Influx mode mappings are not stored in mapping events;
+                # their historical identity cannot be proven by this schema.
+                if record.get("source_provenance", {}).get("fallback_entity"):
+                    raise ValueError("fallback mapping identity unavailable")
+                identity = {name: equipment[0].get(name) for name in ("equipment_id", "energy_entity", "state_entity", "state_attribute", "state_map")}
+                if applicability.get("mapping_identity") != identity:
+                    raise ValueError("mode mapping identity mismatch")
+            except (KeyError, TypeError, ValueError):
+                ambiguous.append({"local_date": local_day, "source_key": key, "reason": "mapping_interval_unverified"})
+                continue
+            records.append(record)
         return {"records": records, "ambiguous": ambiguous}
 
     def cancel_electricity_recovery_job(self, job_id: int) -> bool:

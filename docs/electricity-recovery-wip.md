@@ -18,6 +18,10 @@ against production from this draft.
 
 The storage reader deliberately excludes a source-day when multiple evidence
 checksums exist or an evidence checksum fails validation. There is currently no
-durable mapping-effective identity and administrator-approved version selection
-for resolving those cases. Selecting the newest observation would risk silently
-replacing stronger evidence. No reporting overlay uses this reader yet.
+administrator-approved version selection for resolving those cases. A single
+candidate is eligible only when its source and mode mapping exactly match a
+persisted mapping event covering the full local day. The current mapping-event
+schema does not include the configured Influx fallback-mode entity or site meter
+identity, so those sources remain excluded. An assertion in the evidence alone
+does not establish applicability. Selecting the newest observation would risk
+silently replacing stronger evidence. No reporting overlay uses this reader yet.
