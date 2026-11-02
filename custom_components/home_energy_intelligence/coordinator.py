@@ -109,20 +109,27 @@ class HomeEnergyCoordinator:
             "mapping_effective_at": self.mapping_revision.get("effective_at"),
         }
 
-    async def async_preview_historical_energy(self, day: date, *, attest_current_mapping: bool = False) -> dict[str, object]:
+    async def async_preview_historical_energy(self, day: date, *, attest_current_mapping: bool = False,
+                                              evidence_only: bool = False) -> dict[str, object]:
         """Read-only single-day preview; no database mutations or automatic execution.
 
-        The caller must be an administrator and explicitly attest older current
-        mappings. The WebSocket entry point requires administrator access.
+        The WebSocket entry point requires administrator access. Evidence-only
+        results use exact configured sources with explicitly unverified mappings.
         """
         start, end = local_day_bounds(day, self.timezone)
+        if evidence_only and attest_current_mapping:
+            raise ValueError("evidence-only preview cannot be combined with historical mapping attestation")
         try:
             effective = datetime.fromisoformat(str(self.mapping_revision["effective_at"]).replace("Z", "+00:00"))
         except (KeyError, ValueError, TypeError):
             effective = None
-        if not attest_current_mapping and (effective is None or effective.tzinfo is None or effective > start):
+        if not evidence_only and not attest_current_mapping and (effective is None or effective.tzinfo is None or effective > start):
             raise ValueError("historical mapping identity requires administrator attestation")
-        source = await self._async_collect_range(start, end, store_mapping_revision=False, include_temperatures=False, strict_sources=True, attest_sources=attest_current_mapping)
+        collection_options = {"store_mapping_revision": False, "include_temperatures": False,
+                              "strict_sources": True, "attest_sources": attest_current_mapping}
+        if evidence_only:
+            collection_options["exact_source_identity"] = True
+        source = await self._async_collect_range(start, end, **collection_options)
         try:
             mappings = json.loads(self.config.get(CONF_INFLUX_MAPPING, "{}") or "{}")
             if not isinstance(mappings, dict):
@@ -150,6 +157,8 @@ class HomeEnergyCoordinator:
                 continue
             device = source.devices[item.equipment_id]
             base = f"equipment.{item.equipment_id}"
+            if evidence_only:
+                device.mode = [sample for sample in device.mode if start-freshness <= sample.timestamp < end]
             mode_source = "recorder" if device.mode else "unavailable"
 
             async def influx_states(key: str, expected_entity: str | None) -> list[StateSample]:
@@ -184,6 +193,8 @@ class HomeEnergyCoordinator:
                     errors.append({"source": base + ".fallback_state", "error": type(error).__name__})
                 if not fallback:
                     fallback = await influx_states(base + ".fallback_state", fallback_entity)
+                if evidence_only:
+                    fallback = [sample for sample in fallback if start-freshness <= sample.timestamp < end]
             if item.kind == "heat_pump":
                 dhw_config = mappings.get(base + ".actual_dhw_state")
                 dhw_entity = (dhw_config.get("entity_id") if isinstance(dhw_config, dict)
@@ -197,9 +208,16 @@ class HomeEnergyCoordinator:
                         errors.append({"source": base + ".actual_dhw_state", "error": type(error).__name__})
                     if not actual_dhw:
                         actual_dhw = await influx_states(base + ".actual_dhw_state", dhw_entity)
+                    if evidence_only:
+                        actual_dhw = [sample for sample in actual_dhw if start-freshness <= sample.timestamp < end]
                 primary = ([StateSample(sample.timestamp, str(sample.attributes.get(item.state_attribute, "unavailable")),
                                         sample.attributes) for sample in device.mode]
                            if item.state_attribute else device.mode)
+                if evidence_only and (item.state_entity or "").startswith("climate."):
+                    # A climate selection is not proof of actual compressor operation.
+                    if not fallback:
+                        fallback = primary
+                    primary = []
                 device.mode = historical_heat_pump_modes(start, end, primary=primary, actual_dhw=actual_dhw, fallback=fallback,
                                                          state_map=item.state_map, maximum_age=freshness)
                 device.state_map = {name: name for name in ("confirmed_heating", "dhw", "cooling", "idle", "heating_assumed", "unknown")}
@@ -208,7 +226,9 @@ class HomeEnergyCoordinator:
                 device.state_map = {name: name for name in ("heating", "cooling", "heating_selected", "cooling_selected", "standby", "unknown")}
             device.state_attribute = None
             device.provenance.update({"historical_mode_source": mode_source, "fallback_entity": fallback_entity,
-                                      "mapping_attested": bool(attest_current_mapping)})
+                                      "mapping_attested": bool(attest_current_mapping),
+                                      "fallback_observation_count": len(fallback),
+                                      "historical_mapping_quality": "unverified historical mapping" if evidence_only else "normal"})
             mapping = mappings.get(base + ".energy")
             def counter_coverage(samples):
                 valid, _ = historical_counter_observations([s for s in samples if start <= s.timestamp <= end])
@@ -251,7 +271,8 @@ class HomeEnergyCoordinator:
                 unit = live_state.attributes.get("unit_of_measurement") if live_state else None
             mapping_identity_ok = (isinstance(mapping, dict) and
                 (mapping.get("entity_id") == item.energy_entity or
-                 (not mapping.get("entity_id") and attest_current_mapping)))
+                 (not mapping.get("entity_id") and attest_current_mapping)) and
+                (not evidence_only or mapping.get("entity_tag") == (item.energy_entity or "").partition(".")[2]))
             if influx and isinstance(mapping, dict) and not mapping_identity_ok:
                 errors.append({"source": base + ".energy", "error": "counter_source_identity_unverified"})
             if recorder_coverage < (end-start).total_seconds() and influx and mapping_identity_ok and mapping.get("entity_tag") and unit:
@@ -328,7 +349,9 @@ class HomeEnergyCoordinator:
                                     "complete" if observed.covered_seconds >= observed.period_seconds and not observed.rejected_count and not observed.reset_count
                                     else "partial_known_subtotal"),
                          "source": source.provenance.get("counter_collection", {}).get(f"site.{key}", "unavailable")}
-        return {"local_date": day.isoformat(), "preview": True, "allocations": report.allocations, "site": site,
+        return {"local_date": day.isoformat(), "preview": True, "evidence_only": evidence_only,
+                "historical_mapping_quality": "unverified historical mapping" if evidence_only else "normal",
+                "allocations": report.allocations, "site": site,
                 "errors": errors, "provenance": source.provenance}
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
@@ -1639,7 +1662,7 @@ class HomeEnergyCoordinator:
     async def _async_collect_range(
         self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None,
         store_mapping_revision: bool = True, include_temperatures: bool = True, strict_sources: bool = False,
-        attest_sources: bool = False,
+        attest_sources: bool = False, exact_source_identity: bool = False,
     ) -> DailyInput:
         equipment = [item for item in equipment_from_config(self.config) if item.enabled]
         if equipment_ids is not None:
@@ -1797,7 +1820,8 @@ class HomeEnergyCoordinator:
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
             if (strict_sources and isinstance(mapping, dict) and
                     ((mapping.get("entity_id") != entity_id and
-                      (mapping.get("entity_id") is not None or not attest_sources)) or not mapping.get("entity_tag"))):
+                      (mapping.get("entity_id") is not None or not attest_sources)) or not mapping.get("entity_tag") or
+                     (exact_source_identity and mapping.get("entity_tag") != entity_id.partition(".")[2]))):
                 query_errors.append({"query": "influx", "source_key": source_key,
                                      "entity_id": entity_id, "error": "SourceIdentityUnverified"})
                 mapping = None

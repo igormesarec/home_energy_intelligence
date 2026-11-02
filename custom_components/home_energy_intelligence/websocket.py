@@ -1186,6 +1186,7 @@ async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
     vol.Required("type"): f"{DOMAIN}/historical_energy_preview",
     vol.Required("start_date"): str, vol.Required("end_date"): str,
     vol.Optional("attest_current_mapping", default=False): bool,
+    vol.Optional("evidence_only", default=False): bool,
 })
 @websocket_api.require_admin
 @websocket_api.async_response
@@ -1197,17 +1198,21 @@ async def ws_historical_energy_preview(hass, connection, msg):
         return
     try:
         start, end = _diagnostic_dates(coordinator, msg)
+        if msg.get("evidence_only", False) and msg["attest_current_mapping"]:
+            raise ValueError("evidence-only preview cannot be combined with historical mapping attestation")
         rows = []
         day = start
         while day <= end:
             rows.append(await coordinator.async_preview_historical_energy(
-                day, attest_current_mapping=msg["attest_current_mapping"]))
+                day, attest_current_mapping=msg["attest_current_mapping"], evidence_only=msg.get("evidence_only", False)))
             day += timedelta(days=1)
     except ValueError as error:
         connection.send_error(msg["id"], "invalid_range_or_mapping", str(error))
         return
     connection.send_result(msg["id"], {"start_date": start.isoformat(), "end_date": end.isoformat(),
-                                      "preview": True, "records": rows})
+                                      "preview": True, "evidence_only": msg.get("evidence_only", False),
+                                      "historical_mapping_quality": "unverified historical mapping" if msg.get("evidence_only", False) else "normal",
+                                      "records": rows})
 
 
 @websocket_api.websocket_command({

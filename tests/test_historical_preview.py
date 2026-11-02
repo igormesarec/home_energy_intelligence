@@ -54,6 +54,67 @@ async def test_preview_rejects_unattested_newer_mapping_before_collection():
 
 
 @pytest.mark.asyncio
+async def test_evidence_only_does_not_attest_future_operation_or_confirm_selected_heat():
+    day = date(2026, 9, 25)
+    start = datetime(2026, 9, 25, tzinfo=UTC)
+    source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump",
+        counter=[NumericSample(start, 10), NumericSample(start + timedelta(hours=1), 11)],
+        mode=[StateSample(datetime(2026, 10, 9, tzinfo=UTC), "heating_water")])},
+        site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    fallback = SimpleNamespace(last_updated=start, state="heat", attributes={})
+    collector = AsyncMock(return_value=source)
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-10-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump",
+                               "state_entity": "sensor.operation", "state_map": {"heating_water": "dhw"}}],
+                "influx_mapping_json": json.dumps({"equipment.hp.fallback_state": {"entity_id": "climate.zone"}})},
+        reader=SimpleNamespace(async_history=AsyncMock(return_value={"climate.zone": [fallback]})),
+        _async_collect_range=collector)
+    result = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True)
+    allocation = result["allocations"]["hp"]
+    assert result["historical_mapping_quality"] == "unverified historical mapping"
+    assert allocation["categories"] == {"heating_assumed": pytest.approx(1)}
+    assert not allocation["source_provenance"]["mapping_attested"]
+    assert collector.await_args.kwargs["attest_sources"] is False
+    assert collector.await_args.kwargs["exact_source_identity"] is True
+    collector.reset_mock()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True, attest_current_mapping=True)
+    collector.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evidence_only_never_promotes_climate_selection_to_confirmed_heat():
+    day = date(2026, 9, 28)
+    start = datetime(2026, 9, 28, tzinfo=UTC)
+    source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump",
+        counter=[NumericSample(start, 10), NumericSample(start + timedelta(hours=1), 11)],
+        mode=[StateSample(start, "heat")])}, site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-10-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump",
+                               "state_entity": "climate.zone", "state_map": {"heat": "confirmed_heating"}}]},
+        _async_collect_range=AsyncMock(return_value=source))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True)
+    assert report["allocations"]["hp"]["categories"] == {"heating_assumed": pytest.approx(1)}
+
+
+@pytest.mark.asyncio
+async def test_evidence_only_rejects_mismatched_influx_entity_tag(monkeypatch):
+    class FakeInflux:
+        def __init__(self, **kwargs): pass
+        def query_counter(self, *args, **kwargs): raise AssertionError("mismatched tag was queried")
+    monkeypatch.setattr("custom_components.home_energy_intelligence.coordinator.InfluxBackfillClient", FakeInflux)
+    source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump")}, site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-10-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.correct"}],
+                "influx_enabled": True, "influx_host": "localhost", "influx_database": "homeassistant",
+                "influx_mapping_json": json.dumps({"equipment.hp.energy": {"entity_id": "sensor.correct", "entity_tag": "other", "unit": "kWh"}})},
+        _async_collect_range=AsyncMock(return_value=source))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, date(2026, 9, 25), evidence_only=True)
+    assert report["allocations"]["hp"]["meter_kwh"] is None
+    assert any(item["error"] == "counter_source_identity_unverified" for item in report["errors"])
+
+
+@pytest.mark.asyncio
 async def test_preview_reads_configured_influx_when_recorder_missing_without_double_count(monkeypatch):
     day = date(2026, 10, 9)
     start = datetime(2026, 10, 9, tzinfo=UTC)

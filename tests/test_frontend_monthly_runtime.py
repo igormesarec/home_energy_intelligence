@@ -66,6 +66,19 @@ await pending;process.stdout.write(JSON.stringify({frames,request}));})();
         assert 'No configured equipment evidence.' in final
 
 
+def test_evidence_only_preview_sends_option_and_labels_unverified_results():
+    result = json.loads(run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.shadowRoot={querySelector:(s)=>({'.temperature-start':{value:'2026-09-01'},'.temperature-end':{value:'2026-09-30'},'.temperature-attest':{checked:false},'.historical-evidence-only':{checked:true}}[s])};
+let request;panel.render=()=>{};panel._hass={callWS:async(msg)=>{request=msg;return {evidence_only:true,records:[]}}};
+(async()=>{await panel.previewHistoricalEnergy();process.stdout.write(JSON.stringify({request,html:panel.settingsView()}));})();
+""", {}))
+    assert result["request"]["evidence_only"] is True
+    assert result["request"]["attest_current_mapping"] is False
+    assert "unverified historical mapping" in result["html"]
+    assert 'class="historical-evidence-only" type="checkbox" checked' in result["html"]
+
+
 def monthly_payload():
     months = [f"2025-{month:02d}" for month in range(10, 13)] + [
         f"2026-{month:02d}" for month in range(1, 11)
