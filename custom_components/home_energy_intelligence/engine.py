@@ -118,6 +118,7 @@ class DailyAggregator:
                     result = (allocate_historical_counter_increments(
                         start=interval_start, end=interval_end, mode_samples=history.mode,
                         counter_samples=history.counter, classifier=classifier,
+                        power_samples=history.power,
                         maximum_delta_kwh=self.maximum_counter_delta_kwh,
                     ) if self.strict_historical else allocate_interval(
                         start=interval_start,

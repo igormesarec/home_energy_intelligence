@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .allocation import allocate_interval, configurable_classifier, counter_delta
+from .allocation import allocate_interval, allocate_historical_counter_increments, configurable_classifier, counter_delta
 from .configuration import (
     equipment_from_config, equipment_temperature_mappings, mapping_revision,
     temperatures_from_config,
@@ -40,6 +40,25 @@ from .timeutils import local_day_bounds
 
 LEGACY_SITE_KEYS = {"pv": "pv_energy", "import": "grid_import", "export": "grid_export"}
 _LOGGER = logging.getLogger(__name__)
+
+
+def _merge_preview_counters(recorder, archive, *, identity_verified):
+    """Combine only independently matching observations of the same counter."""
+    if not recorder:
+        return archive, "influx", None
+    if not archive:
+        return recorder, "recorder", None
+    left = {s.timestamp: s for s in recorder}
+    right = {s.timestamp: s for s in archive}
+    overlap = left.keys() & right.keys()
+    if not identity_verified:
+        return recorder, "recorder", "counter_source_identity_unverified"
+    if not overlap:
+        return recorder, "recorder", "counter_overlap_unverified"
+    if any(left[t].value is None or right[t].value is None or
+           abs(left[t].value - right[t].value) > 1e-6 for t in overlap):
+        return recorder, "recorder", "counter_overlap_conflict"
+    return sorted({**right, **left}.values(), key=lambda s: s.timestamp), "recorder_and_influx", None
 
 
 def _validated_temperature_coverage(
@@ -89,7 +108,7 @@ class HomeEnergyCoordinator:
         """Read-only single-day preview; no database mutations or automatic execution.
 
         The caller must be an administrator and explicitly attest older current
-        mappings. This method is not registered as a WebSocket command.
+        mappings. The WebSocket entry point requires administrator access.
         """
         start, end = local_day_bounds(day, self.timezone)
         try:
@@ -98,7 +117,7 @@ class HomeEnergyCoordinator:
             effective = None
         if not attest_current_mapping and (effective is None or effective.tzinfo is None or effective > start):
             raise ValueError("historical mapping identity requires administrator attestation")
-        source = await self._async_collect_range(start, end, store_mapping_revision=False)
+        source = await self._async_collect_range(start, end, store_mapping_revision=False, include_temperatures=False, strict_sources=True, attest_sources=attest_current_mapping)
         try:
             mappings = json.loads(self.config.get(CONF_INFLUX_MAPPING, "{}") or "{}")
             if not isinstance(mappings, dict):
@@ -114,6 +133,9 @@ class HomeEnergyCoordinator:
                 verify_ssl=bool(self.config.get("influx_verify_ssl", True)),
                 retention_policy=str(self.config.get("influx_retention_policy", "autogen")))
         errors = []
+        for source_key in source.provenance.get("influx_backfill_keys", []):
+            if source_key.startswith("site.") or (source_key.startswith("equipment.") and source_key.endswith(".energy")):
+                source.provenance.setdefault("counter_collection", {})[source_key] = "influx"
         freshness_minutes = int(self.config.get("historical_mode_freshness_minutes", 60))
         if not 1 <= freshness_minutes <= 1440:
             raise ValueError("historical mode freshness must be between 1 and 1440 minutes")
@@ -224,32 +246,82 @@ class HomeEnergyCoordinator:
             if not unit and item.energy_entity:
                 live_state = self.hass.states.get(item.energy_entity)
                 unit = live_state.attributes.get("unit_of_measurement") if live_state else None
-            if recorder_coverage < (end-start).total_seconds() and influx and isinstance(mapping, dict) and mapping.get("entity_id", item.energy_entity) == item.energy_entity and mapping.get("entity_tag") and unit:
+            mapping_identity_ok = (isinstance(mapping, dict) and
+                (mapping.get("entity_id") == item.energy_entity or
+                 (not mapping.get("entity_id") and attest_current_mapping)))
+            if influx and isinstance(mapping, dict) and not mapping_identity_ok:
+                errors.append({"source": base + ".energy", "error": "counter_source_identity_unverified"})
+            if recorder_coverage < (end-start).total_seconds() and influx and mapping_identity_ok and mapping.get("entity_tag") and unit:
                 try:
                     rows = await self.hass.async_add_executor_job(partial(influx.query_counter, mapping["measurement"],
                         mapping.get("field", "value"), start, end + timedelta(microseconds=1), entity_tag=mapping["entity_tag"], include_following=True))
                     converted = states_to_numeric([SimpleNamespace(last_updated=stamp, state=value,
                         attributes={"unit_of_measurement": unit}) for stamp, value in rows], dimension="energy")
-                    if counter_coverage(converted) > recorder_coverage:
-                        device.counter = converted
-                        source.provenance.setdefault("counter_collection", {})[base + ".energy"] = "influx"
+                    existing_source = source.provenance.get("counter_collection", {}).get(base + ".energy", "")
+                    identity_verified = (mapping_identity_ok
+                                         and existing_source != "recorder_statistics")
+                    combined, selected_source, merge_error = _merge_preview_counters(
+                        device.counter, converted, identity_verified=identity_verified)
+                    if merge_error:
+                        errors.append({"source": base + ".energy", "error": merge_error})
+                    if counter_coverage(combined) > recorder_coverage:
+                        device.counter = combined
+                        source.provenance.setdefault("counter_collection", {})[base + ".energy"] = selected_source
                 except Exception as error:
                     errors.append({"source": base + ".energy", "error": type(error).__name__})
             coverage_seconds = counter_coverage(device.counter)
             in_day = sorted((s.timestamp for s in device.counter if start <= s.timestamp <= end))
+            missing_intervals = []
+            if not in_day:
+                missing_intervals.append({"start": start.isoformat(), "end": end.isoformat(), "reason": "no_counter_observations"})
+            else:
+                if in_day[0] > start:
+                    missing_intervals.append({"start": start.isoformat(), "end": in_day[0].isoformat(), "reason": "missing_start_boundary"})
+                for left, right in zip(in_day, in_day[1:]):
+                    if right-left > timedelta(hours=1):
+                        missing_intervals.append({"start": left.isoformat(), "end": right.isoformat(), "reason": "recording_gap"})
+                if in_day[-1] < end:
+                    missing_intervals.append({"start": in_day[-1].isoformat(), "end": end.isoformat(), "reason": "missing_end_boundary"})
             device.provenance.update({"meter_coverage_seconds": coverage_seconds,
                                       "meter_expected_seconds": (end-start).total_seconds(),
+                                      "meter_evidence_status": ("unavailable" if not in_day or coverage_seconds == 0 else
+                                          "complete" if coverage_seconds >= (end-start).total_seconds() else "partial_known_subtotal"),
                                       "energy_entity_id": item.energy_entity,
                                       "state_entity_id": item.state_entity,
                                       "first_observation_utc": in_day[0].isoformat() if in_day else None,
                                       "last_observation_utc": in_day[-1].isoformat() if in_day else None,
+                                      "missing_intervals": missing_intervals[:50],
                                       "boundary_policy": "observed_whole_increments_only"})
             if coverage_seconds < (end-start).total_seconds():
                 errors.append({"source": base + ".energy", "error": "counter_coverage_incomplete"})
         report = DailyAggregator(self.timezone, strict_historical=True,
                                  maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
                                  assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate"))).aggregate_range(day, start, end, source)
-        return {"local_date": day.isoformat(), "preview": True, "allocations": report.allocations,
+        site = {}
+        for key in ("pv", "import", "export"):
+            site_entity = self._site_sources().get(key) if hasattr(self, "_site_sources") else None
+            samples = source.site_counters.get(key, [])
+            if not samples and site_entity and getattr(self, "reader", None) is not None:
+                try:
+                    history = await self.reader.async_history([site_entity], start, end)
+                    samples = states_to_numeric(history.get(site_entity, []), dimension="energy")
+                    if samples:
+                        source.provenance.setdefault("counter_collection", {})[f"site.{key}"] = "recorder_states_partial"
+                except Exception as error:
+                    errors.append({"source": f"site.{key}", "error": type(error).__name__})
+            observed = allocate_historical_counter_increments(
+                start=start, end=end, counter_samples=samples,
+                mode_samples=[StateSample(start, "measured")], classifier=lambda _: "measured",
+                maximum_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)))
+            site[key] = {"meter_kwh": observed.meter_kwh, "covered_seconds": observed.covered_seconds,
+                         "period_seconds": observed.period_seconds, "rejected_count": observed.rejected_count,
+                         "reset_count": observed.reset_count,
+                         "entity_id": site_entity,
+                         "status": ("unavailable" if observed.meter_kwh is None else
+                                    "complete" if observed.covered_seconds >= observed.period_seconds and not observed.rejected_count and not observed.reset_count
+                                    else "partial_known_subtotal"),
+                         "source": source.provenance.get("counter_collection", {}).get(f"site.{key}", "unavailable")}
+        return {"local_date": day.isoformat(), "preview": True, "allocations": report.allocations, "site": site,
                 "errors": errors, "provenance": source.provenance}
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
@@ -1559,12 +1631,13 @@ class HomeEnergyCoordinator:
 
     async def _async_collect_range(
         self, start: datetime, end: datetime, *, equipment_ids: set[str] | None = None,
-        store_mapping_revision: bool = True,
+        store_mapping_revision: bool = True, include_temperatures: bool = True, strict_sources: bool = False,
+        attest_sources: bool = False,
     ) -> DailyInput:
         equipment = [item for item in equipment_from_config(self.config) if item.enabled]
         if equipment_ids is not None:
             equipment = [item for item in equipment if item.equipment_id in equipment_ids]
-        temperature_sources = self._temperature_sources(equipment=equipment)
+        temperature_sources = self._temperature_sources(equipment=equipment) if include_temperatures else []
         site_sources = self._site_sources()
         entity_ids = [
             entity for item in equipment
@@ -1715,6 +1788,12 @@ class HomeEnergyCoordinator:
                             }
                         return normalized_statistics
             mapping = influx_mapping.get(source_key) if isinstance(influx_mapping, dict) else None
+            if (strict_sources and isinstance(mapping, dict) and
+                    ((mapping.get("entity_id") != entity_id and
+                      (mapping.get("entity_id") is not None or not attest_sources)) or not mapping.get("entity_tag"))):
+                query_errors.append({"query": "influx", "source_key": source_key,
+                                     "entity_id": entity_id, "error": "SourceIdentityUnverified"})
+                mapping = None
             if influx is not None and isinstance(mapping, dict) and not suspicious_counter:
                 try:
                     rows = await self.hass.async_add_executor_job(partial(

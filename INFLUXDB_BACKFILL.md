@@ -30,13 +30,20 @@ Choose up to 31 local dates and, where the mapping predates known history, attes
 that the current mapping applied. It does not write historical records. Configure
 Influx entries by stable equipment ID: energy entries use `measurement`,
 `entity_tag`, and either a configured `unit` or the live entity's known unit.
-An optional `entity_id` must match the configured energy entity. State entries
+An `entity_id` must match the configured energy entity, or an administrator
+must explicitly attest that a mapping without it identifies the same source. State entries
 require their `entity_id`; `equipment.<id>.fallback_state` names the selected
 mode, while `equipment.<id>.actual_dhw_state` additionally requires
 `actual_operation: true`. State freshness defaults to 60 minutes.
 
 The preview reports observed counter increments inside the day and excludes
 unsupported boundary contributions and gaps longer than one hour. Mixed-mode
-increments remain unknown, including when power readings exist. It selects
-one counter source by coverage rather than combining partial sources. This is
-not a historical backfill: recovery execution and persistence are not implemented.
+increments remain unknown unless power covers the whole increment and agrees
+with the measured counter change; such splits are labelled power-informed
+estimates. Recorder and Influx counter observations are combined only when
+identity is established and overlapping timestamps agree. This is not a
+historical backfill: recovery execution and persistence are not implemented.
+
+Offline fixture replay uses `HEI_REPLAY_FIXTURE` pointing to a JSON file in the
+format described in `tests/test_historical_fixture_replay.py`; it does not connect
+to Home Assistant or write historical records.

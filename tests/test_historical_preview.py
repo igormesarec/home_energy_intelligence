@@ -40,7 +40,7 @@ async def test_read_only_preview_retains_measured_total_and_separates_dhw():
     assert hp["categories"]["dhw"] == pytest.approx(2)
     assert hp["categories"]["confirmed_heating"] == pytest.approx(22)
     assert hp["residual_kwh"] == pytest.approx(0)
-    collector.assert_awaited_once_with(start, start+timedelta(days=1), store_mapping_revision=False)
+    collector.assert_awaited_once_with(start, start+timedelta(days=1), store_mapping_revision=False, include_temperatures=False, strict_sources=True, attest_sources=False)
 
 
 @pytest.mark.asyncio
@@ -136,4 +136,20 @@ async def test_preview_uses_partial_recorder_counter_without_power_or_writes():
     assert sum(ac["categories"].values()) + ac["residual_kwh"] == pytest.approx(1.99)
     assert ac["source_provenance"]["meter_coverage_seconds"] == 3600
     assert ac["authoritative_counter_source"] == "recorder_states_partial"
-    collector.assert_awaited_once_with(start, start + timedelta(days=1), store_mapping_revision=False)
+    collector.assert_awaited_once_with(start, start + timedelta(days=1), store_mapping_revision=False, include_temperatures=False, strict_sources=True, attest_sources=False)
+
+
+@pytest.mark.asyncio
+async def test_site_preview_reports_partial_and_missing_meter_evidence():
+    day = date(2026, 9, 18)
+    start = datetime(2026, 9, 18, tzinfo=UTC)
+    source = DailyInput(devices={}, site_counters={"pv": [NumericSample(start, 10),
+        NumericSample(start + timedelta(minutes=30), 12)]}, temperatures={},
+        provenance={"counter_collection": {"site.pv": "recorder_states"}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-01-01T00:00:00+00:00"},
+        config={}, _async_collect_range=AsyncMock(return_value=source))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
+    assert report["site"]["pv"]["meter_kwh"] == pytest.approx(2)
+    assert report["site"]["pv"]["status"] == "partial_known_subtotal"
+    assert report["site"]["import"]["meter_kwh"] is None
+    assert report["site"]["export"]["status"] == "unavailable"

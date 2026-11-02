@@ -240,6 +240,7 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                                            mode_samples: list[StateSample],
                                            counter_samples: list[NumericSample],
                                            classifier: Callable[[StateSample], str],
+                                           power_samples: list[NumericSample] | None = None,
                                            maximum_gap: timedelta = timedelta(hours=1),
                                            maximum_delta_kwh: float = 500.0) -> AllocationResult:
     """Allocate whole observed increments only; never interpolate across a boundary."""
@@ -290,13 +291,29 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
         category = classifier(state) if state else "unknown"
         changes = [classifier(item) for item in modes[index:bisect_left(mode_times, right.timestamp)]]
         if any(item != category for item in changes):
-            category = "unknown"
-        allocations[category] = allocations.get(category, 0.0) + delta
+            refined = allocate_interval(start=left.timestamp, end=right.timestamp,
+                mode_samples=modes, power_samples=power_samples or [], counter_samples=[left, right],
+                classifier=classifier, maximum_counter_delta_kwh=maximum_delta_kwh)
+            supported = (refined.covered_seconds >= duration.total_seconds()
+                         and "unknown" not in refined.allocations_kwh
+                         and refined.residual_kwh is not None
+                         and abs(refined.residual_kwh) <= 0.05
+                         and sum(refined.allocations_kwh.values()) > 0
+                         and abs(sum(refined.allocations_kwh.values()) - delta) <= 1e-9)
+            if supported:
+                for name, amount in refined.allocations_kwh.items():
+                    key = name + "_power_estimate"
+                    allocations[key] = allocations.get(key, 0.0) + amount
+                category = "power_estimate"
+            else:
+                category = "unknown"
+        if category != "power_estimate":
+            allocations[category] = allocations.get(category, 0.0) + delta
         measured += delta
         if category != "unknown":
             covered += duration.total_seconds()
         accepted += 1
     period = elapsed_seconds(start, end)
-    quality = "missing_counter" if not accepted else "partial" if covered < period or resets or rejected else "uncertain" if any(key in allocations for key in ("unknown", "heating_assumed", "heating_selected", "cooling_selected")) else "good"
+    quality = "missing_counter" if not accepted else "partial" if covered < period or resets or rejected else "uncertain" if any(key in allocations or any(k.endswith("_power_estimate") for k in allocations) for key in ("unknown", "heating_assumed", "heating_selected", "cooling_selected")) else "good"
     return AllocationResult(measured if accepted else None, allocations, 0.0 if accepted else None,
                             covered, period, resets, rejected, quality)
