@@ -10,6 +10,13 @@ from custom_components.home_energy_intelligence.engine import DailyInput, Device
 from custom_components.home_energy_intelligence.models import NumericSample, StateSample
 
 
+def test_historical_preview_requires_administrator():
+    from homeassistant.exceptions import Unauthorized
+    from custom_components.home_energy_intelligence.websocket import ws_historical_energy_preview
+    with pytest.raises(Unauthorized):
+        ws_historical_energy_preview(None, SimpleNamespace(user=SimpleNamespace(is_admin=False)), {"id": 1})
+
+
 @pytest.mark.asyncio
 async def test_read_only_preview_retains_measured_total_and_separates_dhw():
     day = date(2026, 10, 9)
@@ -56,7 +63,7 @@ async def test_preview_reads_configured_influx_when_recorder_missing_without_dou
         def query_states(self, left, right, *, entity_id, domain, maximum_age):
             calls.append(("state", entity_id))
             return [(left+timedelta(hours=i), "heating_water" if i == 10 else "heating_zones") for i in range(24)]
-        def query_counter(self, measurement, field, left, right, *, entity_tag):
+        def query_counter(self, measurement, field, left, right, *, entity_tag, include_following=False):
             calls.append(("counter", entity_tag))
             return [(left+timedelta(hours=i), 100+i) for i in range(25)]
     monkeypatch.setattr("custom_components.home_energy_intelligence.coordinator.InfluxBackfillClient", FakeInflux)
@@ -104,3 +111,29 @@ async def test_recorder_wins_over_conflicting_influx_at_same_state_timestamp(mon
     report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
     assert report["allocations"]["hp"]["categories"]["dhw"] == pytest.approx(1)
     assert report["allocations"]["hp"]["meter_kwh"] == pytest.approx(24)
+
+
+@pytest.mark.asyncio
+async def test_preview_uses_partial_recorder_counter_without_power_or_writes():
+    day = date(2026, 9, 28)
+    start = datetime(2026, 9, 28, tzinfo=UTC)
+    entity = "sensor.energy"
+    rows = [SimpleNamespace(last_updated=start + timedelta(minutes=m), state=str(v),
+                            attributes={"unit_of_measurement": "kWh"})
+            for m, v in [(5, 100), (35, 101), (65, 101.99)]]
+    source = DailyInput(devices={"ac": DeviceHistory(kind="air_conditioner", mode=[
+        StateSample(start, "heat"), StateSample(start + timedelta(hours=1), "heat")])},
+        site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    collector = AsyncMock(return_value=source)
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-01-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "ac", "display_name": "AC", "kind": "air_conditioner",
+                               "energy_entity": entity}]},
+        hass=SimpleNamespace(states=SimpleNamespace(get=lambda _: None)),
+        reader=SimpleNamespace(async_history=AsyncMock(return_value={entity: rows})), _async_collect_range=collector)
+    result = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
+    ac = result["allocations"]["ac"]
+    assert ac["meter_kwh"] == pytest.approx(1.99)
+    assert sum(ac["categories"].values()) + ac["residual_kwh"] == pytest.approx(1.99)
+    assert ac["source_provenance"]["meter_coverage_seconds"] == 3600
+    assert ac["authoritative_counter_source"] == "recorder_states_partial"
+    collector.assert_awaited_once_with(start, start + timedelta(days=1), store_mapping_revision=False)

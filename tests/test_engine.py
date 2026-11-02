@@ -40,8 +40,8 @@ def test_strict_historical_preview_preserves_unknown_and_residual():
                              assumed_heating_reporting="include_in_heating_total").aggregate_range(day, start, end, source)
     hp = result.allocations["hp"]
     assert hp["meter_kwh"] == pytest.approx(1)
-    assert hp["categories"]["unknown"] == pytest.approx(.5)
-    assert hp["residual_kwh"] == pytest.approx(.5)
+    assert hp["categories"]["unknown"] == pytest.approx(1)
+    assert hp["residual_kwh"] == pytest.approx(0)
     assert hp["reported_assumed_heating_kwh"] == 0
     assert hp["remaining_unassigned_after_fallback_kwh"] == pytest.approx(1)
 
@@ -50,12 +50,13 @@ def test_synthetic_reference_sized_meter_is_not_promoted_to_heating():
     day = date(2026, 9, 25)
     start, end = local_day_bounds(day, "Europe/Ljubljana")
     source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump", counter=[
-        NumericSample(start, 1000), NumericSample(end, 1186.105)], mode=[], power=[])},
+        NumericSample(start + timedelta(hours=i), 1000 + 186.105*i/24) for i in range(25)], mode=[], power=[])},
         site_counters={}, temperatures={})
     hp = DailyAggregator("Europe/Ljubljana", strict_historical=True).aggregate(day, source).allocations["hp"]
     assert hp["meter_kwh"] == pytest.approx(186.105)
     assert hp["reported_assumed_heating_kwh"] == 0
-    assert hp["residual_kwh"] == pytest.approx(186.105)
+    assert hp["categories"]["unknown"] == pytest.approx(186.105)
+    assert hp["residual_kwh"] == pytest.approx(0)
 
 
 def test_persisted_checkpoints_survive_recorder_expiration_and_are_primary():

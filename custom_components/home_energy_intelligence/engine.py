@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from .allocation import allocate_interval, configurable_classifier, counter_delta
+from .allocation import allocate_interval, allocate_historical_counter_increments, configurable_classifier, counter_delta
 from .configuration import TemperatureQuality
 from .models import DailyRecord, NumericSample, StateSample
 from .temperature import DEFAULT_LIMITS, time_weighted_temperature
@@ -115,7 +115,11 @@ class DailyAggregator:
                     interval_rejected = int(checkpoint.get("rejected_count", 0))
                     interval_quality = str(checkpoint.get("quality", "missing"))
                 else:
-                    result = allocate_interval(
+                    result = (allocate_historical_counter_increments(
+                        start=interval_start, end=interval_end, mode_samples=history.mode,
+                        counter_samples=history.counter, classifier=classifier,
+                        maximum_delta_kwh=self.maximum_counter_delta_kwh,
+                    ) if self.strict_historical else allocate_interval(
                         start=interval_start,
                         end=interval_end,
                         mode_samples=history.mode,
@@ -124,7 +128,7 @@ class DailyAggregator:
                         classifier=classifier,
                         maximum_power_gap=self.maximum_power_gap,
                         maximum_counter_delta_kwh=self.maximum_counter_delta_kwh,
-                    )
+                    ))
                     interval_meter = result.meter_kwh
                     interval_residual = result.residual_kwh
                     interval_categories = result.allocations_kwh
@@ -146,7 +150,7 @@ class DailyAggregator:
                 resets += interval_resets
                 rejected += interval_rejected
                 qualities.append(interval_quality)
-            authoritative, daily_resets, daily_rejected = counter_delta(
+            authoritative, daily_resets, daily_rejected = (None, 0, 0) if self.strict_historical else counter_delta(
                 history.counter, start, end,
                 maximum_delta_kwh=self.maximum_counter_delta_kwh,
             )
@@ -194,8 +198,9 @@ class DailyAggregator:
                 "checkpoint_intervals": checkpoint_intervals,
                 "classification_source": "persisted_checkpoints" if checkpoint_intervals else "history_recovery",
                 "authoritative_counter_source": (
-                    counter_source or "daily_recorder" if authoritative is not None
-                    else "checkpoints" if meter_value is not None else "unavailable"
+                    (counter_source or ("historical_counter" if self.strict_historical else
+                                        "daily_recorder" if authoritative is not None else "checkpoints"))
+                    if meter_value is not None else "unavailable"
                 ),
                 "source_provenance": history.provenance,
                 "checkpoint_source_provenance": checkpoint_sources,

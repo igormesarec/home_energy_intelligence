@@ -62,6 +62,7 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_start)
     websocket_api.async_register_command(hass, ws_temperature_backfill_status)
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
+    websocket_api.async_register_command(hass, ws_historical_energy_preview)
     websocket_api.async_register_command(hass, ws_temperature_timeline)
     websocket_api.async_register_command(hass, ws_v02_report)
     websocket_api.async_register_command(hass, ws_thermal_readings)
@@ -1179,6 +1180,34 @@ async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
         connection.send_error(msg["id"], "invalid_range", str(error))
         return
     connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/historical_energy_preview",
+    vol.Required("start_date"): str, vol.Required("end_date"): str,
+    vol.Optional("attest_current_mapping", default=False): bool,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_historical_energy_preview(hass, connection, msg):
+    """Read-only preview of at most 31 local days; never starts a backfill."""
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        rows = []
+        day = start
+        while day <= end:
+            rows.append(await coordinator.async_preview_historical_energy(
+                day, attest_current_mapping=msg["attest_current_mapping"]))
+            day += timedelta(days=1)
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_range_or_mapping", str(error))
+        return
+    connection.send_result(msg["id"], {"start_date": start.isoformat(), "end_date": end.isoformat(),
+                                      "preview": True, "records": rows})
 
 
 @websocket_api.websocket_command({

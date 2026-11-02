@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from bisect import bisect_right, bisect_left
 from datetime import datetime, timedelta
 from math import isfinite
 
@@ -233,3 +234,69 @@ def allocate_interval(
         total_rejected,
         quality,
     )
+
+
+def allocate_historical_counter_increments(*, start: datetime, end: datetime,
+                                           mode_samples: list[StateSample],
+                                           counter_samples: list[NumericSample],
+                                           classifier: Callable[[StateSample], str],
+                                           maximum_gap: timedelta = timedelta(hours=1),
+                                           maximum_delta_kwh: float = 500.0) -> AllocationResult:
+    """Allocate whole observed increments only; never interpolate across a boundary."""
+    samples = sorted((item for item in counter_samples if start <= item.timestamp <= end),
+                     key=lambda item: item.timestamp)
+    def valid_value(item):
+        return item.value is not None and isfinite(item.value) and item.value >= 0
+    modes = sorted((item for item in mode_samples if item.timestamp < end), key=lambda item: item.timestamp)
+    mode_times = [item.timestamp for item in modes]
+    allocations: dict[str, float] = {}
+    measured = covered = 0.0
+    accepted = resets = rejected = 0
+    if any(a.timestamp == b.timestamp and a.value != b.value for a, b in zip(samples, samples[1:])):
+        return AllocationResult(None, {}, None, 0, elapsed_seconds(start, end), 0, 1, "missing_counter")
+    samples = list({item.timestamp: item for item in samples}.values())
+    suppressed: set[int] = set()
+    for index, (left, right) in enumerate(zip(samples, samples[1:])):
+        if valid_value(left) and valid_value(right) and right.value < left.value:
+            for recovery in range(index + 2, len(samples)):
+                if samples[recovery].timestamp - left.timestamp > maximum_gap * 2:
+                    break
+                if not valid_value(samples[recovery]):
+                    break
+                if samples[recovery].value >= left.value:
+                    suppressed.update(range(index, recovery))
+                    break
+    for pair_index, (left, right) in enumerate(zip(samples, samples[1:])):
+        duration = right.timestamp-left.timestamp
+        if not valid_value(left) or not valid_value(right):
+            rejected += 1
+            continue
+        delta = right.value-left.value
+        if pair_index in suppressed:
+            resets += int(delta < 0)
+            rejected += 1
+            continue
+        if duration <= timedelta(0) or duration > maximum_gap:
+            rejected += 1
+            continue
+        if delta < 0:
+            resets += 1
+            continue
+        if delta > maximum_delta_kwh:
+            rejected += 1
+            continue
+        index = bisect_right(mode_times, left.timestamp)
+        state = modes[index-1] if index else None
+        category = classifier(state) if state else "unknown"
+        changes = [classifier(item) for item in modes[index:bisect_left(mode_times, right.timestamp)]]
+        if any(item != category for item in changes):
+            category = "unknown"
+        allocations[category] = allocations.get(category, 0.0) + delta
+        measured += delta
+        if category != "unknown":
+            covered += duration.total_seconds()
+        accepted += 1
+    period = elapsed_seconds(start, end)
+    quality = "missing_counter" if not accepted else "partial" if covered < period or resets or rejected else "uncertain" if any(key in allocations for key in ("unknown", "heating_assumed", "heating_selected", "cooling_selected")) else "good"
+    return AllocationResult(measured if accepted else None, allocations, 0.0 if accepted else None,
+                            covered, period, resets, rejected, quality)

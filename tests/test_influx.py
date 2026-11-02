@@ -108,3 +108,18 @@ def test_counter_baseline_is_bounded_and_missing_is_not_invented(monkeypatch):
     assert "ORDER BY time DESC LIMIT 1" in calls[0]
     monkeypatch.setattr(client, "_query", lambda q: [])
     assert client.query_counter("kWh", "value", start, start+timedelta(hours=1), entity_tag="energy") == [(start+timedelta(minutes=30), 101.0)]
+
+
+def test_counter_can_read_bounded_following_observation(monkeypatch):
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    client = InfluxBackfillClient(host="localhost", port=8086, database="homeassistant")
+    calls = []
+    def query(statement):
+        calls.append(statement)
+        return [(end + timedelta(minutes=10), 102.0)] if "ASC LIMIT 1" in statement else []
+    monkeypatch.setattr(client, "_query", query)
+    monkeypatch.setattr(client, "query", lambda *args, **kwargs: [(start + timedelta(minutes=20), 101.0)])
+    result = client.query_counter("kWh", "value", start, end, entity_tag="energy", include_following=True)
+    assert result[-1] == (end + timedelta(minutes=10), 102.0)
+    assert "ORDER BY time ASC LIMIT 1" in calls[-1]

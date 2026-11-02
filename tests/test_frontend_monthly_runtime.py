@@ -28,6 +28,17 @@ const input=JSON.parse(fs.readFileSync(0,'utf8'));const panel=new Panel();
     return result.stdout
 
 
+def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
+    output = run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.historicalEnergyPreview={records:[{local_date:'2026-09-28',errors:[],allocations:{ac:{meter_kwh:1.99,categories:{unknown:1.99},residual_kwh:0,quality:'partial',coverage_percent:0,source_provenance:{energy_entity_id:'sensor.ac',meter_coverage_seconds:3600,meter_expected_seconds:86400}}}}]};
+process.stdout.write(panel.settingsView());
+""", {})
+    assert 'Preview historical energy' in output
+    assert '1.990' in output and 'sensor.ac' in output and 'partial' in output
+    assert 'Unknown / residual' in output
+
+
 def monthly_payload():
     months = [f"2025-{month:02d}" for month in range(10, 13)] + [
         f"2026-{month:02d}" for month in range(1, 11)

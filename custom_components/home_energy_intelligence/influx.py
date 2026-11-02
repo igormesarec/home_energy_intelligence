@@ -140,8 +140,9 @@ class InfluxBackfillClient:
         return sorted(rows.items())
 
     def query_counter(self, measurement: str, field: str, start: datetime, end: datetime,
-                      *, entity_tag: str, maximum_age: timedelta = timedelta(hours=1)) -> list[tuple[datetime, float]]:
-        """Read a counter range with one bounded preceding baseline, if available."""
+                      *, entity_tag: str, maximum_age: timedelta = timedelta(hours=1),
+                      include_following: bool = False) -> list[tuple[datetime, float]]:
+        """Read bounded observations around a range without inventing boundary values."""
         if (start.tzinfo is None or end.tzinfo is None or end <= start
                 or end-start > timedelta(days=31) or maximum_age <= timedelta(0)
                 or maximum_age > timedelta(days=1) or not entity_tag):
@@ -156,6 +157,16 @@ class InfluxBackfillClient:
                                   or not isfinite(value) or value < 0 for stamp, value in before):
             raise InfluxBackfillError("malformed counter baseline")
         rows = self.query(measurement, field, start, end, entity_tag=entity_tag)
-        if len(before)+len(rows) > self.max_points:
+        after = []
+        if include_following:
+            following = (f'SELECT {self.quote_identifier(field)} FROM {ref} '
+                         f'WHERE time >= {self.quote_string(end.isoformat())} '
+                         f'AND time <= {self.quote_string((end+maximum_age).isoformat())} '
+                         f'AND "entity_id" = {self.quote_string(entity_tag)} ORDER BY time ASC LIMIT 1')
+            after = self._query(following)
+            if len(after) > 1 or any(stamp.tzinfo is None or not end <= stamp <= end+maximum_age
+                                     or not isfinite(value) or value < 0 for stamp, value in after):
+                raise InfluxBackfillError("malformed following counter observation")
+        if len(before)+len(rows)+len(after) > self.max_points:
             raise InfluxBackfillError("historical query exceeded configured point limit")
-        return before + rows
+        return before + rows + after
