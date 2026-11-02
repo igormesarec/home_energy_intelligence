@@ -10,16 +10,17 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
 from .models import DailyRecord
+from .timeutils import local_day_bounds
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_records (
@@ -211,6 +212,24 @@ CREATE TABLE IF NOT EXISTS monthly_ecodan_snapshot_audit (
 CREATE INDEX IF NOT EXISTS idx_monthly_ecodan_audit
   ON monthly_ecodan_snapshot_audit(snapshot_id,id);
 """
+
+MIGRATION_8 = (
+    """CREATE TABLE IF NOT EXISTS electricity_recovery_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+        cursor_date TEXT NOT NULL, timezone TEXT NOT NULL, mapping_mode TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled')),
+        cancel_requested INTEGER NOT NULL DEFAULT 0, details_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_electricity_recovery
+       ON electricity_recovery_jobs((1)) WHERE status IN ('queued','running')""",
+    """CREATE TABLE IF NOT EXISTS electricity_recovery_evidence (
+        local_date TEXT NOT NULL, source_key TEXT NOT NULL, source_entity_id TEXT NOT NULL,
+        interval_start_utc TEXT NOT NULL, interval_end_utc TEXT NOT NULL, timezone TEXT NOT NULL,
+        verification_status TEXT NOT NULL, calculation_version TEXT NOT NULL,
+        payload_json TEXT NOT NULL, checksum TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(local_date,source_key,checksum))""",
+    "CREATE INDEX IF NOT EXISTS idx_electricity_recovery_date ON electricity_recovery_evidence(local_date,source_key)",
+)
 
 _TEMPERATURE_REJECTION_REASONS = (
     "invalid_sentinel", "out_of_range", "temporal_spike",
@@ -738,9 +757,101 @@ class EnergyDatabase:
                 connection.execute("BEGIN IMMEDIATE")
                 _migrate_monthly_storage_v7(connection)
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            elif row[0] == 7:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema {row[0]}")
+            if row is None or row[0] < 8:
+                for statement in MIGRATION_8:
+                    connection.execute(statement)
         return recovered
+
+    def create_electricity_recovery_job(self, start_date: str, end_date: str, timezone: str,
+                                        mapping_mode: str) -> int:
+        """Register an explicitly started job; this method never runs recovery."""
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if end < start or (end - start).days > 30:
+            raise ValueError("recovery range must be ordered and at most 31 days")
+        if mapping_mode not in {"evidence_only", "attested", "verified"} or not timezone:
+            raise ValueError("invalid recovery mapping mode or timezone")
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = connection.execute(
+                    """INSERT INTO electricity_recovery_jobs
+                    (start_date,end_date,cursor_date,timezone,mapping_mode,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,'queued',?,?)""",
+                    (start_date, end_date, start_date, timezone, mapping_mode, now, now))
+            except sqlite3.IntegrityError as error:
+                raise ValueError("another electricity recovery job is active") from error
+            return int(result.lastrowid)
+
+    def electricity_recovery_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM electricity_recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def cancel_electricity_recovery_job(self, job_id: int) -> bool:
+        with self.connect() as connection:
+            return connection.execute("""UPDATE electricity_recovery_jobs SET cancel_requested=1,updated_at=?
+                WHERE id=? AND status IN ('queued','running')""", (datetime.now(UTC).isoformat(), job_id)).rowcount == 1
+
+    def commit_electricity_recovery_day(self, job_id: int, local_date: str,
+                                        records: list[dict[str, Any]]) -> dict[str, Any]:
+        """Atomically insert a day's evidence and move its cursor; never replace records."""
+        day = date.fromisoformat(local_date)
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM electricity_recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] not in ("queued", "running"):
+                raise ValueError("recovery job is not active")
+            if row["cancel_requested"]:
+                connection.execute("UPDATE electricity_recovery_jobs SET status='cancelled',updated_at=? WHERE id=?", (now, job_id))
+                return {"cancelled": True, "inserted": 0}
+            if row["cursor_date"] != local_date:
+                raise ValueError("day does not match the durable recovery cursor")
+            inserted = 0
+            for record in records:
+                key, entity = record.get("source_key"), record.get("source_entity_id")
+                if not isinstance(key, str) or not key or not isinstance(entity, str) or not entity:
+                    raise ValueError("source key and exact entity identity are required")
+                if record.get("local_date") != local_date or record.get("timezone") != row["timezone"]:
+                    raise ValueError("evidence date or timezone does not match job")
+                left = datetime.fromisoformat(record["interval_start_utc"])
+                right = datetime.fromisoformat(record["interval_end_utc"])
+                if left.tzinfo is None or right.tzinfo is None or right <= left:
+                    raise ValueError("evidence requires valid timezone-aware boundaries")
+                expected_left, expected_right = local_day_bounds(day, row["timezone"])
+                if left.astimezone(UTC) != expected_left or right.astimezone(UTC) != expected_right:
+                    raise ValueError("evidence boundaries do not match the local calendar day")
+                if record.get("verification_status") != "provisional":
+                    raise ValueError("recovery evidence must remain provisional")
+                value = record.get("meter_kwh")
+                if value is None or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+                    raise ValueError("a finite observed meter subtotal is required")
+                categories = record.get("categories", {})
+                residual = record.get("residual_kwh")
+                if not isinstance(categories, dict) or any(not isinstance(v, (int, float)) or not isfinite(v) or v < 0 for v in categories.values()):
+                    raise ValueError("invalid allocation evidence")
+                if residual is not None and (not isinstance(residual, (int, float)) or not isfinite(residual)):
+                    raise ValueError("invalid reconciliation residual")
+                if categories and (residual is None or abs(sum(categories.values()) + residual - value) > 1e-6):
+                    raise ValueError("allocation evidence does not reconcile")
+                payload = _canonical_json(record)
+                inserted += connection.execute("""INSERT OR IGNORE INTO electricity_recovery_evidence
+                    (local_date,source_key,source_entity_id,interval_start_utc,interval_end_utc,timezone,
+                     verification_status,calculation_version,payload_json,checksum,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (local_date, key, entity, left.isoformat(), right.isoformat(),
+                    row["timezone"], "provisional", str(record.get("calculation_version") or "historical-preview-v1"),
+                    payload, _checksum(payload), now)).rowcount
+            next_day = (day + timedelta(days=1)).isoformat()
+            status = "completed" if local_date == row["end_date"] else "running"
+            connection.execute("UPDATE electricity_recovery_jobs SET cursor_date=?,status=?,updated_at=? WHERE id=?",
+                               (next_day, status, now, job_id))
+            return {"cancelled": False, "inserted": inserted, "status": status, "cursor_date": next_day}
 
     def upsert_daily(self, record: DailyRecord, *, reason: str = "daily_close") -> bool:
         now = datetime.now(UTC).isoformat()

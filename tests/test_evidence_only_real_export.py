@@ -11,6 +11,7 @@ import pytest
 
 from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
 from custom_components.home_energy_intelligence.engine import DailyInput, DeviceHistory
+from custom_components.home_energy_intelligence.electricity_recovery import prepare_recovery_day
 from custom_components.home_energy_intelligence.models import NumericSample
 from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
@@ -33,8 +34,9 @@ async def test_local_september_export(day, meter, assumed, unknown):
     source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump", counter=meters)}, site_counters={}, temperatures={}, provenance={"counter_collection": {}})
     collector = AsyncMock(return_value=source)
     coordinator = SimpleNamespace(timezone="Europe/Ljubljana", mapping_revision={"effective_at": "2026-10-01T00:00:00+00:00"},
-        config={"equipment": [{"equipment_id": "hp", "display_name": "Ecodan", "kind": "heat_pump"}],
+        config={"equipment": [{"equipment_id": "hp", "display_name": "Ecodan", "kind": "heat_pump", "energy_entity": "sensor.toplotna_pro_3em_energy"}],
                 "influx_mapping_json": json.dumps({"equipment.hp.fallback_state": {"entity_id": "climate.toplotna_zone_1"}})},
+        hass=SimpleNamespace(states=SimpleNamespace(get=lambda _: None)),
         reader=SimpleNamespace(async_history=AsyncMock(return_value={"climate.toplotna_zone_1": modes})), _async_collect_range=collector)
     result = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, date(2026, 9, day), evidence_only=True)
     hp = result["allocations"]["hp"]
@@ -43,3 +45,6 @@ async def test_local_september_export(day, meter, assumed, unknown):
     assert hp["categories"].get("unknown", 0) == pytest.approx(unknown)
     assert result["historical_mapping_quality"] == "unverified historical mapping"
     assert collector.await_args.kwargs["store_mapping_revision"] is False
+    plan = prepare_recovery_day(result, "Europe/Ljubljana")
+    assert plan["records"][0]["meter_kwh"] == pytest.approx(meter)
+    assert plan["records"][0]["verification_status"] == "provisional"

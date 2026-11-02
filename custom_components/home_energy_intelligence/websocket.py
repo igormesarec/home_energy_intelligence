@@ -29,6 +29,7 @@ from .configuration import (
     temperatures_from_config,
 )
 from .const import DOMAIN
+from .electricity_recovery import prepare_recovery_day
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -1187,6 +1188,7 @@ async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
     vol.Required("start_date"): str, vol.Required("end_date"): str,
     vol.Optional("attest_current_mapping", default=False): bool,
     vol.Optional("evidence_only", default=False): bool,
+    vol.Optional("include_recovery_plan", default=False): bool,
 })
 @websocket_api.require_admin
 @websocket_api.async_response
@@ -1209,10 +1211,11 @@ async def ws_historical_energy_preview(hass, connection, msg):
     except ValueError as error:
         connection.send_error(msg["id"], "invalid_range_or_mapping", str(error))
         return
+    plans = [prepare_recovery_day(row, coordinator.timezone) for row in rows] if msg.get("include_recovery_plan", False) else None
     connection.send_result(msg["id"], {"start_date": start.isoformat(), "end_date": end.isoformat(),
                                       "preview": True, "evidence_only": msg.get("evidence_only", False),
                                       "historical_mapping_quality": "unverified historical mapping" if msg.get("evidence_only", False) else "normal",
-                                      "records": rows})
+                                      "records": rows, "recovery_dry_run": plans})
 
 
 @websocket_api.websocket_command({
