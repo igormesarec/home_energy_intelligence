@@ -25,19 +25,18 @@ Queries use HTTP `POST`; credentials are sent using the Authorization header and
 
 Influx schemas vary. Verify the measurement, field, entity tag, unit, and counter semantics against your own database before enabling a mapping. If returned history cannot be verified, leave the mapping absent; the resulting period remains unavailable.
 
-The coordinator has an experimental, read-only single-day preview, not exposed
-to the dashboard or a WebSocket command. It requires the current source mapping
-to have been effective for the requested date or explicit administrator
-attestation. Configure Influx mapping entries by stable equipment ID, with an
-explicit `entity_id`; energy entries also require `measurement`, `unit`, and
-`entity_tag`. The optional `equipment.<id>.fallback_state` entry names the
-selected-mode source. State freshness defaults to 60 minutes. The preview uses
-the strict historical policy: unknown and residual electricity remain separate.
+The experimental administrator-only historical energy preview is in Settings.
+Choose up to 31 local dates and, where the mapping predates known history, attest
+that the current mapping applied. It does not write historical records. Configure
+Influx entries by stable equipment ID: energy entries use `measurement`,
+`entity_tag`, and either a configured `unit` or the live entity's known unit.
+An optional `entity_id` must match the configured energy entity. State entries
+require their `entity_id`; `equipment.<id>.fallback_state` names the selected
+mode, while `equipment.<id>.actual_dhw_state` additionally requires
+`actual_operation: true`. State freshness defaults to 60 minutes.
 
-The preview conservatively requires counter samples at both exact day boundaries and
-no counter gap longer than one hour. It may therefore report unavailable even
-when partial measured evidence exists. It does not yet implement separately
-configured actual-DHW evidence, a user-facing authorized preview, safe recovery
-execution, historical record merging, cancellation, or job resumption. Do not
-use it for a historical energy backfill. Existing temperature recovery remains
-separate.
+The preview reports observed counter increments inside the day and excludes
+unsupported boundary contributions and gaps longer than one hour. Mixed-mode
+increments remain unknown, including when power readings exist. It selects
+one counter source by coverage rather than combining partial sources. This is
+not a historical backfill: recovery execution and persistence are not implemented.
