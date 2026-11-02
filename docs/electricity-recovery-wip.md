@@ -15,3 +15,9 @@ the monthly and House Thermal Profile reports do not yet read recovered
 evidence. A complete recovery workflow, integration tests and a backed-up Home
 Assistant validation remain required. No historical recovery should be run
 against production from this draft.
+
+The storage reader deliberately excludes a source-day when multiple evidence
+checksums exist or an evidence checksum fails validation. There is currently no
+durable mapping-effective identity and administrator-approved version selection
+for resolving those cases. Selecting the newest observation would risk silently
+replacing stronger evidence. No reporting overlay uses this reader yet.

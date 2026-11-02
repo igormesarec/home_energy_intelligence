@@ -793,10 +793,41 @@ class EnergyDatabase:
             row = connection.execute("SELECT * FROM electricity_recovery_jobs WHERE id=?", (job_id,)).fetchone()
             return dict(row) if row else None
 
+    def electricity_recovery_evidence_range(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """Return only unambiguous source-day evidence; never select a version by recency."""
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if end < start:
+            raise ValueError("invalid evidence date range")
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT local_date,source_key,payload_json,checksum
+                FROM electricity_recovery_evidence WHERE local_date>=? AND local_date<=?
+                ORDER BY local_date,source_key,checksum""", (start_date, end_date)).fetchall()
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault((row["local_date"], row["source_key"]), []).append(row)
+        records, ambiguous = [], []
+        for (local_day, key), versions in grouped.items():
+            if len(versions) != 1:
+                ambiguous.append({"local_date": local_day, "source_key": key, "versions": len(versions)})
+                continue
+            row = versions[0]
+            if _checksum(row["payload_json"]) != row["checksum"]:
+                ambiguous.append({"local_date": local_day, "source_key": key, "reason": "checksum_mismatch"})
+                continue
+            records.append(json.loads(row["payload_json"]))
+        return {"records": records, "ambiguous": ambiguous}
+
     def cancel_electricity_recovery_job(self, job_id: int) -> bool:
         with self.connect() as connection:
             return connection.execute("""UPDATE electricity_recovery_jobs SET cancel_requested=1,updated_at=?
                 WHERE id=? AND status IN ('queued','running')""", (datetime.now(UTC).isoformat(), job_id)).rowcount == 1
+
+    def resumable_electricity_recovery_jobs(self) -> list[dict[str, Any]]:
+        """List explicitly created unfinished jobs without starting them."""
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT * FROM electricity_recovery_jobs
+                WHERE status IN ('queued','running') ORDER BY id""").fetchall()
+            return [dict(row) for row in rows]
 
     def commit_electricity_recovery_day(self, job_id: int, local_date: str,
                                         records: list[dict[str, Any]]) -> dict[str, Any]:

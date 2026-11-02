@@ -60,6 +60,29 @@ def test_existing_v7_database_is_migrated_without_losing_mapping(tmp_path):
         assert connection.execute("SELECT count(*) FROM electricity_recovery_evidence").fetchone()[0] == 0
 
 
+def test_different_versions_are_ambiguous_not_summed_or_selected_by_recency(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    for value in (1, 2):
+        job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+        db.commit_electricity_recovery_day(job, "2026-09-25", [evidence("2026-09-25", value=value)])
+    result = db.electricity_recovery_evidence_range("2026-09-01", "2026-09-30")
+    assert result["records"] == []
+    assert result["ambiguous"] == [{"local_date": "2026-09-25", "source_key": "equipment.hp", "versions": 2}]
+
+
+def test_corrupt_evidence_is_excluded_from_reporting_candidates(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [evidence("2026-09-25")])
+    with db.connect() as connection:
+        connection.execute("UPDATE electricity_recovery_evidence SET payload_json='{}'")
+    result = db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")
+    assert result["records"] == []
+    assert result["ambiguous"][0]["reason"] == "checksum_mismatch"
+
+
 def test_atomic_failure_and_overlap_cancellation(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
@@ -75,6 +98,19 @@ def test_atomic_failure_and_overlap_cancellation(tmp_path):
     assert db.cancel_electricity_recovery_job(job)
     assert db.commit_electricity_recovery_day(job, "2026-09-25", []) == {"cancelled": True, "inserted": 0}
     assert db.electricity_recovery_job(job)["status"] == "cancelled"
+
+
+def test_explicit_job_cursor_survives_database_reopen(tmp_path):
+    path = tmp_path / "energy.sqlite3"
+    db = EnergyDatabase(path)
+    db.initialize()
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-26", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [evidence("2026-09-25")])
+    reopened = EnergyDatabase(path)
+    jobs = reopened.resumable_electricity_recovery_jobs()
+    assert len(jobs) == 1 and jobs[0]["cursor_date"] == "2026-09-26"
+    reopened.commit_electricity_recovery_day(job, "2026-09-26", [evidence("2026-09-26")])
+    assert reopened.resumable_electricity_recovery_jobs() == []
 
 
 @pytest.mark.parametrize("day,hours", [("2026-03-29", 23), ("2026-10-25", 25)])
