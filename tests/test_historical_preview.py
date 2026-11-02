@@ -1,7 +1,7 @@
 import json
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -153,3 +153,75 @@ async def test_site_preview_reports_partial_and_missing_meter_evidence():
     assert report["site"]["pv"]["status"] == "partial_known_subtotal"
     assert report["site"]["import"]["meter_kwh"] is None
     assert report["site"]["export"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_history", [False, True])
+async def test_preview_does_not_write_database_or_read_temperature_sources(hass, tmp_path, fail_history):
+    """Exercise real collection with preserved temperature and mapping records."""
+    import sqlite3
+    from custom_components.home_energy_intelligence.database import EnergyDatabase
+
+    path = tmp_path / "preview.sqlite3"
+    database = EnergyDatabase(path)
+    database.initialize()
+    start = datetime(2026, 9, 25, tzinfo=UTC)
+    identity = {"source_id": "indoor", "entity_id": "sensor.indoor", "attribute": None,
+                "role": "indoor", "enabled": True}
+    mapping = {"effective_at": "2026-01-01T00:00:00+00:00", "temperatures": [identity]}
+    database.ensure_mapping_revision(mapping)
+    end = start + timedelta(hours=1)
+    applicability = database.temperature_mapping_applicability("indoor", start, end, identity,
+                                                                 allow_historical_identity=True)
+    assert database.upsert_temperature_history("hourly", start, end, "2026-09-25", "UTC", "indoor",
+        {"mean": 22, "minimum": 22, "maximum": 22, "coverage_seconds": 3600,
+         "period_seconds": 3600, "coverage_percent": 100, "quality": "good",
+         "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+         "source_provenance": {**identity, "mapping_effective_at": applicability["mapping_effective_at"]}},
+        applicability) == "inserted"
+    def snapshot():
+        with sqlite3.connect(path) as connection:
+            return list(connection.iterdump())
+    before = snapshot()
+    entry = SimpleNamespace(entry_id="entry", data={"equipment": "[]", "site_sources": {},
+        "temperature_sources": json.dumps([identity])}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, database, registered_mapping=mapping)
+    coordinator.timezone = "UTC"
+    history = AsyncMock(side_effect=RuntimeError("unavailable") if fail_history else None,
+                        return_value={})
+    coordinator.reader = SimpleNamespace(async_history=history, async_statistics=AsyncMock(return_value={}))
+    database.store_mapping_revision = Mock(side_effect=AssertionError("unexpected write"))
+    if fail_history:
+        with pytest.raises(RuntimeError):
+            await coordinator.async_preview_historical_energy(start.date())
+    else:
+        await coordinator.async_preview_historical_energy(start.date())
+    assert "sensor.indoor" not in history.await_args.args[0]
+    database.store_mapping_revision.assert_not_called()
+    assert snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_influx_failure_keeps_recorder_data_and_never_writes(monkeypatch):
+    day = date(2026, 9, 25)
+    start = datetime(2026, 9, 25, tzinfo=UTC)
+    class ReadOnlyInflux:
+        def __init__(self, **kwargs): pass
+        def query_counter(self, *args, **kwargs): raise TimeoutError("offline")
+    monkeypatch.setattr("custom_components.home_energy_intelligence.coordinator.InfluxBackfillClient", ReadOnlyInflux)
+    async def execute(fn, *args): return fn(*args)
+    source = DailyInput(devices={"hp": DeviceHistory(kind="heat_pump", counter=[
+        NumericSample(start, 10), NumericSample(start + timedelta(hours=1), 11)])},
+        site_counters={}, temperatures={}, provenance={"counter_collection": {"equipment.hp.energy": "recorder_states"}})
+    database = Mock()
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-01-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump",
+                              "energy_entity": "sensor.hp"}], "influx_enabled": True, "influx_host": "localhost",
+                "influx_database": "homeassistant", "influx_mapping_json": json.dumps({"equipment.hp.energy": {
+                    "entity_id": "sensor.hp", "entity_tag": "hp", "measurement": "kWh", "unit": "kWh"}})},
+        hass=SimpleNamespace(async_add_executor_job=execute), database=database,
+        _async_collect_range=AsyncMock(return_value=source))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
+    assert report["allocations"]["hp"]["meter_kwh"] == pytest.approx(1)
+    assert any(e["error"] == "TimeoutError" for e in report["errors"])
+    assert database.mock_calls == []

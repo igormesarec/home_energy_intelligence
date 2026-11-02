@@ -6,7 +6,7 @@ from typing import Final
 
 DOMAIN: Final = "home_energy_intelligence"
 NAME: Final = "Home Energy Intelligence"
-VERSION: Final = "0.2.1"
+VERSION: Final = "0.2.2b1"
 PLATFORMS: Final = ["sensor"]
 
 CONF_LOCALE: Final = "locale"

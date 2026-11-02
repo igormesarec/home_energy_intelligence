@@ -1,5 +1,9 @@
 # Home Energy Intelligence
 
+**Preview release:** Historical energy recovery in this branch is a read-only
+administrator preview. It does not save recovered energy; real-data acceptance
+is pending. Do not treat partial coverage as a complete daily measurement.
+
 ## V0.2.1 monthly analytics and midnight availability (draft)
 
 V0.2.1 keeps the 05:00 authoritative daily close but no longer makes Yesterday wait for
