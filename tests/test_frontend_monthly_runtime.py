@@ -122,6 +122,20 @@ process.stdout.write(panel.settingsView());
     assert 'class="temperature-end" type="date" value="2026-09-30"' in output
 
 
+def test_temperature_cop_charts_render_grids_and_selected_series():
+    output = run_panel(r"""
+panel.analysisData={mode:'month',period:'2026-10',source:{source_id:'outside'},cop:{rows:[{vendor_heating_cop:3.2,primary_dhw_cop:2.1}]}};
+panel.analysisMetrics=['vendor_heating_cop','primary_dhw_cop'];
+panel.temperatureCopRows=()=>[{key:'2026-10-01',min:-2,max:12,mean:5,low:0,high:10,coverage:100,valid:3600,expected:3600,qualities:[]}];
+process.stdout.write(panel.temperatureCopAnalysis());
+""", {})
+    assert "Outdoor temperature" in output and "COP by selected metric" in output
+    assert output.count('class="analysis-grid"') >= 8
+    assert "Vendor heating: 3.20 COP" in output and "Verified Primary DHW: 2.10 COP" in output
+    assert output.count('class="analysis-plot"') == 2
+    assert output.count('class="analysis-metric"') == 9
+
+
 def test_yesterday_history_survives_optional_thermal_report_failure():
     output = run_panel(r"""
 panel.shadowRoot={querySelector:(selector)=>selector==='.period-select'?{value:'yesterday'}:null};
