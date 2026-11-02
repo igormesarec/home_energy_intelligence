@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .allocation import allocate_interval, allocate_historical_counter_increments, configurable_classifier, counter_delta
+from .allocation import (allocate_interval, allocate_historical_counter_increments,
+                         configurable_classifier, counter_delta, historical_counter_observations)
 from .configuration import (
     equipment_from_config, equipment_temperature_mappings, mapping_revision,
     temperatures_from_config,
@@ -48,6 +49,10 @@ def _merge_preview_counters(recorder, archive, *, identity_verified):
         return archive, "influx", None
     if not archive:
         return recorder, "recorder", None
+    _, recorder_conflicts = historical_counter_observations(recorder)
+    _, archive_conflicts = historical_counter_observations(archive)
+    if recorder_conflicts or archive_conflicts:
+        return recorder, "recorder", "counter_source_timestamp_conflict"
     left = {s.timestamp: s for s in recorder}
     right = {s.timestamp: s for s in archive}
     overlap = left.keys() & right.keys()
@@ -206,11 +211,9 @@ class HomeEnergyCoordinator:
                                       "mapping_attested": bool(attest_current_mapping)})
             mapping = mappings.get(base + ".energy")
             def counter_coverage(samples):
-                valid = sorted((s for s in samples if start <= s.timestamp <= end), key=lambda s: s.timestamp)
+                valid, _ = historical_counter_observations([s for s in samples if start <= s.timestamp <= end])
                 def usable(s):
                     return s.value is not None and isfinite(s.value) and s.value >= 0
-                if any(a.timestamp == b.timestamp and a.value != b.value for a,b in zip(valid, valid[1:])):
-                    return 0.0
                 suppressed = set()
                 for index, (a, b) in enumerate(zip(valid, valid[1:])):
                     if usable(a) and usable(b) and b.value < a.value:
@@ -270,6 +273,9 @@ class HomeEnergyCoordinator:
                 except Exception as error:
                     errors.append({"source": base + ".energy", "error": type(error).__name__})
             coverage_seconds = counter_coverage(device.counter)
+            _, conflicts = historical_counter_observations([s for s in device.counter if start <= s.timestamp <= end])
+            if conflicts:
+                errors.append({"source": base + ".energy", "error": "conflicting_counter_timestamps"})
             in_day = sorted((s.timestamp for s in device.counter if start <= s.timestamp <= end))
             missing_intervals = []
             if not in_day:
@@ -290,6 +296,7 @@ class HomeEnergyCoordinator:
                                       "state_entity_id": item.state_entity,
                                       "first_observation_utc": in_day[0].isoformat() if in_day else None,
                                       "last_observation_utc": in_day[-1].isoformat() if in_day else None,
+                                      "conflicting_timestamps_utc": [stamp.isoformat() for stamp in conflicts[:50]],
                                       "missing_intervals": missing_intervals[:50],
                                       "boundary_policy": "observed_whole_increments_only"})
             if coverage_seconds < (end-start).total_seconds():

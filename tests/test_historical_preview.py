@@ -156,6 +156,25 @@ async def test_site_preview_reports_partial_and_missing_meter_evidence():
 
 
 @pytest.mark.asyncio
+async def test_conflicting_displayed_timestamps_preserve_remaining_preview_evidence():
+    day = date(2026, 9, 1)
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    source = DailyInput(devices={"ac": DeviceHistory(kind="air_conditioner", counter=[
+        NumericSample(start + timedelta(minutes=i), value)
+        for i, value in [(0, 100), (10, 101), (20, 102), (20, 102.001), (30, 103), (40, 104)]])},
+        site_counters={}, temperatures={}, provenance={"counter_collection": {"equipment.ac.energy": "recorder_states"}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-01-01T00:00:00+00:00"},
+        config={"equipment": [{"equipment_id": "ac", "display_name": "AC", "kind": "air_conditioner"}]},
+        _async_collect_range=AsyncMock(return_value=source))
+    result = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
+    ac = result["allocations"]["ac"]
+    assert ac["meter_kwh"] == pytest.approx(2)
+    assert ac["source_provenance"]["meter_coverage_seconds"] == 1200
+    assert ac["source_provenance"]["conflicting_timestamps_utc"] == [(start + timedelta(minutes=20)).isoformat()]
+    assert any(item["error"] == "conflicting_counter_timestamps" for item in result["errors"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_history", [False, True])
 async def test_preview_does_not_write_database_or_read_temperature_sources(hass, tmp_path, fail_history):
     """Exercise real collection with preserved temperature and mapping records."""

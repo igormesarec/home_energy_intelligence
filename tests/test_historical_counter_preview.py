@@ -50,6 +50,21 @@ def test_unavailable_counter_state_breaks_observation_chain():
     assert result.rejected_count == 2
 
 
+def test_conflicting_export_timestamp_excludes_only_adjacent_increments():
+    result = preview([(0, 100), (10, 101), (20, 102), (20, 102.001),
+                      (30, 103), (40, 104)], [(0, "idle")])
+    assert result.meter_kwh == pytest.approx(2)
+    assert result.covered_seconds == 1200
+    assert result.rejected_count >= 3
+    assert result.quality == "partial"
+
+
+def test_small_counter_drop_does_not_fabricate_reset_energy():
+    result = preview([(0, 100), (10, 101), (20, 100.9999), (30, 101.01), (40, 101.02)], [(0, "idle")])
+    assert result.meter_kwh == pytest.approx(1.01)
+    assert result.reset_count == 1
+
+
 def test_merge_requires_identity_and_matching_overlap():
     start = datetime(2026, 9, 1, tzinfo=UTC)
     first = [NumericSample(start, 100), NumericSample(start + timedelta(minutes=30), 101)]
@@ -57,6 +72,8 @@ def test_merge_requires_identity_and_matching_overlap():
     merged, source, error = _merge_preview_counters(first, second, identity_verified=True)
     assert len(merged) == 3 and source == "recorder_and_influx" and error is None
     assert _merge_preview_counters(first, second, identity_verified=False)[2] == "counter_source_identity_unverified"
+    duplicated = first + [NumericSample(first[1].timestamp, 101.1)]
+    assert _merge_preview_counters(duplicated, second, identity_verified=True)[2] == "counter_source_timestamp_conflict"
     second[0] = NumericSample(second[0].timestamp, 105)
     assert _merge_preview_counters(first, second, identity_verified=True)[2] == "counter_overlap_conflict"
 

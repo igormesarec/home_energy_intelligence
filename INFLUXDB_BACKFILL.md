@@ -44,6 +44,11 @@ estimates. Recorder and Influx counter observations are combined only when
 identity is established and overlapping timestamps agree. This is not a
 historical backfill: recovery execution and persistence are not implemented.
 
+Conflicting values at an identical timestamp are retained as a reported gap:
+the ambiguous observation and adjacent increments are excluded, while other
+supported increments remain available. A CSV rounded to milliseconds cannot
+establish whether those timestamps conflict at InfluxDB's native precision.
+
 Offline fixture replay uses `HEI_REPLAY_FIXTURE` pointing to a JSON file in the
 format described in `tests/test_historical_fixture_replay.py`; it does not connect
 to Home Assistant or write historical records.

@@ -236,6 +236,20 @@ def allocate_interval(
     )
 
 
+def historical_counter_observations(samples: list[NumericSample]) -> tuple[list[NumericSample], list[datetime]]:
+    """Turn conflicting equal-timestamp readings into gaps, never choose a value."""
+    grouped: dict[datetime, NumericSample] = {}
+    conflicts: set[datetime] = set()
+    for sample in samples:
+        previous = grouped.get(sample.timestamp)
+        if previous is not None and previous.value != sample.value:
+            conflicts.add(sample.timestamp)
+        else:
+            grouped[sample.timestamp] = sample
+    return ([NumericSample(stamp, None) if stamp in conflicts else grouped[stamp]
+             for stamp in sorted(grouped)], sorted(conflicts))
+
+
 def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                                            mode_samples: list[StateSample],
                                            counter_samples: list[NumericSample],
@@ -244,18 +258,16 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                                            maximum_gap: timedelta = timedelta(hours=1),
                                            maximum_delta_kwh: float = 500.0) -> AllocationResult:
     """Allocate whole observed increments only; never interpolate across a boundary."""
-    samples = sorted((item for item in counter_samples if start <= item.timestamp <= end),
-                     key=lambda item: item.timestamp)
+    samples, conflicts = historical_counter_observations(
+        [item for item in counter_samples if start <= item.timestamp <= end])
     def valid_value(item):
         return item.value is not None and isfinite(item.value) and item.value >= 0
     modes = sorted((item for item in mode_samples if item.timestamp < end), key=lambda item: item.timestamp)
     mode_times = [item.timestamp for item in modes]
     allocations: dict[str, float] = {}
     measured = covered = 0.0
-    accepted = resets = rejected = 0
-    if any(a.timestamp == b.timestamp and a.value != b.value for a, b in zip(samples, samples[1:])):
-        return AllocationResult(None, {}, None, 0, elapsed_seconds(start, end), 0, 1, "missing_counter")
-    samples = list({item.timestamp: item for item in samples}.values())
+    accepted = resets = 0
+    rejected = len(conflicts)
     suppressed: set[int] = set()
     for index, (left, right) in enumerate(zip(samples, samples[1:])):
         if valid_value(left) and valid_value(right) and right.value < left.value:
