@@ -1,4 +1,3 @@
-import asyncio
 import json
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -11,7 +10,8 @@ from custom_components.home_energy_intelligence.engine import DailyInput, Device
 from custom_components.home_energy_intelligence.models import NumericSample, StateSample
 
 
-def test_read_only_preview_retains_measured_total_and_separates_dhw():
+@pytest.mark.asyncio
+async def test_read_only_preview_retains_measured_total_and_separates_dhw():
     day = date(2026, 10, 9)
     start = datetime(2026, 10, 9, tzinfo=UTC)
     hours = [start + timedelta(hours=i) for i in range(25)]
@@ -27,7 +27,7 @@ def test_read_only_preview_retains_measured_total_and_separates_dhw():
                                "state_map": {"heating_water": "dhw", "heating_zones": "confirmed_heating"}}]},
         _async_collect_range=collector,
     )
-    result = asyncio.run(HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day))
+    result = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
     hp = result["allocations"]["hp"]
     assert result["preview"] is True and hp["meter_kwh"] == pytest.approx(24)
     assert hp["categories"]["dhw"] == pytest.approx(2)
@@ -36,16 +36,18 @@ def test_read_only_preview_retains_measured_total_and_separates_dhw():
     collector.assert_awaited_once_with(start, start+timedelta(days=1), store_mapping_revision=False)
 
 
-def test_preview_rejects_unattested_newer_mapping_before_collection():
+@pytest.mark.asyncio
+async def test_preview_rejects_unattested_newer_mapping_before_collection():
     collector = AsyncMock()
     coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-10-01T00:00:00+00:00"},
                                   config={}, _async_collect_range=collector)
     with pytest.raises(ValueError, match="attestation"):
-        asyncio.run(HomeEnergyCoordinator.async_preview_historical_energy(coordinator, date(2026, 9, 1)))
+        await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, date(2026, 9, 1))
     collector.assert_not_awaited()
 
 
-def test_preview_reads_configured_influx_when_recorder_missing_without_double_count(monkeypatch):
+@pytest.mark.asyncio
+async def test_preview_reads_configured_influx_when_recorder_missing_without_double_count(monkeypatch):
     day = date(2026, 10, 9)
     start = datetime(2026, 10, 9, tzinfo=UTC)
     calls = []
@@ -71,14 +73,15 @@ def test_preview_reads_configured_influx_when_recorder_missing_without_double_co
                 "influx_mapping_json": json.dumps({"equipment.hp.state": {"entity_id": "sensor.mode"},
                     "equipment.hp.energy": {"entity_id": "sensor.energy", "entity_tag": "energy", "measurement": "kWh", "unit": "kWh"}})},
         hass=SimpleNamespace(async_add_executor_job=execute), _async_collect_range=AsyncMock(return_value=source))
-    report = asyncio.run(HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
     assert calls == [("state", "sensor.mode"), ("counter", "energy")]
     assert report["allocations"]["hp"]["meter_kwh"] == pytest.approx(24)
     assert report["allocations"]["hp"]["categories"]["dhw"] == pytest.approx(1)
     assert report["provenance"]["counter_collection"]["equipment.hp.energy"] == "influx"
 
 
-def test_recorder_wins_over_conflicting_influx_at_same_state_timestamp(monkeypatch):
+@pytest.mark.asyncio
+async def test_recorder_wins_over_conflicting_influx_at_same_state_timestamp(monkeypatch):
     day = date(2026, 10, 9)
     start = datetime(2026, 10, 9, tzinfo=UTC)
     class FakeInflux:
@@ -98,6 +101,6 @@ def test_recorder_wins_over_conflicting_influx_at_same_state_timestamp(monkeypat
               "influx_enabled": True, "influx_host": "localhost", "influx_database": "homeassistant",
               "influx_mapping_json": json.dumps({"equipment.hp.state": {"entity_id": "sensor.mode"}})},
         hass=SimpleNamespace(async_add_executor_job=execute), _async_collect_range=AsyncMock(return_value=source))
-    report = asyncio.run(HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day))
+    report = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day)
     assert report["allocations"]["hp"]["categories"]["dhw"] == pytest.approx(1)
     assert report["allocations"]["hp"]["meter_kwh"] == pytest.approx(24)
