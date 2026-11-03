@@ -362,6 +362,10 @@ def test_recovered_monthly_metrics_remain_separate_and_keep_missing_values():
     assert [row[k] for k in ("recovered_ecodan_meter_kwh", "recovered_ecodan_assumed_heating_kwh", "recovered_ecodan_unknown_kwh", "recovered_ac_selected_heating_kwh", "recovered_ac_selected_cooling_kwh")] == [12, 4, 8, 2, 4]
     assert "recovered_ecodan_dhw_kwh" not in row
     assert row["primary_heating_cop"] is None and row["ecodan_heating_electricity_kwh"] == 3
+    other = {"rows": [{"month": "2026-09"}]}
+    add_recovered_presentation_metrics(other, summary, equipment + [{"equipment_id": "hp2", "kind": "heat_pump"}])
+    assert "recovered_ecodan_meter_kwh" not in other["rows"][0]
+    assert other["rows"][0]["recovered_ac_selected_heating_kwh"] == 2
 
 
 @pytest.mark.parametrize("handler_name", ["ws_electricity_recovery_start", "ws_electricity_recovery_status", "ws_electricity_recovery_cancel"])

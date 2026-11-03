@@ -97,13 +97,15 @@ RECOVERED_METRICS = {
 def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str, Any], equipment: list[dict[str, Any]]) -> None:
     """Attach separate known subtotals and coverage, without changing canonical totals."""
     kinds = {f"equipment.{item['equipment_id']}": item.get("kind") for item in equipment if item.get("enabled", True)}
+    # A generic heat-pump mapping cannot identify Ecodan when multiple heat pumps exist.
+    unique_heat_pump = sum(kind == "heat_pump" for kind in kinds.values()) == 1
     rows = {row["month"]: row for row in report.get("rows", [])}
     for item in summary.get("rows", []):
         row = rows.get(item.get("month"))
         if row is None:
             continue
         for metric, (kind, category) in RECOVERED_METRICS.items():
-            if kinds.get(item.get("source_key")) != kind:
+            if kinds.get(item.get("source_key")) != kind or (kind == "heat_pump" and not unique_heat_pump):
                 continue
             value = item.get("meter_kwh") if category is None else item.get("categories", {}).get(category)
             if value is None:
