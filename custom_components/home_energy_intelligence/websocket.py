@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -29,7 +30,7 @@ from .configuration import (
     temperatures_from_config,
 )
 from .const import DOMAIN
-from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence
+from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -588,6 +589,7 @@ async def _monthly_report_payload(hass, coordinator, end_month: str, count: int 
         if hasattr(coordinator, "_site_sources"):
             sources.update({f"site.{key}": value for key, value in coordinator._site_sources().items() if value})
         report["provisional_recovered"] = summarize_provisional_evidence(recovered, occupied, sources)
+        add_recovered_presentation_metrics(report, report["provisional_recovered"], _equipment(coordinator))
     return report
 
 
@@ -642,11 +644,20 @@ async def ws_monthly_report_csv(hass, connection, msg):
         "month", *metrics, "quality", "primary_cop_quality", "snapshot_status",
         "snapshot_cutoff_utc", "energy_period_end_utc", "cutoff_match",
     ]
+    recovered_metrics = [metric for metric in metrics if metric.startswith("recovered_")]
+    fields.extend(f"{metric}_evidence" for metric in recovered_metrics)
+    if recovered_metrics:
+        fields.append("recovered_excluded")
     writer = csv.DictWriter(output, fieldnames=fields)
     units = {item["id"]: item["unit"] for item in report["metric_catalog"]}
     writer.writerow({field: f"{field} ({units[field]})" if field in units else field for field in fields})
     for row in report["rows"]:
-        writer.writerow({field: row.get(field) for field in fields})
+        csv_row = {field: row.get(field) for field in fields}
+        for metric in recovered_metrics:
+            csv_row[f"{metric}_evidence"] = json.dumps(row.get("recovered_metric_evidence", {}).get(metric, []), ensure_ascii=False)
+        if recovered_metrics:
+            csv_row["recovered_excluded"] = json.dumps(row.get("recovered_excluded", []), ensure_ascii=False)
+        writer.writerow(csv_row)
     connection.send_result(msg["id"], {
         "filename": f"home-energy-intelligence-monthly-{msg['end_month']}.csv",
         "csv": output.getvalue(), "row_count": len(report["rows"]),

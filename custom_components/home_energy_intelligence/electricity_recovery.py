@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from math import isfinite
 from typing import Any
 
@@ -64,11 +64,56 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
             continue
         group = groups.setdefault((day[:7], key), {"month": day[:7], "source_key": key,
             "source_entity_id": record["source_entity_id"], "meter_kwh": 0.0, "categories": {}, "residual_kwh": None, "days": 0,
+            "coverage_seconds": None, "expected_seconds": 0.0, "coverage_unknown_days": 0, "sources": [],
             "quality": "provisional partial subtotal; historical mapping unverified"})
         group["meter_kwh"] += record["meter_kwh"]
         group["days"] += 1
+        covered = record.get("meter_coverage_seconds")
+        if isinstance(covered, (int, float)):
+            group["coverage_seconds"] = (group["coverage_seconds"] or 0.0) + covered
+        else:
+            group["coverage_unknown_days"] += 1
+        group["expected_seconds"] += (datetime.fromisoformat(record["interval_end_utc"]) - datetime.fromisoformat(record["interval_start_utc"])).total_seconds()
+        source = record.get("counter_source")
+        if source and source not in group["sources"]:
+            group["sources"].append(source)
         if record.get("residual_kwh") is not None:
             group["residual_kwh"] = (group["residual_kwh"] or 0.0) + record["residual_kwh"]
         for category, value in record.get("categories", {}).items():
             group["categories"][category] = group["categories"].get(category, 0.0) + value
     return {"rows": list(groups.values()), "skipped": skipped}
+
+
+RECOVERED_METRICS = {
+    "recovered_ecodan_meter_kwh": ("heat_pump", None),
+    "recovered_ecodan_assumed_heating_kwh": ("heat_pump", "heating_assumed"),
+    "recovered_ecodan_dhw_kwh": ("heat_pump", "dhw"),
+    "recovered_ecodan_unknown_kwh": ("heat_pump", "unknown"),
+    "recovered_ac_selected_heating_kwh": ("air_conditioner", "heating_selected"),
+    "recovered_ac_selected_cooling_kwh": ("air_conditioner", "cooling_selected"),
+}
+
+
+def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str, Any], equipment: list[dict[str, Any]]) -> None:
+    """Attach separate known subtotals and coverage, without changing canonical totals."""
+    kinds = {f"equipment.{item['equipment_id']}": item.get("kind") for item in equipment if item.get("enabled", True)}
+    rows = {row["month"]: row for row in report.get("rows", [])}
+    for item in summary.get("rows", []):
+        row = rows.get(item.get("month"))
+        if row is None:
+            continue
+        for metric, (kind, category) in RECOVERED_METRICS.items():
+            if kinds.get(item.get("source_key")) != kind:
+                continue
+            value = item.get("meter_kwh") if category is None else item.get("categories", {}).get(category)
+            if value is None:
+                continue
+            row[metric] = (row.get(metric) or 0.0) + value
+            row.setdefault("recovered_metric_evidence", {}).setdefault(metric, []).append({
+                "source_key": item["source_key"], "source_entity_id": item["source_entity_id"],
+                "sources": item.get("sources", []), "coverage_seconds": item.get("coverage_seconds"),
+                "expected_seconds": item.get("expected_seconds"), "days": item.get("days"),
+                "coverage_unknown_days": item.get("coverage_unknown_days", 0),
+                "quality": item.get("quality")})
+    for row in rows.values():
+        row["recovered_excluded"] = [item for item in summary.get("skipped", []) if str(item.get("local_date", "")).startswith(row["month"])]

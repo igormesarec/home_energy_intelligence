@@ -307,7 +307,11 @@ async def test_explicit_start_idempotent_retry_and_cancel_during_day(hass, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_monthly_report_includes_only_nonoverlapping_provisional_evidence(hass, tmp_path):
+async def test_monthly_report_includes_only_nonoverlapping_provisional_evidence(hass, tmp_path, monkeypatch):
+    import csv
+    import inspect
+    import io
+    from custom_components.home_energy_intelligence import websocket
     from custom_components.home_energy_intelligence.websocket import _monthly_report_payload
     db = EnergyDatabase(tmp_path / "monthly.sqlite3")
     db.initialize()
@@ -320,6 +324,17 @@ async def test_monthly_report_includes_only_nonoverlapping_provisional_evidence(
         "equipment": json.dumps([{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.hp"}])})
     result = await _monthly_report_payload(hass, coordinator, "2026-09", 1)
     assert result["provisional_recovered"]["rows"][0]["categories"] == {"unknown": 1}
+    assert result["rows"][0]["recovered_ecodan_unknown_kwh"] == 1
+    assert result["rows"][0]["recovered_ecodan_meter_kwh"] == 1
+    assert "recovered_ecodan_dhw_kwh" not in result["rows"][0]
+    assert result["rows"][0]["recovered_metric_evidence"]["recovered_ecodan_unknown_kwh"][0]["source_entity_id"] == "sensor.hp"
+    monkeypatch.setattr(websocket, "_coordinator", lambda _hass: coordinator)
+    connection = SimpleNamespace(send_result=Mock(), send_error=Mock())
+    await inspect.unwrap(websocket.ws_monthly_report_csv)(hass, connection, {"id": 1, "end_month": "2026-09", "count": 1, "metric_ids": ["recovered_ecodan_unknown_kwh"]})
+    csv_text = connection.send_result.call_args.args[1]["csv"]
+    csv_row = next(csv.DictReader(io.StringIO(csv_text)))
+    assert float(csv_row["recovered_ecodan_unknown_kwh (kWh)"]) == result["rows"][0]["recovered_ecodan_unknown_kwh"]
+    assert "sensor.hp" in csv_row["recovered_ecodan_unknown_kwh_evidence"]
     with db.connect() as connection:
         connection.execute("""INSERT INTO hourly_records (interval_start_utc,interval_end_utc,local_date,timezone,payload_json,checksum,quality,updated_at)
             VALUES (?,?,?,?,?,?,?,?)""", ("2026-09-25T00:00:00+00:00", "2026-09-25T01:00:00+00:00", "2026-09-25",
@@ -327,6 +342,26 @@ async def test_monthly_report_includes_only_nonoverlapping_provisional_evidence(
     result = await _monthly_report_payload(hass, coordinator, "2026-09", 1)
     assert result["provisional_recovered"]["rows"] == []
     assert result["provisional_recovered"]["skipped"][0]["reason"] == "existing_electrical_record"
+    assert "recovered_ecodan_unknown_kwh" not in result["rows"][0]
+    assert result["rows"][0]["recovered_excluded"][0]["local_date"] == "2026-09-25"
+
+
+def test_recovered_monthly_metrics_remain_separate_and_keep_missing_values():
+    from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics
+    report = {"rows": [{"month": "2026-09", "primary_heating_cop": None, "ecodan_heating_electricity_kwh": 3}]}
+    common = {"month": "2026-09", "days": 2, "coverage_seconds": 3600, "expected_seconds": 86400,
+              "sources": ["recorder"], "quality": "provisional partial"}
+    summary = {"rows": [
+        {**common, "source_key": "equipment.hp", "source_entity_id": "sensor.hp", "meter_kwh": 12,
+         "categories": {"heating_assumed": 4, "unknown": 8}},
+        {**common, "source_key": "equipment.ac", "source_entity_id": "sensor.ac", "meter_kwh": 6,
+         "categories": {"heating_selected": 2, "cooling_selected": 4}}], "skipped": []}
+    equipment = [{"equipment_id": "hp", "kind": "heat_pump"}, {"equipment_id": "ac", "kind": "air_conditioner"}]
+    add_recovered_presentation_metrics(report, summary, equipment)
+    row = report["rows"][0]
+    assert [row[k] for k in ("recovered_ecodan_meter_kwh", "recovered_ecodan_assumed_heating_kwh", "recovered_ecodan_unknown_kwh", "recovered_ac_selected_heating_kwh", "recovered_ac_selected_cooling_kwh")] == [12, 4, 8, 2, 4]
+    assert "recovered_ecodan_dhw_kwh" not in row
+    assert row["primary_heating_cop"] is None and row["ecodan_heating_electricity_kwh"] == 3
 
 
 @pytest.mark.parametrize("handler_name", ["ws_electricity_recovery_start", "ws_electricity_recovery_status", "ws_electricity_recovery_cancel"])

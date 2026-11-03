@@ -28,6 +28,19 @@ const input=JSON.parse(fs.readFileSync(0,'utf8'));const panel=new Panel();
     return result.stdout
 
 
+def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyMetricIds=['recovered_ac_selected_heating_kwh'];
+panel.monthlyReport={metric_catalog:[{id:'recovered_ac_selected_heating_kwh',group:'recovered',axis:'energy',label:'Recovered AC selected heating subtotal',unit:'kWh'}],rows:[{month:'2026-09',quality:'partial',snapshot_status:'partial',recovered_ac_selected_heating_kwh:11.7,recovered_ac_selected_cooling_kwh:78.7,recovered_ecodan_unknown_kwh:4,recovered_metric_evidence:{recovered_ac_selected_heating_kwh:[{source_entity_id:'sensor.ac',coverage_seconds:3600,quality:'provisional'}]},recovered_excluded:[{local_date:'2026-09-18',reason:'existing_electrical_record'}]}]};
+process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
+""", {})
+    assert '11.700' in output and '78.70' in output
+    assert 'Recovered provisional AC selected heat' in output
+    assert 'sensor.ac' in output and '2026-09-18' in output
+    assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
+
+
 def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
     output = run_panel(r"""
 panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
