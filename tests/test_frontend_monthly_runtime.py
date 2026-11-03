@@ -28,6 +28,31 @@ const input=JSON.parse(fs.readFileSync(0,'utf8'));const panel=new Panel();
     return result.stdout
 
 
+def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyMetricIds=['recovered_ac_selected_heating_kwh'];
+panel.monthlyReport={metric_catalog:[{id:'recovered_ac_selected_heating_kwh',group:'recovered',axis:'energy',label:'Recovered AC selected heating subtotal',unit:'kWh'}],rows:[{month:'2026-09',quality:'partial',snapshot_status:'partial',recovered_ac_selected_heating_kwh:11.7,recovered_ac_selected_cooling_kwh:78.7,recovered_ecodan_unknown_kwh:4,recovered_metric_evidence:{recovered_ac_selected_heating_kwh:[{source_entity_id:'sensor.ac',coverage_seconds:3600,quality:'provisional'}]},recovered_excluded:[{local_date:'2026-09-18',reason:'existing_electrical_record'}]}]};
+process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
+""", {})
+    assert '11.700' in output and '78.70' in output
+    assert 'Recovered provisional AC selected heat' in output
+    assert 'sensor.ac' in output and '2026-09-18' in output
+    assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
+
+
+def test_recovered_ac_meter_and_unknown_render_as_provisional():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyMetricIds=['recovered_ac_meter_kwh','recovered_ac_unknown_kwh'];
+panel.monthlyReport={metric_catalog:panel.monthlyMetricIds.map(id=>({id,group:'recovered',axis:'energy',label:id,unit:'kWh'})),rows:[{month:'2026-09',quality:'partial',snapshot_status:'partial',recovered_ac_meter_kwh:5,recovered_ac_unknown_kwh:2,recovered_metric_evidence:{recovered_ac_meter_kwh:[{source_entity_id:'sensor.ac'}]},recovered_excluded:[]}]};
+process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
+""", {})
+    assert 'Recovered provisional AC meter' in output and 'Recovered provisional AC unknown' in output
+    assert '5.000' in output and '2.000' in output and 'sensor.ac' in output
+    assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
+
+
 def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
     output = run_panel(r"""
 panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
@@ -77,6 +102,19 @@ let request;panel.render=()=>{};panel._hass={callWS:async(msg)=>{request=msg;ret
     assert result["request"]["attest_current_mapping"] is False
     assert "unverified historical mapping" in result["html"]
     assert 'class="historical-evidence-only" type="checkbox" checked' in result["html"]
+
+
+def test_provisional_recovery_progress_and_categories_are_visible():
+    output = run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.historicalEnergyPreview={recovery_dry_run:[{records:[{}],skipped:[]}],records:[]};
+panel.electricityRecoveryJob={id:1,status:'running',details_json:JSON.stringify({processed_days:2,inserted:3,skipped:1})};
+panel.monthlyReport={provisional_recovered:{rows:[{month:'2026-09',source_key:'equipment.hp',source_entity_id:'sensor.hp',meter_kwh:12,categories:{unknown:12},days:1}],skipped:[]}};
+process.stdout.write(panel.settingsView()+panel.recoveredMonthlyTable());
+""", {})
+    assert "Start provisional recovery" in output and "Cancel recovery" in output
+    assert "processed 2 days" in output and "provisional partial subtotals" in output
+    assert "sensor.hp" in output and "unknown" in output
 
 
 def monthly_payload():
