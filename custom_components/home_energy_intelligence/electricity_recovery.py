@@ -91,6 +91,8 @@ RECOVERED_METRICS = {
     "recovered_ecodan_unknown_kwh": ("heat_pump", "unknown"),
     "recovered_ac_selected_heating_kwh": ("air_conditioner", "heating_selected"),
     "recovered_ac_selected_cooling_kwh": ("air_conditioner", "cooling_selected"),
+    "recovered_ac_meter_kwh": ("air_conditioner", None),
+    "recovered_ac_unknown_kwh": ("air_conditioner", "unknown"),
 }
 
 

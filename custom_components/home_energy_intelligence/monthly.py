@@ -614,6 +614,7 @@ def build_rolling_month_report(
             "recovered_ecodan_meter_kwh", "recovered_ecodan_assumed_heating_kwh",
             "recovered_ecodan_dhw_kwh", "recovered_ecodan_unknown_kwh",
             "recovered_ac_selected_heating_kwh", "recovered_ac_selected_cooling_kwh",
+            "recovered_ac_meter_kwh", "recovered_ac_unknown_kwh",
         ],
         "metric_catalog": monthly_metric_catalog(equipment),
         "timezone": timezone,
@@ -684,6 +685,8 @@ def monthly_metric_catalog(
             "recovered_ecodan_unknown_kwh": "Recovered provisional Ecodan unknown",
             "recovered_ac_selected_heating_kwh": "Recovered provisional AC selected heating",
             "recovered_ac_selected_cooling_kwh": "Recovered provisional AC selected cooling",
+            "recovered_ac_meter_kwh": "Recovered provisional AC meter subtotal",
+            "recovered_ac_unknown_kwh": "Recovered provisional AC unknown subtotal",
         }.items())
     catalog.append({
         "id": "whole_house_heating_kwh_m2",

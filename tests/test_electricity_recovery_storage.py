@@ -368,6 +368,49 @@ def test_recovered_monthly_metrics_remain_separate_and_keep_missing_values():
     assert other["rows"][0]["recovered_ac_selected_heating_kwh"] == 2
 
 
+@pytest.mark.asyncio
+async def test_recovered_ac_monthly_csv_and_source_day_exclusion(hass, tmp_path, monkeypatch):
+    import csv
+    import inspect
+    import io
+    from custom_components.home_energy_intelligence import websocket
+
+    db = EnergyDatabase(tmp_path / "ac-monthly.sqlite3")
+    db.initialize()
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    records = [{**evidence("2026-09-25", value=value), "source_key": f"equipment.{name}",
+                "source_entity_id": f"sensor.{name}", "categories": {"unknown": value},
+                "source_provenance": {"energy_entity_id": f"sensor.{name}"},
+                "historical_mapping_quality": "unverified historical mapping",
+                "meter_coverage_seconds": 3600, "counter_source": "recorder_states_partial"}
+               for name, value in (("ac1", 2), ("ac2", 3))]
+    db.commit_electricity_recovery_day(job, "2026-09-25", records)
+    equipment = [{"equipment_id": name, "display_name": name, "kind": "air_conditioner", "energy_entity": f"sensor.{name}"} for name in ("ac1", "ac2", "missing")]
+    coordinator = SimpleNamespace(database=db, timezone="Europe/Ljubljana", config={"equipment": json.dumps(equipment)})
+    report = await websocket._monthly_report_payload(hass, coordinator, "2026-09", 1)
+    row = report["rows"][0]
+    assert row["recovered_ac_meter_kwh"] == row["recovered_ac_unknown_kwh"] == 5
+    assert len(row["recovered_metric_evidence"]["recovered_ac_meter_kwh"]) == 2
+    monkeypatch.setattr(websocket, "_coordinator", lambda _hass: coordinator)
+    connection = SimpleNamespace(send_result=Mock(), send_error=Mock())
+    await inspect.unwrap(websocket.ws_monthly_report_csv)(hass, connection, {"id": 1, "end_month": "2026-09", "count": 1, "metric_ids": ["recovered_ac_meter_kwh", "recovered_ac_unknown_kwh"]})
+    csv_row = next(csv.DictReader(io.StringIO(connection.send_result.call_args.args[1]["csv"])))
+    assert float(csv_row["recovered_ac_meter_kwh (kWh)"]) == row["recovered_ac_meter_kwh"]
+    assert float(csv_row["recovered_ac_unknown_kwh (kWh)"]) == row["recovered_ac_unknown_kwh"]
+    with db.connect() as connection:
+        connection.execute("""INSERT INTO hourly_records (interval_start_utc,interval_end_utc,local_date,timezone,payload_json,checksum,quality,updated_at)
+            VALUES (?,?,?,?,?,?,?,?)""", ("2026-09-25T00:00:00+00:00", "2026-09-25T01:00:00+00:00", "2026-09-25", "Europe/Ljubljana", json.dumps({"allocations": {"ac1": {"meter_kwh": 0}}}), "saved", "partial", "now"))
+    row = (await websocket._monthly_report_payload(hass, coordinator, "2026-09", 1))["rows"][0]
+    assert row["recovered_ac_meter_kwh"] == row["recovered_ac_unknown_kwh"] == 3
+    assert any(item["source_key"] == "equipment.ac1" for item in row["recovered_excluded"])
+
+    empty = {"rows": [{"month": "2026-09"}]}
+    from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics
+    add_recovered_presentation_metrics(empty, {"rows": [], "skipped": []}, equipment)
+    assert "recovered_ac_meter_kwh" not in empty["rows"][0]
+    assert "recovered_ac_unknown_kwh" not in empty["rows"][0]
+
+
 @pytest.mark.parametrize("handler_name", ["ws_electricity_recovery_start", "ws_electricity_recovery_status", "ws_electricity_recovery_cancel"])
 def test_recovery_commands_require_admin(handler_name):
     from homeassistant.exceptions import Unauthorized

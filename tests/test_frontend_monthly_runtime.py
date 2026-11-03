@@ -41,6 +41,18 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
     assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
 
 
+def test_recovered_ac_meter_and_unknown_render_as_provisional():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyMetricIds=['recovered_ac_meter_kwh','recovered_ac_unknown_kwh'];
+panel.monthlyReport={metric_catalog:panel.monthlyMetricIds.map(id=>({id,group:'recovered',axis:'energy',label:id,unit:'kWh'})),rows:[{month:'2026-09',quality:'partial',snapshot_status:'partial',recovered_ac_meter_kwh:5,recovered_ac_unknown_kwh:2,recovered_metric_evidence:{recovered_ac_meter_kwh:[{source_entity_id:'sensor.ac'}]},recovered_excluded:[]}]};
+process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
+""", {})
+    assert 'Recovered provisional AC meter' in output and 'Recovered provisional AC unknown' in output
+    assert '5.000' in output and '2.000' in output and 'sensor.ac' in output
+    assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
+
+
 def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
     output = run_panel(r"""
 panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
