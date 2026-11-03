@@ -53,6 +53,18 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
     assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
 
 
+def test_overlapping_historical_references_render_with_distinct_style_and_reasons():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyMetricIds=['recovered_reference_ecodan_meter_kwh','recovered_reference_ac_meter_kwh'];
+panel.monthlyReport={metric_catalog:panel.monthlyMetricIds.map(id=>({id,group:'recovered_reference',axis:'energy',label:id,unit:'kWh'})),rows:[{month:'2026-09',quality:'partial',snapshot_status:'partial',recovered_reference_ecodan_meter_kwh:12.073,recovered_reference_ac_meter_kwh:2.741,recovered_metric_evidence:{recovered_reference_ac_meter_kwh:[{source_entity_id:'sensor.ac',coverage_seconds:3600}]},recovered_excluded:[{local_date:'2026-09-25',reason:'existing_electrical_record'}]}]};
+process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
+""", {})
+    assert '12.073' in output and '2.741' in output
+    assert 'stroke-dasharray="1 3"' in output and 'non-additive' in output
+    assert 'sensor.ac' in output and 'existing_electrical_record' in output
+
+
 def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
     output = run_panel(r"""
 panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};

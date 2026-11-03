@@ -615,6 +615,7 @@ def build_rolling_month_report(
             "recovered_ecodan_dhw_kwh", "recovered_ecodan_unknown_kwh",
             "recovered_ac_selected_heating_kwh", "recovered_ac_selected_cooling_kwh",
             "recovered_ac_meter_kwh", "recovered_ac_unknown_kwh",
+            "recovered_reference_ecodan_meter_kwh", "recovered_reference_ac_meter_kwh",
         ],
         "metric_catalog": monthly_metric_catalog(equipment),
         "timezone": timezone,
@@ -688,6 +689,10 @@ def monthly_metric_catalog(
             "recovered_ac_meter_kwh": "Recovered provisional AC meter subtotal",
             "recovered_ac_unknown_kwh": "Recovered provisional AC unknown subtotal",
         }.items())
+    catalog.extend({**item, "id": item["id"].replace("recovered_", "recovered_reference_", 1),
+                    "label": item["label"].replace("Recovered provisional", "Overlapping historical reference (non-additive)"),
+                    "group": "recovered_reference"}
+                   for item in list(catalog) if item.get("group") == "recovered")
     catalog.append({
         "id": "whole_house_heating_kwh_m2",
         "label": "Whole-house heating electricity per floor area",
