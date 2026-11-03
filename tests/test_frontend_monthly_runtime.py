@@ -28,6 +28,26 @@ const input=JSON.parse(fs.readFileSync(0,'utf8'));const panel=new Panel();
     return result.stdout
 
 
+def test_full_monthly_csv_export_ignores_checkbox_selection_and_reports_errors():
+    output = run_panel(r"""
+(async()=>{
+const metrics=Array.from({length:40},(_,i)=>({id:`metric_${i}`,label:`Metric ${i}`,unit:'kWh',axis:'energy'}));
+panel.monthlyReport={metric_catalog:metrics,rows:[]};panel.monthlyMetricIds=['metric_1'];panel.monthlyEndMonth='2026-09';panel.equipment=[];
+panel.render=()=>{};let sent;let clicked=false;
+global.document={createElement:()=>({click:()=>{clicked=true}})};global.URL={createObjectURL:()=>'',revokeObjectURL:()=>{}};
+panel._hass={callWS:async msg=>{sent=msg;return {csv:'month',filename:'all.csv'}}};
+await panel.exportMonthlyCsv(true);
+const controls=panel.monthlyView();
+panel._hass.callWS=async()=>{throw new Error('<denied>')};await panel.exportMonthlyCsv(true);
+process.stdout.write(JSON.stringify({sent,clicked,selected:panel.monthlyMetricIds,controls,error:panel.monthlyView()}));
+})();
+""", {})
+    result = json.loads(output)
+    assert len(result["sent"]["metric_ids"]) == 40 and result["selected"] == ["metric_1"] and result["clicked"]
+    assert "Select All" in result["controls"] and "Clear All" in result["controls"] and "Export all metrics CSV" in result["controls"]
+    assert "CSV export failed: &lt;denied&gt;" in result["error"]
+
+
 def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};

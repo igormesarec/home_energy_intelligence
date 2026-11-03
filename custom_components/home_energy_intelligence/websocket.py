@@ -618,7 +618,7 @@ async def ws_monthly_report(hass, connection, msg):
     vol.Required("type"): f"{DOMAIN}/monthly_report_csv",
     vol.Required("end_month"): str,
     vol.Optional("count", default=13): vol.All(vol.Coerce(int), vol.Range(min=1, max=24)),
-    vol.Required("metric_ids"): vol.All([str], vol.Length(min=1, max=30)),
+    vol.Required("metric_ids"): vol.All([str], vol.Length(min=1)),
 })
 @websocket_api.async_response
 async def ws_monthly_report_csv(hass, connection, msg):
@@ -627,6 +627,9 @@ async def ws_monthly_report_csv(hass, connection, msg):
         connection.send_error(msg["id"], "not_configured", "Integration is not configured")
         return
     allowed = {item["id"] for item in monthly_metric_catalog(_equipment(coordinator))}
+    if len(msg["metric_ids"]) > len(allowed):
+        connection.send_error(msg["id"], "invalid_metric", "Too many metric IDs for the current catalog")
+        return
     metrics = list(dict.fromkeys(msg["metric_ids"]))
     invalid = [item for item in metrics if item not in allowed]
     if invalid:
