@@ -73,6 +73,18 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
     assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
 
 
+def test_partial_whole_house_months_and_missing_zero_render_truthfully():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyReport={rows:[['2026-07',null],['2026-08',74.48593],['2026-09',197.767433],['2026-10',94.060806],['2026-11',59.918257],['2026-12',0]].map(([month,value])=>({month,known_whole_house_heating_electricity_kwh:value,period_coverage:{allocation_coverage:{complete:false},date_coverage:{complete:false}},quality:'partial'}))};
+process.stdout.write(panel.monthlyHouseProfile());
+""", {})
+    assert '74.486' in output and '197.767' in output and '94.061' in output and '59.918' in output
+    assert 'Partial known subtotal' in output and 'Unavailable' in output
+    assert '2026-12 · Whole-house: 0.000' not in output
+    assert output.count('stroke="var(--divider-color,#b9c6d5)"') >= 5
+
+
 def test_overlapping_historical_references_render_with_distinct_style_and_reasons():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};

@@ -54,6 +54,16 @@ def daily_record(
     }
 
 
+def test_partial_month_known_heating_is_nullable_and_keeps_assumptions_separate():
+    equipment = [{"equipment_id": "hp_main", "kind": "heat_pump"}]
+    report = build_rolling_month_report(daily_records=[daily_record()], snapshots=[], equipment=equipment,
+                                        timezone="Europe/Ljubljana", end_month="2026-10", count=2)
+    september, october = report["rows"]
+    assert september["known_whole_house_heating_electricity_kwh"] is None
+    assert october["known_whole_house_heating_electricity_kwh"] == 9
+    assert october["ecodan_assumed_heating_kwh"] is not None
+
+
 def test_september_provisional_shelly_cop_without_classification():
     from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
