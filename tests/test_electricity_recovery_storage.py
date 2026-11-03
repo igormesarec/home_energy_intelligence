@@ -20,6 +20,39 @@ def evidence(day, *, value=1.0):
             "source": "recorder", "calculation_version": "historical-preview-v1"}
 
 
+@pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-09-25", 86400), ("2026-10-25", 90000)])
+def test_site_recovered_evidence_keeps_overlap_coverage_and_missing_separate(day, seconds):
+    from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics
+    pv = {**evidence(day, value=0), "source_key": "site.pv", "source_entity_id": "sensor.pv", "meter_coverage_seconds": seconds, "counter_source": "recorder_states"}
+    imp = {**evidence(day, value=2), "source_key": "site.import", "source_entity_id": "sensor.import", "meter_coverage_seconds": seconds / 2, "counter_source": "recorder_states_partial"}
+    bad = {**evidence(day), "source_key": "site.export", "source_entity_id": "sensor.old"}
+    sources = {"site.pv": "sensor.pv", "site.import": "sensor.import", "site.export": "sensor.new"}
+    summary = summarize_provisional_evidence({"records": [pv, imp, bad]}, {(day, "site.import")}, sources)
+    report = {"rows": [{"month": day[:7], "pv_kwh": 7}]}
+    add_recovered_presentation_metrics(report, summary, [])
+    row = report["rows"][0]
+    assert row["recovered_pv_kwh"] == 0 and row["pv_kwh"] == 7
+    assert row["recovered_reference_import_kwh"] == 2 and "recovered_import_kwh" not in row
+    assert "recovered_export_kwh" not in row and "recovered_reference_export_kwh" not in row
+    details = row["recovered_metric_evidence"]["recovered_reference_import_kwh"][0]
+    assert details["source_entity_id"] == "sensor.import" and details["expected_seconds"] == seconds
+    assert details["coverage_seconds"] == seconds / 2 and details["recovery_kind"] == "overlapping_reference"
+    assert {item["reason"] for item in row["recovered_excluded"]} == {"current_source_identity_mismatch", "existing_electrical_record"}
+
+
+def test_august_thermal_values_remain_separate_from_assumed_recovery():
+    from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics
+    row = {"month": "2026-08", "heating_thermal_kwh": 6, "dhw_thermal_kwh": 242,
+           "primary_heating_cop": None, "whole_house_heating_electricity_kwh": None}
+    item = {"month": "2026-08", "source_key": "equipment.hp", "source_entity_id": "sensor.hp",
+            "meter_kwh": 30, "categories": {"heating_assumed": 30}, "days": 1}
+    add_recovered_presentation_metrics({"rows": [row]}, {"rows": [item]}, [{"equipment_id": "hp", "kind": "heat_pump"}])
+    assert (row["heating_thermal_kwh"], row["dhw_thermal_kwh"]) == (6, 242)
+    assert row["recovered_ecodan_assumed_heating_kwh"] == 30
+    assert "recovered_ecodan_confirmed_heating_kwh" not in row
+    assert row["primary_heating_cop"] is None and row["whole_house_heating_electricity_kwh"] is None
+
+
 def test_additive_migration_and_idempotent_recovery_preserve_existing_data(tmp_path):
     db = EnergyDatabase(tmp_path / "energy.sqlite3")
     db.initialize()
@@ -441,6 +474,9 @@ async def test_seven_overlapping_september_sources_remain_nonadditive_references
     row = report["rows"][0]
     assert row["recovered_reference_ecodan_meter_kwh"] == pytest.approx(12.073)
     assert row["recovered_reference_ac_meter_kwh"] == pytest.approx(2.741)
+    assert row["recovered_reference_pv_kwh"] == 3
+    assert row["recovered_reference_import_kwh"] == 4
+    assert row["recovered_reference_export_kwh"] == 1
     assert "recovered_ecodan_meter_kwh" not in row and "recovered_ac_meter_kwh" not in row
     assert len(row["recovered_excluded"]) == 7
     assert all(item["reason"] == "existing_electrical_record" for item in row["recovered_excluded"])
@@ -448,10 +484,14 @@ async def test_seven_overlapping_september_sources_remain_nonadditive_references
     assert row["recovered_metric_evidence"]["recovered_reference_ac_meter_kwh"][0]["coverage_seconds"] == 3600
     monkeypatch.setattr(websocket, "_coordinator", lambda _hass: coordinator)
     connection = SimpleNamespace(send_result=Mock(), send_error=Mock())
-    await inspect.unwrap(websocket.ws_monthly_report_csv)(hass, connection, {"id": 1, "end_month": "2026-09", "count": 1, "metric_ids": ["recovered_reference_ecodan_meter_kwh", "recovered_reference_ac_meter_kwh"]})
-    csv_row = next(csv.DictReader(io.StringIO(connection.send_result.call_args.args[1]["csv"])))
+    await inspect.unwrap(websocket.ws_monthly_report_csv)(hass, connection, {"id": 1, "end_month": "2026-09", "count": 13, "metric_ids": ["recovered_reference_ecodan_meter_kwh", "recovered_reference_ac_meter_kwh", "recovered_reference_pv_kwh"]})
+    csv_rows = list(csv.DictReader(io.StringIO(connection.send_result.call_args.args[1]["csv"])))
+    assert len(csv_rows) == 13
+    csv_row = next(item for item in csv_rows if item["month"] == "2026-09")
     assert float(csv_row["recovered_reference_ecodan_meter_kwh (kWh)"]) == pytest.approx(12.073)
     assert float(csv_row["recovered_reference_ac_meter_kwh (kWh)"]) == pytest.approx(2.741)
+    assert float(csv_row["recovered_reference_pv_kwh (kWh)"]) == 3
+    assert "sensor.pv" in csv_row["recovered_reference_pv_kwh_evidence"]
     assert "existing_electrical_record" in csv_row["recovered_excluded"]
     monkeypatch.setattr(db, "electricity_recovery_evidence_range", lambda *_: {"records": [], "ambiguous": []})
     baseline = (await websocket._monthly_report_payload(hass, coordinator, "2026-09", 1))["rows"][0]

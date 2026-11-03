@@ -57,7 +57,7 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
 """, {})
     assert '11.700' in output and '78.70' in output
     assert 'Recovered provisional AC selected heat' in output
-    assert 'sensor.ac' in output and '2026-09-18' in output
+    assert 'sensor.ac' in output and 'existing_electrical_record' in output
     assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
 
 
@@ -83,6 +83,18 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
     assert '12.073' in output and '2.741' in output
     assert 'stroke-dasharray="1 3"' in output and 'non-additive' in output
     assert 'sensor.ac' in output and 'existing_electrical_record' in output
+
+
+def test_pv_recovered_site_evidence_stays_separate_and_compact():
+    output = run_panel(r"""
+panel.monthlyReport={rows:[{month:'2026-01',recovered_pv_kwh:33.006,recovered_reference_import_kwh:61.51,recovered_metric_evidence:{recovered_pv_kwh:[{source_entity_id:'sensor.pv',coverage_seconds:10800,expected_seconds:10800,days:3}]},recovered_excluded:Array.from({length:100},()=>({reason:'existing_electrical_record'}))}]};
+panel.equipment=[];process.stdout.write(panel.pvPeriodMetrics({energy:{pv_kwh:2}})+panel.recoveredSiteEvidence()+panel.monthlyView());
+""", {})
+    assert '33.006' in output and '61.510' in output
+    assert 'provisional partial' in output and 'overlapping reference, non-additive' in output
+    assert 'sensor.pv' in output and '100.0% coverage' in output
+    assert 'PV generation' in output and '2.0' in output
+    assert 'existing_electrical_record 100' in output and '&quot;reason&quot;' not in output
 
 
 def test_read_only_historical_preview_renders_unknown_and_partial_evidence():
