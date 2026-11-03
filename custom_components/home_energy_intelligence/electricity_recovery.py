@@ -53,19 +53,20 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
                                    source_entities: dict[str, str]) -> dict[str, Any]:
     """Summarize separate provisional evidence without merging it into measured totals."""
     groups: dict[tuple[str, str], dict[str, Any]] = {}
+    references: dict[tuple[str, str], dict[str, Any]] = {}
     skipped = list(evidence.get("ambiguous", []))
     for record in evidence.get("records", []):
         day, key = record.get("local_date", ""), record.get("source_key", "")
-        if day in excluded_dates or (day, key) in excluded_dates or (day, "*") in excluded_dates:
-            skipped.append({"local_date": day, "source_key": key, "reason": "existing_electrical_record"})
-            continue
         if not source_entities.get(key) or source_entities[key] != record.get("source_entity_id"):
             skipped.append({"local_date": day, "source_key": key, "reason": "current_source_identity_mismatch"})
             continue
-        group = groups.setdefault((day[:7], key), {"month": day[:7], "source_key": key,
+        overlap = day in excluded_dates or (day, key) in excluded_dates or (day, "*") in excluded_dates
+        if overlap:
+            skipped.append({"local_date": day, "source_key": key, "reason": "existing_electrical_record"})
+        group = (references if overlap else groups).setdefault((day[:7], key), {"month": day[:7], "source_key": key,
             "source_entity_id": record["source_entity_id"], "meter_kwh": 0.0, "categories": {}, "residual_kwh": None, "days": 0,
             "coverage_seconds": None, "expected_seconds": 0.0, "coverage_unknown_days": 0, "sources": [],
-            "quality": "provisional partial subtotal; historical mapping unverified"})
+            "quality": ("overlapping historical reference; non-additive; historical mapping unverified" if overlap else "provisional partial subtotal; historical mapping unverified")})
         group["meter_kwh"] += record["meter_kwh"]
         group["days"] += 1
         covered = record.get("meter_coverage_seconds")
@@ -81,7 +82,7 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
             group["residual_kwh"] = (group["residual_kwh"] or 0.0) + record["residual_kwh"]
         for category, value in record.get("categories", {}).items():
             group["categories"][category] = group["categories"].get(category, 0.0) + value
-    return {"rows": list(groups.values()), "skipped": skipped}
+    return {"rows": list(groups.values()), "reference_rows": list(references.values()), "skipped": skipped}
 
 
 RECOVERED_METRICS = {
@@ -102,7 +103,7 @@ def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str
     # A generic heat-pump mapping cannot identify Ecodan when multiple heat pumps exist.
     unique_heat_pump = sum(kind == "heat_pump" for kind in kinds.values()) == 1
     rows = {row["month"]: row for row in report.get("rows", [])}
-    for item in summary.get("rows", []):
+    for is_reference, item in [(False, item) for item in summary.get("rows", [])] + [(True, item) for item in summary.get("reference_rows", [])]:
         row = rows.get(item.get("month"))
         if row is None:
             continue
@@ -112,6 +113,8 @@ def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str
             value = item.get("meter_kwh") if category is None else item.get("categories", {}).get(category)
             if value is None:
                 continue
+            if is_reference:
+                metric = metric.replace("recovered_", "recovered_reference_", 1)
             row[metric] = (row.get(metric) or 0.0) + value
             row.setdefault("recovered_metric_evidence", {}).setdefault(metric, []).append({
                 "source_key": item["source_key"], "source_entity_id": item["source_entity_id"],
