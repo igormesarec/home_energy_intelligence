@@ -681,6 +681,7 @@ def monthly_metric_catalog(
     catalog.extend({"id": key, "label": label, "unit": "kWh", "axis": "energy", "group": "recovered"}
         for key, label in {
             "recovered_ecodan_meter_kwh": "Recovered provisional Ecodan meter subtotal",
+            "recovered_ecodan_confirmed_heating_kwh": "Recovered provisional Ecodan confirmed heating",
             "recovered_ecodan_assumed_heating_kwh": "Recovered provisional Ecodan assumed heating",
             "recovered_ecodan_dhw_kwh": "Recovered provisional Ecodan DHW",
             "recovered_ecodan_unknown_kwh": "Recovered provisional Ecodan unknown",
@@ -688,6 +689,9 @@ def monthly_metric_catalog(
             "recovered_ac_selected_cooling_kwh": "Recovered provisional AC selected cooling",
             "recovered_ac_meter_kwh": "Recovered provisional AC meter subtotal",
             "recovered_ac_unknown_kwh": "Recovered provisional AC unknown subtotal",
+            "recovered_pv_kwh": "Recovered provisional PV generation",
+            "recovered_import_kwh": "Recovered provisional grid import",
+            "recovered_export_kwh": "Recovered provisional grid export",
         }.items())
     catalog.extend({**item, "id": item["id"].replace("recovered_", "recovered_reference_", 1),
                     "label": item["label"].replace("Recovered provisional", "Overlapping historical reference (non-additive)"),

@@ -87,6 +87,7 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
 
 RECOVERED_METRICS = {
     "recovered_ecodan_meter_kwh": ("heat_pump", None),
+    "recovered_ecodan_confirmed_heating_kwh": ("heat_pump", "confirmed_heating"),
     "recovered_ecodan_assumed_heating_kwh": ("heat_pump", "heating_assumed"),
     "recovered_ecodan_dhw_kwh": ("heat_pump", "dhw"),
     "recovered_ecodan_unknown_kwh": ("heat_pump", "unknown"),
@@ -94,12 +95,16 @@ RECOVERED_METRICS = {
     "recovered_ac_selected_cooling_kwh": ("air_conditioner", "cooling_selected"),
     "recovered_ac_meter_kwh": ("air_conditioner", None),
     "recovered_ac_unknown_kwh": ("air_conditioner", "unknown"),
+    "recovered_pv_kwh": ("site.pv", None),
+    "recovered_import_kwh": ("site.import", None),
+    "recovered_export_kwh": ("site.export", None),
 }
 
 
 def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str, Any], equipment: list[dict[str, Any]]) -> None:
     """Attach separate known subtotals and coverage, without changing canonical totals."""
     kinds = {f"equipment.{item['equipment_id']}": item.get("kind") for item in equipment if item.get("enabled", True)}
+    kinds.update({key: key for key in ("site.pv", "site.import", "site.export")})
     # A generic heat-pump mapping cannot identify Ecodan when multiple heat pumps exist.
     unique_heat_pump = sum(kind == "heat_pump" for kind in kinds.values()) == 1
     rows = {row["month"]: row for row in report.get("rows", [])}
@@ -121,6 +126,7 @@ def add_recovered_presentation_metrics(report: dict[str, Any], summary: dict[str
                 "sources": item.get("sources", []), "coverage_seconds": item.get("coverage_seconds"),
                 "expected_seconds": item.get("expected_seconds"), "days": item.get("days"),
                 "coverage_unknown_days": item.get("coverage_unknown_days", 0),
+                "recovery_kind": "overlapping_reference" if is_reference else "non_overlapping_provisional",
                 "quality": item.get("quality")})
     for row in rows.values():
         row["recovered_excluded"] = [item for item in summary.get("skipped", []) if str(item.get("local_date", "")).startswith(row["month"])]
