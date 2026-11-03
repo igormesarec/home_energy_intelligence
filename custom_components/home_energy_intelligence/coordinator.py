@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 import json
+import hashlib
 import logging
 from math import isfinite
 from time import monotonic
@@ -28,6 +29,7 @@ from .const import (
     CONF_SEASONAL_FALLBACK, CONF_TEMPERATURE_FRESHNESS_MINUTES,
 )
 from .database import EnergyDatabase
+from .electricity_recovery import prepare_recovery_day
 from .engine import DailyAggregator, DailyInput, DeviceHistory
 from .influx import InfluxBackfillClient
 from .models import NumericSample, StateSample
@@ -101,6 +103,70 @@ class HomeEnergyCoordinator:
         self.timezone = hass.config.time_zone
         self._temperature_repair_lock = asyncio.Lock()
         self._temperature_backfill_lock = asyncio.Lock()
+        self._electricity_recovery_lock = asyncio.Lock()
+        self._recovery_preview_key = None
+
+    def _electricity_recovery_fingerprint(self) -> str:
+        relevant = {key: self.config.get(key) for key in ("equipment", "site_sources", "influx_mapping_json",
+            "influx_enabled", "influx_host", "influx_port", "influx_database", "influx_username",
+            "influx_use_ssl", "influx_verify_ssl", "influx_retention_policy", "historical_mode_freshness_minutes",
+            "counter_jump_limit_kwh", "ecodan_energy", "ecodan_power", "ecodan_mode", "ac_1_energy", "ac_2_energy", "ac_3_energy")}
+        relevant["timezone"] = self.timezone
+        relevant["mapping_event_id"] = self.mapping_revision.get("mapping_event_id")
+        return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()
+
+    async def async_start_electricity_recovery(self, start: date, end: date, *, evidence_only: bool,
+                                               attest_current_mapping: bool, preview_confirmed: bool) -> dict[str, object]:
+        """Start only after an explicit administrator request and preview."""
+        if not preview_confirmed or end < start or (end-start).days > 30:
+            raise ValueError("A preview and an ordered range of at most 31 days are required")
+        if evidence_only and attest_current_mapping:
+            raise ValueError("evidence-only cannot be combined with attestation")
+        if end >= datetime.now(UTC).astimezone(ZoneInfo(self.timezone)).date():
+            raise ValueError("recovery requires completed local days")
+        mode = "evidence_only" if evidence_only else "attested" if attest_current_mapping else "verified"
+        fingerprint = self._electricity_recovery_fingerprint()
+        if self._recovery_preview_key != (start.isoformat(), end.isoformat(), evidence_only, attest_current_mapping, fingerprint):
+            raise ValueError("Run the recovery preview for this range and configuration first")
+        job_id = await self.hass.async_add_executor_job(self.database.create_electricity_recovery_job,
+            start.isoformat(), end.isoformat(), self.timezone, mode, fingerprint)
+        self._recovery_preview_key = None
+        self._schedule_electricity_recovery(job_id)
+        return {"job_id": job_id, "status": "queued"}
+
+    def _schedule_electricity_recovery(self, job_id: int) -> None:
+        task = self._async_run_electricity_recovery(job_id)
+        create = getattr(self.entry, "async_create_background_task", None)
+        if create:
+            create(self.hass, task, f"{self.entry.entry_id}_electricity_recovery_{job_id}")
+        else:
+            self.hass.async_create_task(task)
+
+    async def _async_run_electricity_recovery(self, job_id: int) -> None:
+        async with self._electricity_recovery_lock:
+            try:
+                while True:
+                    job = await self.hass.async_add_executor_job(self.database.electricity_recovery_job, job_id)
+                    if not job or job["status"] not in ("queued", "running"):
+                        return
+                    details = json.loads(job["details_json"])
+                    if details.get("config_fingerprint") != self._electricity_recovery_fingerprint():
+                        raise ValueError("configuration_changed_since_start")
+                    day = date.fromisoformat(job["cursor_date"])
+                    if job["cancel_requested"]:
+                        await self.hass.async_add_executor_job(self.database.commit_electricity_recovery_day, job_id, day.isoformat(), [])
+                        return
+                    preview = await self.async_preview_historical_energy(day, evidence_only=job["mapping_mode"] == "evidence_only",
+                        attest_current_mapping=job["mapping_mode"] == "attested")
+                    plan = prepare_recovery_day(preview, job["timezone"])
+                    outcome = await self.hass.async_add_executor_job(self.database.commit_electricity_recovery_day,
+                        job_id, day.isoformat(), plan["records"], len(plan["skipped"]))
+                    if outcome.get("cancelled") or outcome.get("status") == "completed":
+                        return
+            except Exception as error:
+                reason = str(error) if isinstance(error, ValueError) else type(error).__name__
+                await self.hass.async_add_executor_job(self.database.fail_electricity_recovery_job, job_id, reason)
+                _LOGGER.exception("Electricity recovery failed for job %s", job_id)
 
     def _temperature_mapping_identity(self, item) -> dict[str, object]:
         return {
@@ -228,6 +294,7 @@ class HomeEnergyCoordinator:
             device.provenance.update({"historical_mode_source": mode_source, "fallback_entity": fallback_entity,
                                       "mapping_attested": bool(attest_current_mapping),
                                       "fallback_observation_count": len(fallback),
+                                      "strict_influx_identity": bool(evidence_only),
                                       "historical_mapping_quality": "unverified historical mapping" if evidence_only else "normal"})
             mapping = mappings.get(base + ".energy")
             def counter_coverage(samples):
@@ -1359,6 +1426,9 @@ class HomeEnergyCoordinator:
 
     async def async_catch_up(self) -> None:
         local_today = datetime.now(UTC).astimezone(ZoneInfo(self.hass.config.time_zone)).date()
+        recovery_reader = getattr(self.database, "resumable_electricity_recovery_jobs", None)
+        for job in (await self.hass.async_add_executor_job(recovery_reader) if recovery_reader else []):
+            self._schedule_electricity_recovery(int(job["id"]))
         resumable_reader = getattr(
             self.database, "resumable_temperature_backfill_jobs", None
         )

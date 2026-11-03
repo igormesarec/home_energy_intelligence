@@ -79,6 +79,19 @@ let request;panel.render=()=>{};panel._hass={callWS:async(msg)=>{request=msg;ret
     assert 'class="historical-evidence-only" type="checkbox" checked' in result["html"]
 
 
+def test_provisional_recovery_progress_and_categories_are_visible():
+    output = run_panel(r"""
+panel.settings={configured:true,mapping:[]};panel.overviewData={cutoff_local:'2026-11-02T12:00:00+01:00'};
+panel.historicalEnergyPreview={recovery_dry_run:[{records:[{}],skipped:[]}],records:[]};
+panel.electricityRecoveryJob={id:1,status:'running',details_json:JSON.stringify({processed_days:2,inserted:3,skipped:1})};
+panel.monthlyReport={provisional_recovered:{rows:[{month:'2026-09',source_key:'equipment.hp',source_entity_id:'sensor.hp',meter_kwh:12,categories:{unknown:12},days:1}],skipped:[]}};
+process.stdout.write(panel.settingsView()+panel.recoveredMonthlyTable());
+""", {})
+    assert "Start provisional recovery" in output and "Cancel recovery" in output
+    assert "processed 2 days" in output and "provisional partial subtotals" in output
+    assert "sensor.hp" in output and "unknown" in output
+
+
 def monthly_payload():
     months = [f"2025-{month:02d}" for month in range(10, 13)] + [
         f"2026-{month:02d}" for month in range(1, 11)

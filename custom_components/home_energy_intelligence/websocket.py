@@ -29,7 +29,7 @@ from .configuration import (
     temperatures_from_config,
 )
 from .const import DOMAIN
-from .electricity_recovery import prepare_recovery_day
+from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -64,6 +64,9 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_status)
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
     websocket_api.async_register_command(hass, ws_historical_energy_preview)
+    websocket_api.async_register_command(hass, ws_electricity_recovery_start)
+    websocket_api.async_register_command(hass, ws_electricity_recovery_status)
+    websocket_api.async_register_command(hass, ws_electricity_recovery_cancel)
     websocket_api.async_register_command(hass, ws_temperature_timeline)
     websocket_api.async_register_command(hass, ws_v02_report)
     websocket_api.async_register_command(hass, ws_thermal_readings)
@@ -570,12 +573,22 @@ async def _monthly_report_payload(hass, coordinator, end_month: str, count: int 
         end = max(datetime.fromisoformat(item["cutoff_utc"]) for item in candidates)
         if end > start and (end - start).total_seconds() % 3600 == 0:
             hourly_records.extend(await hass.async_add_executor_job(coordinator.database.hourly_range, start, end))
-    return build_rolling_month_report(
+    report = build_rolling_month_report(
         daily_records=records, snapshots=snapshots, equipment=_equipment(coordinator),
         timezone=coordinator.timezone, end_month=end_month, count=count,
         floor_area_m2=coordinator.config.get("floor_area_m2"),
         hourly_records=hourly_records,
     )
+    evidence_reader = getattr(coordinator.database, "electricity_recovery_evidence_range", None)
+    dates_reader = getattr(coordinator.database, "electricity_occupied_sources", None)
+    if evidence_reader and dates_reader:
+        recovered = await hass.async_add_executor_job(evidence_reader, start_date, end_date)
+        occupied = set(await hass.async_add_executor_job(dates_reader, start_date, end_date))
+        sources = {f"equipment.{item.equipment_id}": item.energy_entity for item in equipment_from_config(coordinator.config) if item.enabled and item.energy_entity}
+        if hasattr(coordinator, "_site_sources"):
+            sources.update({f"site.{key}": value for key, value in coordinator._site_sources().items() if value})
+        report["provisional_recovered"] = summarize_provisional_evidence(recovered, occupied, sources)
+    return report
 
 
 @websocket_api.websocket_command({
@@ -1212,10 +1225,62 @@ async def ws_historical_energy_preview(hass, connection, msg):
         connection.send_error(msg["id"], "invalid_range_or_mapping", str(error))
         return
     plans = [prepare_recovery_day(row, coordinator.timezone) for row in rows] if msg.get("include_recovery_plan", False) else None
+    if plans is not None and hasattr(coordinator, "_electricity_recovery_fingerprint"):
+        coordinator._recovery_preview_key = (start.isoformat(), end.isoformat(), msg.get("evidence_only", False),
+                                             msg["attest_current_mapping"], coordinator._electricity_recovery_fingerprint())
     connection.send_result(msg["id"], {"start_date": start.isoformat(), "end_date": end.isoformat(),
                                       "preview": True, "evidence_only": msg.get("evidence_only", False),
                                       "historical_mapping_quality": "unverified historical mapping" if msg.get("evidence_only", False) else "normal",
                                       "records": rows, "recovery_dry_run": plans})
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/electricity_recovery_start",
+    vol.Required("start_date"): str, vol.Required("end_date"): str,
+    vol.Optional("evidence_only", default=False): bool, vol.Optional("attest_current_mapping", default=False): bool,
+    vol.Required("preview_confirmed"): bool})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_electricity_recovery_start(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        result = await coordinator.async_start_electricity_recovery(start, end, evidence_only=msg["evidence_only"],
+            attest_current_mapping=msg["attest_current_mapping"], preview_confirmed=msg["preview_confirmed"])
+    except ValueError as error:
+        connection.send_error(msg["id"], "recovery_invalid", str(error))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/electricity_recovery_status", vol.Optional("job_id"): int})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_electricity_recovery_status(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    result = (await hass.async_add_executor_job(coordinator.database.electricity_recovery_job, msg["job_id"])
+              if "job_id" in msg else await hass.async_add_executor_job(coordinator.database.latest_electricity_recovery_job))
+    if result is None and "job_id" in msg:
+        connection.send_error(msg["id"], "not_found", "Recovery job not found")
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/electricity_recovery_cancel", vol.Required("job_id"): int})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_electricity_recovery_cancel(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    cancelled = await hass.async_add_executor_job(coordinator.database.cancel_electricity_recovery_job, msg["job_id"])
+    connection.send_result(msg["id"], {"cancel_requested": cancelled})
 
 
 @websocket_api.websocket_command({

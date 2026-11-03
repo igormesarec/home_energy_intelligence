@@ -768,7 +768,7 @@ class EnergyDatabase:
         return recovered
 
     def create_electricity_recovery_job(self, start_date: str, end_date: str, timezone: str,
-                                        mapping_mode: str) -> int:
+                                        mapping_mode: str, config_fingerprint: str | None = None) -> int:
         """Register an explicitly started job; this method never runs recovery."""
         start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
         if end < start or (end - start).days > 30:
@@ -781,9 +781,10 @@ class EnergyDatabase:
             try:
                 result = connection.execute(
                     """INSERT INTO electricity_recovery_jobs
-                    (start_date,end_date,cursor_date,timezone,mapping_mode,status,created_at,updated_at)
-                    VALUES (?,?,?,?,?,'queued',?,?)""",
-                    (start_date, end_date, start_date, timezone, mapping_mode, now, now))
+                    (start_date,end_date,cursor_date,timezone,mapping_mode,status,details_json,created_at,updated_at)
+                    VALUES (?,?,?,?,?,'queued',?,?,?)""",
+                    (start_date, end_date, start_date, timezone, mapping_mode,
+                     _canonical_json({"config_fingerprint": config_fingerprint, "processed_days": 0, "inserted": 0, "skipped": 0}), now, now))
             except sqlite3.IntegrityError as error:
                 raise ValueError("another electricity recovery job is active") from error
             return int(result.lastrowid)
@@ -791,6 +792,11 @@ class EnergyDatabase:
     def electricity_recovery_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM electricity_recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def latest_electricity_recovery_job(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM electricity_recovery_jobs ORDER BY id DESC LIMIT 1").fetchone()
             return dict(row) if row else None
 
     def electricity_recovery_evidence_range(self, start_date: str, end_date: str) -> dict[str, Any]:
@@ -817,6 +823,19 @@ class EnergyDatabase:
                 ambiguous.append({"local_date": local_day, "source_key": key, "reason": "checksum_mismatch"})
                 continue
             record = json.loads(row["payload_json"])
+            if record.get("historical_mapping_quality") == "unverified historical mapping":
+                provenance = record.get("source_provenance", {})
+                if (record.get("verification_status") == "provisional"
+                        and isinstance(provenance, dict)
+                        and provenance.get("energy_entity_id") == record.get("source_entity_id")
+                        and record.get("counter_source") in {"recorder_states", "recorder_states_partial", "recorder_statistics", "recorder_and_influx", "influx"}
+                        and (record.get("counter_source") not in {"influx", "recorder_and_influx"} or provenance.get("strict_influx_identity") is True)
+                        and isinstance(record.get("meter_coverage_seconds"), (int, float))
+                        and record["meter_coverage_seconds"] > 0):
+                    records.append(record)
+                else:
+                    ambiguous.append({"local_date": local_day, "source_key": key, "reason": "source_identity_or_coverage_unverified"})
+                continue
             applicability = record.get("mapping_applicability")
             if not isinstance(applicability, dict) or applicability.get("source_entity_id") != record.get("source_entity_id") or applicability.get("status") != "verified":
                 ambiguous.append({"local_date": local_day, "source_key": key, "reason": "mapping_applicability_unverified"})
@@ -858,6 +877,33 @@ class EnergyDatabase:
             records.append(record)
         return {"records": records, "ambiguous": ambiguous}
 
+    def electricity_occupied_sources(self, start_date: str, end_date: str) -> list[tuple[str, str]]:
+        """Identify source-days already represented in stored electrical records."""
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT local_date,payload_json FROM daily_records WHERE local_date BETWEEN ? AND ?
+                UNION ALL SELECT local_date,payload_json FROM hourly_records WHERE local_date BETWEEN ? AND ?""",
+                (start_date, end_date, start_date, end_date)).fetchall()
+        occupied = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid electrical record")
+                allocations = payload.get("allocations", {})
+                if not isinstance(allocations, dict):
+                    raise ValueError("invalid allocations")
+                for device, item in allocations.items():
+                    if not isinstance(item, dict):
+                        raise ValueError("invalid allocation")
+                    if item.get("meter_kwh") is not None or item.get("categories"):
+                        occupied.add((row["local_date"], f"equipment.{device}"))
+                for key, field in (("pv", "pv_kwh"), ("import", "import_kwh"), ("export", "export_kwh")):
+                    if payload.get(field) is not None:
+                        occupied.add((row["local_date"], f"site.{key}"))
+            except (TypeError, ValueError):
+                occupied.add((row["local_date"], "*"))
+        return sorted(occupied)
+
     def cancel_electricity_recovery_job(self, job_id: int) -> bool:
         with self.connect() as connection:
             return connection.execute("""UPDATE electricity_recovery_jobs SET cancel_requested=1,updated_at=?
@@ -870,8 +916,17 @@ class EnergyDatabase:
                 WHERE status IN ('queued','running') ORDER BY id""").fetchall()
             return [dict(row) for row in rows]
 
+    def fail_electricity_recovery_job(self, job_id: int, reason: str) -> None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT details_json FROM electricity_recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            if row:
+                details = json.loads(row["details_json"])
+                details["error"] = reason
+                connection.execute("UPDATE electricity_recovery_jobs SET status='failed',details_json=?,updated_at=? WHERE id=? AND status IN ('queued','running')",
+                                   (_canonical_json(details), datetime.now(UTC).isoformat(), job_id))
+
     def commit_electricity_recovery_day(self, job_id: int, local_date: str,
-                                        records: list[dict[str, Any]]) -> dict[str, Any]:
+                                        records: list[dict[str, Any]], skipped_count: int = 0) -> dict[str, Any]:
         """Atomically insert a day's evidence and move its cursor; never replace records."""
         day = date.fromisoformat(local_date)
         now = datetime.now(UTC).isoformat()
@@ -921,8 +976,12 @@ class EnergyDatabase:
                     payload, _checksum(payload), now)).rowcount
             next_day = (day + timedelta(days=1)).isoformat()
             status = "completed" if local_date == row["end_date"] else "running"
-            connection.execute("UPDATE electricity_recovery_jobs SET cursor_date=?,status=?,updated_at=? WHERE id=?",
-                               (next_day, status, now, job_id))
+            details = json.loads(row["details_json"])
+            details["processed_days"] = int(details.get("processed_days", 0)) + 1
+            details["inserted"] = int(details.get("inserted", 0)) + inserted
+            details["skipped"] = int(details.get("skipped", 0)) + skipped_count
+            connection.execute("UPDATE electricity_recovery_jobs SET cursor_date=?,status=?,details_json=?,updated_at=? WHERE id=?",
+                               (next_day, status, _canonical_json(details), now, job_id))
             return {"cancelled": False, "inserted": inserted, "status": status, "cursor_date": next_day}
 
     def upsert_daily(self, record: DailyRecord, *, reason: str = "daily_close") -> bool:

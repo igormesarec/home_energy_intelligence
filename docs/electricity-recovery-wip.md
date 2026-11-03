@@ -9,19 +9,21 @@ provisional source evidence and its cursor together, reject overlapping active
 jobs, and do not replace existing evidence. The preview creates no job and
 performs no writes.
 
-**Not ready for installation or recovery:** administrator start, status,
-resume and cancellation controls are not connected to an execution worker;
-the monthly and House Thermal Profile reports do not yet read recovered
-evidence. A complete recovery workflow, integration tests and a backed-up Home
-Assistant validation remain required. No historical recovery should be run
-against production from this draft.
+Administrator start, status and cancellation use the previewed range. Explicitly
+started unfinished jobs resume after restart if their source configuration is
+unchanged. The House Thermal Profile shows recovered evidence separately as
+provisional monthly subtotals; existing electrical source-days are excluded.
+The recovery path does not update daily or hourly records or verified COP.
 
 The storage reader deliberately excludes a source-day when multiple evidence
 checksums exist or an evidence checksum fails validation. There is currently no
 administrator-approved version selection for resolving those cases. A single
-candidate is eligible only when its source and mode mapping exactly match a
-persisted mapping event covering the full local day. The current mapping-event
-schema does not include the configured Influx fallback-mode entity or site meter
-identity, so those sources remain excluded. An assertion in the evidence alone
-does not establish applicability. Selecting the newest observation would risk
-silently replacing stronger evidence. No reporting overlay uses this reader yet.
+candidate with verified mapping requires a matching persisted event covering the
+day. Exact-source observations without historical mapping proof can be shown
+only as explicitly unverified provisional evidence. Influx evidence also requires
+the strict source-identity check. Selecting the newest observation would risk
+silently replacing stronger evidence; conflicting versions remain excluded.
+
+This draft has not been validated against a backed-up live Home Assistant
+installation. No historical recovery should be run in production before review
+and explicit administrator approval.

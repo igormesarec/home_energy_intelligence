@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import date
+import json
 
 import pytest
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 from custom_components.home_energy_intelligence.database import EnergyDatabase, SCHEMA_VERSION
 from custom_components.home_energy_intelligence.timeutils import local_day_bounds
-from custom_components.home_energy_intelligence.electricity_recovery import prepare_recovery_day
+from custom_components.home_energy_intelligence.electricity_recovery import prepare_recovery_day, summarize_provisional_evidence
 
 
 def evidence(day, *, value=1.0):
@@ -81,6 +82,43 @@ def test_corrupt_evidence_is_excluded_from_reporting_candidates(tmp_path):
     result = db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")
     assert result["records"] == []
     assert result["ambiguous"][0]["reason"] == "checksum_mismatch"
+
+
+def test_exact_source_unverified_evidence_remains_provisional(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    record = {**evidence("2026-09-25"), "historical_mapping_quality": "unverified historical mapping",
+              "counter_source": "recorder_states_partial", "meter_coverage_seconds": 3600,
+              "source_provenance": {"energy_entity_id": "sensor.hp"}}
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [record])
+    selected = db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")
+    assert selected["records"][0]["verification_status"] == "provisional"
+    assert selected["records"][0]["categories"] == {"unknown": 1}
+
+
+def test_unverified_source_mismatch_is_excluded(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    record = {**evidence("2026-09-25"), "historical_mapping_quality": "unverified historical mapping",
+              "counter_source": "influx", "meter_coverage_seconds": 3600,
+              "source_provenance": {"energy_entity_id": "sensor.other"}}
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [record])
+    selected = db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")
+    assert selected["records"] == []
+    assert selected["ambiguous"][0]["reason"] == "source_identity_or_coverage_unverified"
+
+
+def test_influx_evidence_requires_exact_identity_check(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    record = {**evidence("2026-09-25"), "historical_mapping_quality": "unverified historical mapping",
+              "counter_source": "influx", "meter_coverage_seconds": 3600,
+              "source_provenance": {"energy_entity_id": "sensor.hp"}}
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [record])
+    assert db.electricity_recovery_evidence_range("2026-09-25", "2026-09-25")["records"] == []
 
 
 def test_reporting_evidence_requires_persisted_exact_mapping_event(tmp_path):
@@ -181,3 +219,120 @@ async def test_admin_preview_can_return_plan_without_any_database_write(monkeypa
     payload = connection.send_result.call_args.args[1]
     assert payload["recovery_dry_run"][0]["records"][0]["categories"] == {"unknown": 1}
     assert database.mock_calls == []
+
+
+def test_monthly_overlay_excludes_existing_or_mismatched_days():
+    item = {**evidence("2026-09-25"), "historical_mapping_quality": "unverified historical mapping"}
+    other = {**item, "local_date": "2026-09-26"}
+    result = summarize_provisional_evidence({"records": [item, other], "ambiguous": []}, {"2026-09-25"}, {"equipment.hp": "sensor.hp"})
+    assert len(result["rows"]) == 1 and result["rows"][0]["meter_kwh"] == 1
+    assert result["rows"][0]["categories"] == {"unknown": 1}
+    assert result["skipped"][0]["reason"] == "existing_electrical_record"
+    mismatch = summarize_provisional_evidence({"records": [item]}, set(), {"equipment.hp": "sensor.other"})
+    assert mismatch["rows"] == [] and mismatch["skipped"][0]["reason"] == "current_source_identity_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_recovery_worker_resumes_durable_cursor_and_rejects_changed_config(hass, tmp_path):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    db = EnergyDatabase(tmp_path / "worker.sqlite3")
+    db.initialize()
+    entry = SimpleNamespace(entry_id="test", data={"equipment": "[]", "site_sources": {}, "temperature_sources": "[]"}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, db, registered_mapping={"effective_at": "2026-01-01T00:00:00+00:00"})
+    coordinator.timezone = "Europe/Ljubljana"
+    fingerprint = coordinator._electricity_recovery_fingerprint()
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-26", coordinator.timezone, "evidence_only", fingerprint)
+    db.commit_electricity_recovery_day(job, "2026-09-25", [evidence("2026-09-25")])
+    preview = {"local_date": "2026-09-26", "historical_mapping_quality": "unverified historical mapping",
+        "allocations": {"hp": {"meter_kwh": 1, "categories": {"unknown": 1}, "residual_kwh": 0,
+        "source_provenance": {"energy_entity_id": "sensor.hp", "meter_coverage_seconds": 3600},
+        "authoritative_counter_source": "recorder_states_partial"}}, "site": {}}
+    coordinator.async_preview_historical_energy = AsyncMock(return_value=preview)
+    await coordinator._async_run_electricity_recovery(job)
+    assert db.electricity_recovery_job(job)["status"] == "completed"
+    assert coordinator.async_preview_historical_energy.await_args.args[0] == date(2026, 9, 26)
+    second = db.create_electricity_recovery_job("2026-09-27", "2026-09-27", coordinator.timezone, "evidence_only", fingerprint)
+    coordinator.config["equipment"] = '[{"equipment_id":"changed"}]'
+    await coordinator._async_run_electricity_recovery(second)
+    assert db.electricity_recovery_job(second)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_unpreviewed_or_conflicting_requests(hass, tmp_path):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    db = EnergyDatabase(tmp_path / "start.sqlite3")
+    db.initialize()
+    entry = SimpleNamespace(entry_id="test", data={"equipment": "[]", "site_sources": {}, "temperature_sources": "[]"}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, db, registered_mapping={"effective_at": "2026-01-01T00:00:00+00:00"})
+    with pytest.raises(ValueError, match="preview"):
+        await coordinator.async_start_electricity_recovery(date(2026, 9, 1), date(2026, 9, 2), evidence_only=True, attest_current_mapping=False, preview_confirmed=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await coordinator.async_start_electricity_recovery(date(2026, 9, 1), date(2026, 9, 2), evidence_only=True, attest_current_mapping=True, preview_confirmed=True)
+    assert db.resumable_electricity_recovery_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_start_idempotent_retry_and_cancel_during_day(hass, tmp_path):
+    from custom_components.home_energy_intelligence.coordinator import HomeEnergyCoordinator
+    db = EnergyDatabase(tmp_path / "execution.sqlite3")
+    db.initialize()
+    entry = SimpleNamespace(entry_id="test", data={"equipment": "[]", "site_sources": {}, "temperature_sources": "[]"}, options={})
+    coordinator = HomeEnergyCoordinator(hass, entry, db, registered_mapping={"effective_at": "2026-01-01T00:00:00+00:00"})
+    coordinator.timezone = "Europe/Ljubljana"
+    coordinator._schedule_electricity_recovery = Mock()
+    preview = {"local_date": "2026-09-25", "historical_mapping_quality": "unverified historical mapping",
+        "allocations": {"hp": {"meter_kwh": 1, "categories": {"unknown": 1}, "residual_kwh": 0,
+        "source_provenance": {"energy_entity_id": "sensor.hp", "meter_coverage_seconds": 3600},
+        "authoritative_counter_source": "recorder_states_partial"}}, "site": {}}
+    coordinator.async_preview_historical_energy = AsyncMock(return_value=preview)
+    async def start():
+        coordinator._recovery_preview_key = ("2026-09-25", "2026-09-25", True, False, coordinator._electricity_recovery_fingerprint())
+        return (await coordinator.async_start_electricity_recovery(date(2026, 9, 25), date(2026, 9, 25),
+            evidence_only=True, attest_current_mapping=False, preview_confirmed=True))["job_id"]
+    first = await start()
+    await coordinator._async_run_electricity_recovery(first)
+    assert db.electricity_recovery_job(first)["status"] == "completed"
+    second = await start()
+    await coordinator._async_run_electricity_recovery(second)
+    assert '"inserted":0' in db.electricity_recovery_job(second)["details_json"]
+    third = await start()
+    async def cancel_during_preview(*args, **kwargs):
+        db.cancel_electricity_recovery_job(third)
+        return preview
+    coordinator.async_preview_historical_energy = AsyncMock(side_effect=cancel_during_preview)
+    await coordinator._async_run_electricity_recovery(third)
+    assert db.electricity_recovery_job(third)["status"] == "cancelled"
+    with db.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM electricity_recovery_evidence").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_monthly_report_includes_only_nonoverlapping_provisional_evidence(hass, tmp_path):
+    from custom_components.home_energy_intelligence.websocket import _monthly_report_payload
+    db = EnergyDatabase(tmp_path / "monthly.sqlite3")
+    db.initialize()
+    record = {**evidence("2026-09-25"), "historical_mapping_quality": "unverified historical mapping",
+        "counter_source": "recorder_states_partial", "meter_coverage_seconds": 3600,
+        "source_provenance": {"energy_entity_id": "sensor.hp"}}
+    job = db.create_electricity_recovery_job("2026-09-25", "2026-09-25", "Europe/Ljubljana", "evidence_only")
+    db.commit_electricity_recovery_day(job, "2026-09-25", [record])
+    coordinator = SimpleNamespace(database=db, timezone="Europe/Ljubljana", config={
+        "equipment": json.dumps([{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.hp"}])})
+    result = await _monthly_report_payload(hass, coordinator, "2026-09", 1)
+    assert result["provisional_recovered"]["rows"][0]["categories"] == {"unknown": 1}
+    with db.connect() as connection:
+        connection.execute("""INSERT INTO hourly_records (interval_start_utc,interval_end_utc,local_date,timezone,payload_json,checksum,quality,updated_at)
+            VALUES (?,?,?,?,?,?,?,?)""", ("2026-09-25T00:00:00+00:00", "2026-09-25T01:00:00+00:00", "2026-09-25",
+            "Europe/Ljubljana", json.dumps({"allocations": {"hp": {"meter_kwh": 0}}}), "saved", "partial", "now"))
+    result = await _monthly_report_payload(hass, coordinator, "2026-09", 1)
+    assert result["provisional_recovered"]["rows"] == []
+    assert result["provisional_recovered"]["skipped"][0]["reason"] == "existing_electrical_record"
+
+
+@pytest.mark.parametrize("handler_name", ["ws_electricity_recovery_start", "ws_electricity_recovery_status", "ws_electricity_recovery_cancel"])
+def test_recovery_commands_require_admin(handler_name):
+    from homeassistant.exceptions import Unauthorized
+    from custom_components.home_energy_intelligence import websocket
+    handler = getattr(websocket, handler_name)
+    with pytest.raises(Unauthorized):
+        handler(None, SimpleNamespace(user=SimpleNamespace(is_admin=False)), {"id": 1})
