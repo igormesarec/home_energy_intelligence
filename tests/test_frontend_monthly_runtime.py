@@ -58,6 +58,18 @@ process.stdout.write(panel.recoveredHeatingChart());
     assert 'never included in verified regression' in output
 
 
+def test_whole_house_provisional_points_are_plotted_without_affecting_trend():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.responseProfileData={points:[{status:'validated',outdoor_mean_c:1,heating_electricity_kwh:8,local_date:'2026-09-01'},{status:'validated',outdoor_mean_c:2,heating_electricity_kwh:7,local_date:'2026-09-02'},{status:'validated',outdoor_mean_c:3,heating_electricity_kwh:6,local_date:'2026-09-03'}]};
+const before=panel.scatterChart();panel.v02Report={recovered_heating:{whole_house:[{local_date:'2026-09-28',outdoor_mean_c:5,outdoor_coverage_percent:99,known_heating_kwh:17,components:[{display_name:'HP',source_entity_id:'sensor.hp',heating_kwh:17,meter_coverage_seconds:86400,day_seconds:86400}],missing_sources:[{display_name:'AC',reason:'source_evidence_unavailable'}]}]}};
+process.stdout.write(JSON.stringify({before,after:panel.scatterChart()}));
+""", {})
+    result = json.loads(output)
+    assert '17.000 kWh/day' in result['after'] and 'provisional partial known subtotal' in result['after']
+    assert 'source_evidence_unavailable' in result['after'] and 'sensor.hp' in result['after']
+    assert 'y = -1.0000x + 9.0000' in result['before'] and 'y = -1.0000x + 9.0000' in result['after']
+
+
 def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};

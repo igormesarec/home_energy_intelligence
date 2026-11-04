@@ -65,10 +65,30 @@ def recovered_heating_points(evidence, occupied, daily_records, equipment, outdo
                            "source_entity_id": item["source_entity_id"], "outdoor_mean_c": mean,
                            "outdoor_coverage_percent": coverage, "heating_kwh": sum(values.values()),
                            "categories": values, "meter_coverage_seconds": item.get("meter_coverage_seconds"),
+                           "classification_coverage_seconds": item.get("classification_coverage_seconds"),
                            "day_seconds": (end-start).total_seconds(), "quality": "provisional; historical source mapping confirmed"})
         except (TypeError, ValueError, KeyError, AttributeError):
             excluded.append({"local_date": day, "source_key": key, "reason": "invalid_evidence"})
-    return {"points": points, "excluded": excluded}
+    # Source-day observations only: do not fill absent or overlapping devices
+    # from canonical aggregates whose precise intervals may be unknown.
+    required = {item.equipment_id: item.display_name for item in equipment
+                if item.enabled and item.kind in ("heat_pump", "air_conditioner")}
+    grouped = {}
+    for point in points:
+        grouped.setdefault(point["local_date"], []).append(point)
+    whole_house = []
+    for day, components in sorted(grouped.items()):
+        present = {item["equipment_id"] for item in components}
+        missing = [{"equipment_id": key, "display_name": name,
+                    "reason": next((entry.get("reason") or "conflicting_evidence" for entry in excluded
+                                    if entry.get("local_date") == day and entry.get("source_key") == f"equipment.{key}"), "source_evidence_unavailable")}
+                   for key, name in required.items() if key not in present]
+        whole_house.append({"local_date": day, "outdoor_mean_c": components[0]["outdoor_mean_c"],
+                            "outdoor_coverage_percent": components[0]["outdoor_coverage_percent"],
+                            "known_heating_kwh": sum(item["heating_kwh"] for item in components),
+                            "components": components, "missing_sources": missing,
+                            "expected_equipment_count": len(required), "quality": "provisional partial known subtotal"})
+    return {"points": points, "excluded": excluded, "whole_house": whole_house}
 
 
 def prepare_recovery_day(preview: dict[str, Any], timezone: str) -> dict[str, Any]:
