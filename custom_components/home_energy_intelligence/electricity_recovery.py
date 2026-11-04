@@ -65,6 +65,7 @@ def recovered_heating_points(evidence, occupied, daily_records, equipment, outdo
                            "source_entity_id": item["source_entity_id"], "outdoor_mean_c": mean,
                            "outdoor_coverage_percent": coverage, "heating_kwh": sum(values.values()),
                            "categories": values, "meter_coverage_seconds": item.get("meter_coverage_seconds"),
+                           "classification_coverage_seconds": item.get("classification_coverage_seconds"),
                            "day_seconds": (end-start).total_seconds(), "quality": "provisional; historical source mapping confirmed"})
         except (TypeError, ValueError, KeyError, AttributeError):
             excluded.append({"local_date": day, "source_key": key, "reason": "invalid_evidence"})
