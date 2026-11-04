@@ -9,6 +9,68 @@ from typing import Any
 from .timeutils import local_day_bounds
 
 
+def recovered_heating_points(evidence, occupied, daily_records, equipment, outdoor_source, timezone, minimum_coverage):
+    """Join independently qualified source-days; never merge them into canonical totals."""
+    from math import isfinite
+
+    points, excluded = [], list(evidence.get("ambiguous", []))
+    devices = {f"equipment.{item.equipment_id}": item for item in equipment if item.enabled}
+    temperatures = {record.get("local_date"): record for record in daily_records}
+    occupied = set(occupied)
+    for item in evidence.get("records", []):
+        key, day = item.get("source_key"), item.get("local_date")
+        device = devices.get(key)
+        if not device:
+            continue
+        reason = None
+        try:
+            local_date = date.fromisoformat(day)
+            start, end = local_day_bounds(local_date, timezone)
+            if not device.commissioning_date:
+                reason = "commissioning_date_unknown"
+            elif local_date < date.fromisoformat(device.commissioning_date):
+                reason = "before_commissioning"
+            mappings = [m for m in device.historical_energy_mappings if date.fromisoformat(m["start_date"]) <= local_date <= date.fromisoformat(m["end_date"])]
+            if not reason and (len(mappings) != 1 or mappings[0]["entity_id"] != item.get("source_entity_id")):
+                reason = "historical_mapping_unverified_or_mismatched"
+            if not reason and ((day, key) in occupied or (day, "*") in occupied):
+                reason = "overlapping_authoritative_source_day"
+            if not reason and (datetime.fromisoformat(item["interval_start_utc"]) != start or datetime.fromisoformat(item["interval_end_utc"]) != end):
+                reason = "electricity_interval_mismatch"
+            categories = item.get("categories") or {}
+            names = ("confirmed_heating", "heating_assumed") if device.kind == "heat_pump" else ("heating_selected",)
+            values = {name: categories[name] for name in names if name in categories}
+            if not reason and not values:
+                reason = "heating_classification_unavailable"
+            if not reason and not sum(values.values()) and (categories.get("unknown", 0) or item.get("residual_kwh")):
+                reason = "heating_classification_unavailable"
+            temp = (temperatures.get(day, {}).get("temperatures") or {}).get(outdoor_source.source_id, {}) if outdoor_source else {}
+            provenance = temp.get("source_provenance") or {}
+            mean, coverage = temp.get("mean"), temp.get("coverage_percent")
+            if not reason and (not outdoor_source or outdoor_source.role != "outdoor" or provenance.get("role") != "outdoor" or provenance.get("entity_id") != outdoor_source.entity_id or "attribute" not in provenance or provenance.get("attribute") != outdoor_source.attribute):
+                reason = "outdoor_source_identity_unverified"
+            if not reason:
+                effective = provenance.get("mapping_effective_at")
+                effective_end = provenance.get("mapping_effective_end")
+                if not effective or datetime.fromisoformat(effective.replace("Z", "+00:00")) > start or (effective_end and datetime.fromisoformat(effective_end.replace("Z", "+00:00")) < end):
+                    reason = "outdoor_mapping_interval_unverified"
+            if not reason and (temp.get("period_start_utc") != start.isoformat() or temp.get("period_end_utc") != end.isoformat()):
+                reason = "outdoor_interval_unverified"
+            if not reason and (not isinstance(mean, (int, float)) or not isfinite(mean) or mean in (-55, 155) or temp.get("quality") not in ("good", "filtered", "partial") or coverage is None or coverage < minimum_coverage):
+                reason = "outdoor_temperature_invalid_or_incomplete"
+            if reason:
+                excluded.append({"local_date": day, "source_key": key, "reason": reason, "meter_kwh": item.get("meter_kwh")})
+                continue
+            points.append({"local_date": day, "equipment_id": device.equipment_id, "display_name": device.display_name,
+                           "source_entity_id": item["source_entity_id"], "outdoor_mean_c": mean,
+                           "outdoor_coverage_percent": coverage, "heating_kwh": sum(values.values()),
+                           "categories": values, "meter_coverage_seconds": item.get("meter_coverage_seconds"),
+                           "day_seconds": (end-start).total_seconds(), "quality": "provisional; historical source mapping confirmed"})
+        except (TypeError, ValueError, KeyError, AttributeError):
+            excluded.append({"local_date": day, "source_key": key, "reason": "invalid_evidence"})
+    return {"points": points, "excluded": excluded}
+
+
 def prepare_recovery_day(preview: dict[str, Any], timezone: str) -> dict[str, Any]:
     """Build provisional day evidence without modifying the preview or database."""
     day = date.fromisoformat(preview["local_date"])

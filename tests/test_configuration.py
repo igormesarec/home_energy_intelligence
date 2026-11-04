@@ -29,6 +29,28 @@ def test_reconfiguration_changes_entity_without_changing_equipment_identity():
     assert mapping_revision(second)["equipment"][0]["energy_entity"] == "sensor.new"
 
 
+def test_optional_verified_dates_and_source_mapping_remain_per_equipment():
+    mappings = [{"entity_id": "sensor.old", "start_date": "2026-08-13", "end_date": "2026-09-30"}, {"entity_id": "sensor.new", "start_date": "2026-10-01", "end_date": "2026-12-31"}]
+    items = equipment_from_config({"equipment": json.dumps([
+        {"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "commissioning_date": "2026-08-13", "historical_energy_mappings": mappings},
+        {"equipment_id": "ac", "display_name": "AC", "kind": "air_conditioner"}])})
+    assert items[0].commissioning_date == "2026-08-13" and items[0].historical_energy_mappings == mappings
+    assert items[1].commissioning_date is None and items[1].historical_energy_mappings == []
+
+
+def test_overlapping_historical_mappings_are_rejected(monkeypatch):
+    from types import SimpleNamespace
+    from custom_components.home_energy_intelligence import config_wizard
+    monkeypatch.setattr(config_wizard, "_check_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(config_wizard, "_circuit_2k", lambda *args: False)
+    handler = SimpleNamespace(hass=SimpleNamespace(states=SimpleNamespace(get=lambda _: object())), equipment=[])
+    values = {"configure": True, "energy_entity": "sensor.hp", "state_entity": "sensor.mode", "state_map": "{}", "commissioning_date": "2026-08-13", "historical_energy_mappings": json.dumps([
+        {"entity_id": "sensor.one", "start_date": "2026-08-01", "end_date": "2026-09-30"},
+        {"entity_id": "sensor.two", "start_date": "2026-09-15", "end_date": "2026-12-31"}])}
+    errors = config_wizard._Wizard._accept_equipment(handler, "heat_pump", values)
+    assert errors and handler.equipment == []
+
+
 def test_duplicate_physical_meter_is_rejected_and_temperature_quality_is_per_source():
     config = {"equipment": json.dumps([
         {"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump",

@@ -77,6 +77,8 @@ def _equipment(kind, values=None, allow_skip=False):
         vol.Optional("equipment_id", default=values.get("equipment_id", uuid.uuid4().hex[:12])): str,
         vol.Optional("display_name", default=values.get("display_name", "Heat pump" if kind == "heat_pump" else "Air conditioner")): str,
         vol.Optional("enabled", default=values.get("enabled", True)): selector.BooleanSelector(),
+        _optional("commissioning_date", values.get("commissioning_date")): str,
+        vol.Optional("historical_energy_mappings", default=(values.get("historical_energy_mappings") if isinstance(values.get("historical_energy_mappings"), str) else json.dumps(values.get("historical_energy_mappings", [])))): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
         _optional("energy_entity", values.get("energy_entity")): _entity("sensor", "energy"),
         _optional("power_entity", values.get("power_entity")): _entity("sensor", "power"),
         _optional("state_entity", values.get("state_entity")): _entity(["sensor", "climate", "water_heater"]),
@@ -253,9 +255,25 @@ class _Wizard:
         allowed = VALID_HEAT_PUMP_CATEGORIES if kind == "heat_pump" else VALID_AC_CATEGORIES
         if not isinstance(state_map, dict) or not set(state_map.values()).issubset(allowed):
             errors["state_map"] = "invalid_state_mapping"
+        try:
+            if values.get("commissioning_date"):
+                date.fromisoformat(values["commissioning_date"])
+            mappings = json.loads(values.get("historical_energy_mappings", "[]"))
+            if not isinstance(mappings, list): raise ValueError("expected list")
+            intervals = []
+            for item in mappings:
+                if not isinstance(item, dict) or set(item) != {"entity_id", "start_date", "end_date"} or not item["entity_id"].startswith("sensor."):
+                    raise ValueError("invalid mapping")
+                start, end = date.fromisoformat(item["start_date"]), date.fromisoformat(item["end_date"])
+                if end < start or any(start <= old_end and old_start <= end for old_start, old_end in intervals):
+                    raise ValueError("overlapping mapping")
+                intervals.append((start, end))
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError, AttributeError):
+            errors["base"] = "invalid_json"
+            mappings = []
         if not errors:
-            record = {k: v for k, v in values.items() if k not in {"configure", "add_another", "state_map"} and v not in (None, "")}
-            record.update(kind=kind, state_map=state_map); self.equipment.append(record)
+            record = {k: v for k, v in values.items() if k not in {"configure", "add_another", "state_map", "historical_energy_mappings"} and v not in (None, "")}
+            record.update(kind=kind, state_map=state_map, historical_energy_mappings=mappings); self.equipment.append(record)
         return errors
 
     async def _equipment_step(self, step_id, kind, user_input, allow_skip):
@@ -280,6 +298,9 @@ class _Wizard:
                 if current is not None:
                     pending.pop(0)
                     user_input["equipment_id"] = current["equipment_id"]
+                    for key in ("commissioning_date", "historical_energy_mappings"):
+                        if key not in user_input and key in current:
+                            user_input[key] = json.dumps(current[key]) if key == "historical_energy_mappings" else current[key]
                 if action != "remove":
                     if action == "disable":
                         disabled = deepcopy(current or user_input)

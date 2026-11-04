@@ -48,6 +48,16 @@ process.stdout.write(JSON.stringify({sent,clicked,selected:panel.monthlyMetricId
     assert "CSV export failed: &lt;denied&gt;" in result["error"]
 
 
+def test_recovered_chart_shows_provisional_source_without_regression():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.v02Report={recovered_heating:{points:[{local_date:'2026-09-28',equipment_id:'ac',display_name:'AC',source_entity_id:'sensor.ac',heating_kwh:1.7,outdoor_mean_c:8,outdoor_coverage_percent:99,meter_coverage_seconds:86400,day_seconds:86400,categories:{heating_selected:1.7}}],excluded:[{local_date:'2026-09-25',source_key:'equipment.hp',reason:'commissioning_date_unknown'}]}};
+process.stdout.write(panel.recoveredHeatingChart());
+""", {})
+    assert '2026-09-28' in output and '1.700 kWh/day' in output
+    assert 'provisional' in output and 'commissioning_date_unknown' in output
+    assert 'never included in verified regression' in output
+
+
 def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};

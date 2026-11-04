@@ -30,7 +30,7 @@ from .configuration import (
     temperatures_from_config,
 )
 from .const import DOMAIN
-from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics
+from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics, recovered_heating_points
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -370,6 +370,15 @@ async def ws_v02_report(hass, connection, msg):
     daily = _v02_daily_curves(
         records, equipment, outdoor_source_id, coordinator.config.get("floor_area_m2")
     )
+    recovered = {"points": [], "excluded": []}
+    evidence_reader = getattr(coordinator.database, "electricity_recovery_evidence_range", None)
+    occupied_reader = getattr(coordinator.database, "electricity_occupied_sources", None)
+    if evidence_reader and occupied_reader:
+        evidence = await hass.async_add_executor_job(evidence_reader, start.isoformat(), end.isoformat())
+        occupied = await hass.async_add_executor_job(occupied_reader, start.isoformat(), end.isoformat())
+        outdoor_source = next((item for item in _temperatures(coordinator) if item.source_id == outdoor_source_id and item.enabled and item.role == "outdoor"), None)
+        recovered = recovered_heating_points(evidence, occupied, records, equipment_from_config(coordinator.config), outdoor_source,
+                                             coordinator.timezone, _response_temperature_coverage_minimum(coordinator))
     period_start, _ = local_day_bounds(start, coordinator.timezone)
     _, period_end = local_day_bounds(end, coordinator.timezone)
     readings = await hass.async_add_executor_job(
@@ -424,6 +433,7 @@ async def ws_v02_report(hass, connection, msg):
         "timezone": coordinator.timezone, "floor_area_m2": coordinator.config.get("floor_area_m2"),
         "outdoor_source_id": outdoor_source_id,
         "whole_house_heating": daily, "ac_cooling": daily,
+        "recovered_heating": recovered,
         "ecodan_space_heating": thermal_points, "ecodan_dhw": thermal_points,
         "ecodan_reports": {"heating": heating_report, "dhw": dhw_report,
                            "combined": combined_report},

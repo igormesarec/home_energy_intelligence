@@ -20,6 +20,32 @@ def evidence(day, *, value=1.0):
             "source": "recorder", "calculation_version": "historical-preview-v1"}
 
 
+@pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-10-25", 90000)])
+def test_recovered_daily_heating_requires_confirmed_dates_identity_and_temperature(day, seconds):
+    from custom_components.home_energy_intelligence.configuration import EquipmentMapping, TemperatureMapping
+    from custom_components.home_energy_intelligence.electricity_recovery import recovered_heating_points
+    start, end = local_day_bounds(date.fromisoformat(day), "Europe/Ljubljana")
+    record = {**evidence(day), "categories": {"heating_assumed": .7, "unknown": .3}, "meter_coverage_seconds": seconds}
+    outdoor = TemperatureMapping(source_id="out", display_name="Outdoor", entity_id="sensor.outdoor", role="outdoor")
+    temp = {"mean": 5, "coverage_percent": 100, "quality": "good", "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(), "source_provenance": {"entity_id": "sensor.outdoor", "attribute": None, "role": "outdoor", "mapping_effective_at": "2025-01-01T00:00:00+00:00"}}
+    daily = [{"local_date": day, "temperatures": {"out": temp}}]
+    device = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.hp", "start_date": "2025-01-01", "end_date": "2027-01-01"}])
+    def run(device=device, occupied=(), temp=temp):
+        return recovered_heating_points({"records": [record]}, occupied, [{"local_date": day, "temperatures": {"out": temp}}], [device], outdoor, "Europe/Ljubljana", 95)
+    point = run()["points"][0]
+    assert point["day_seconds"] == seconds and point["heating_kwh"] == .7 and "unknown" not in point["categories"]
+    unknown = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump")
+    assert run(device=unknown)["excluded"][0]["reason"] == "commissioning_date_unknown"
+    assert run(occupied=[(day, "equipment.hp")])["excluded"][0]["reason"] == "overlapping_authoritative_source_day"
+    assert run(temp={**temp, "mean": 155})["excluded"][0]["reason"] == "outdoor_temperature_invalid_or_incomplete"
+    assert run(temp={**temp, "coverage_percent": 94})["excluded"][0]["reason"] == "outdoor_temperature_invalid_or_incomplete"
+    remapped = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.old", "start_date": "2025-01-01", "end_date": day}])
+    assert run(device=remapped)["excluded"][0]["reason"] == "historical_mapping_unverified_or_mismatched"
+    later = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2027-01-01")
+    assert run(device=later)["excluded"][0]["reason"] == "before_commissioning"
+    assert run(temp={**temp, "source_provenance": {"entity_id": "sensor.flow", "role": "supply"}})["excluded"][0]["reason"] == "outdoor_source_identity_unverified"
+
+
 @pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-09-25", 86400), ("2026-10-25", 90000)])
 def test_site_recovered_evidence_keeps_overlap_coverage_and_missing_separate(day, seconds):
     from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics

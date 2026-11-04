@@ -32,6 +32,8 @@ class EquipmentMapping:
     return_temperature_entity: str | None = None
     state_attribute: str | None = None
     state_map: dict[str, str] = field(default_factory=dict)
+    commissioning_date: str | None = None
+    historical_energy_mappings: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

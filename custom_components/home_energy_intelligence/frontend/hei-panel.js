@@ -354,6 +354,16 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     </svg><p class="muted">${unit} · Trendline: ${esc(trend)}</p>${diagnostics}`;
   }
 
+  recoveredHeatingChart() {
+    const evidence=this.v02Report?.recovered_heating||{points:[],excluded:[]},area=Number(this.overviewData?.floor_area_m2);
+    const points=(evidence.points||[]).filter(p=>!this.heatingIntensity||area>0), excluded=evidence.excluded||[];
+    const details=excluded.length?`<details><summary>${excluded.length} excluded source-day(s)</summary><ul>${excluded.map(p=>`<li>${esc(p.local_date)} · ${esc(p.source_key)} · ${esc(p.reason)} · meter ${n(p.meter_kwh,3)} kWh</li>`).join("")}</ul></details>`:"";
+    if(!points.length)return `<p class="muted">No eligible recovered heating points. Historical source mappings and commissioning dates require explicit confirmation.</p>${details}`;
+    const unit=this.heatingIntensity?"kWh/m²/day":"kWh/day",xs=points.map(p=>Number(p.outdoor_mean_c)),ys=points.map(p=>Number(p.heating_kwh)/(this.heatingIntensity?area:1));
+    const xmin=Math.min(...xs)-1,xmax=Math.max(...xs)+1,ymax=Math.max(.001,...ys)*1.1,px=x=>45+(x-xmin)*450/(xmax-xmin),py=y=>175-y*140/ymax;
+    return `<p class="muted">Provisional source-specific heating, ${points.length} points; never included in verified regression or whole-house totals. Unknown and DHW remain separate.</p><svg class="chart" viewBox="0 0 550 215" role="img" aria-label="Provisional recovered heating by outdoor temperature">${[0,.25,.5,.75,1].map(v=>`<g><line x1="45" x2="495" y1="${py(v*ymax)}" y2="${py(v*ymax)}"/><text x="3" y="${py(v*ymax)+4}">${n(v*ymax,2)}</text></g>`).join("")}${points.map((p,i)=>`<circle cx="${px(xs[i])}" cy="${py(ys[i])}" r="5" style="fill:var(--card-background-color,#fff);stroke:#d97706;stroke-dasharray:2 2"><title>${esc(p.local_date)} · ${esc(p.display_name)} · ${esc(p.source_entity_id)} · provisional ${n(ys[i],3)} ${unit} · ${n(p.outdoor_mean_c,2)} °C · outdoor coverage ${n(p.outdoor_coverage_percent,1)}% · meter ${n(p.meter_coverage_seconds,0)} / ${n(p.day_seconds,0)} seconds · ${esc(JSON.stringify(p.categories))}</title></circle>`).join("")}<text x="45" y="202">${n(xmin,1)} °C</text><text x="460" y="202">${n(xmax,1)} °C</text></svg>${details}`;
+  }
+
   responseProfile() {
     const area=Number(this.overviewData?.floor_area_m2); const source=this.representativeSource("outdoor");
     if(!source) return `<div class="empty">Configure a representative measured outdoor-air sensor to build the electrical response curve.</div>`;
@@ -474,7 +484,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
 
   thermalView() {
     const daily=this.v02Report?.whole_house_heating||[];const thermal=this.v02Report?.ecodan_space_heating||[];
-    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section>${this.monthlyHouseProfile()}${this.recoveredMonthlyTable()}<section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
+    return `${this.periodControls()}${this.wholeHouseEnergyCard()}<section class="grid equipment-charts"><article class="card"><h2>Whole-House Heating Electricity</h2>${this.responseCurve(daily,{kind:"heating"})}${this.recoveredHeatingChart()}</article><article class="card"><h2>AC Cooling Electricity</h2>${this.responseCurve(this.v02Report?.ac_cooling||[],{kind:"cooling"})}</article></section>${this.monthlyHouseProfile()}${this.recoveredMonthlyTable()}<section class="card page-card"><h2>Evidence and uncertainty</h2><p>Outdoor X-axis: <code>${esc(this.v02Report?.outdoor_source_id||"not configured")}</code>. Floor area ${n(this.v02Report?.floor_area_m2,0)} m². Electrical categories remain separate. AC thermal generation and AC COP are unavailable by design.</p><p class="muted">Measured thermal points are interval observations, not invented daily values. Missing source coverage remains missing.</p></section>`;
   }
 
   recoveredMonthlyTable() {
@@ -573,7 +583,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       <div><span>${label}</span><strong>${shown==null?"Unavailable":`${n(shown)} ${unit}`}</strong>
       ${value==null&&known!=null?`<small><b>Partial known subtotal</b> · complete total unavailable</small>`:shown==null?`<small>Missing or incomplete source evidence</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
     <section class="grid top-grid">
-      <article class="card wide"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Heating Energy vs Outdoor Temperature</h2>${this.scatterChart()}</article>
+      <article class="card wide"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Heating Energy vs Outdoor Temperature</h2>${this.scatterChart()}${this.recoveredHeatingChart()}</article>
       <article class="card"><h2><ha-icon icon="mdi:chart-box-outline"></ha-icon>Daily Energy Split</h2>${this.splitChart()}</article>
       <article class="card status-card"><h2><ha-icon icon="mdi:gauge"></ha-icon>Ecodan COP & Efficiency</h2><div class="upcoming"><ha-icon icon="mdi:chart-scatter-plot"></ha-icon><b>${this.v02Report?.ecodan_space_heating?.some((point)=>point.heating_cop!=null)?"Measured interval evidence available":"Awaiting matched thermal evidence"}</b><span>Only Ecodan measured thermal energy and exactly matched electricity are used. AC COP is never inferred.</span></div></article>
     </section>
