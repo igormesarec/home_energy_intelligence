@@ -70,6 +70,8 @@ def test_whole_house_recovered_subtotal_excludes_missing_unknown_and_overlap(day
     unknown = [{**records[0], "categories": {"unknown": 1}}, *records[1:]]
     result = run(items=unknown)["whole_house"][0]
     assert result["known_heating_kwh"] == 9 and result["missing_sources"][0]["reason"] == "heating_classification_unavailable"
+    ambiguous = recovered_heating_points({"records": records[:-1], "ambiguous": [{"local_date": day, "source_key": "equipment.ac3", "versions": 2}]}, (), [{"local_date": day, "temperatures": {"out": temp}}], devices, outdoor, "Europe/Ljubljana", 95)
+    assert ambiguous["whole_house"][0]["missing_sources"][0]["reason"] == "conflicting_evidence"
 
 
 @pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-09-25", 86400), ("2026-10-25", 90000)])

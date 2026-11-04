@@ -79,7 +79,7 @@ def recovered_heating_points(evidence, occupied, daily_records, equipment, outdo
     for day, components in sorted(grouped.items()):
         present = {item["equipment_id"] for item in components}
         missing = [{"equipment_id": key, "display_name": name,
-                    "reason": next((entry.get("reason") for entry in excluded
+                    "reason": next((entry.get("reason") or "conflicting_evidence" for entry in excluded
                                     if entry.get("local_date") == day and entry.get("source_key") == f"equipment.{key}"), "source_evidence_unavailable")}
                    for key, name in required.items() if key not in present]
         whole_house.append({"local_date": day, "outdoor_mean_c": components[0]["outdoor_mean_c"],
