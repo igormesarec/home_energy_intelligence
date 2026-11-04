@@ -332,12 +332,14 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       Number(point.outdoor_mean_c),Number(point.heating_electricity_kwh)/(this.heatingIntensity?area:1),point.local_date,
       point.outdoor_coverage_percent,point.equipment_heating||[],
     ]);
+    const provisional=(this.v02Report?.recovered_heating?.whole_house||[]).filter(p=>p.outdoor_mean_c!=null&&p.known_heating_kwh!=null&&(!this.heatingIntensity||area>0)).map(p=>({...p,value:Number(p.known_heating_kwh)/(this.heatingIntensity?area:1)}));
     const diagnostics=excluded.length?`<details><summary>${excluded.length} excluded day(s) — qualification evidence</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Outdoor</th><th>Coverage</th><th>Heating</th><th>Reason</th></tr></thead><tbody>${excluded.map((point)=>`<tr><td>${esc(point.local_date)}</td><td>${n(point.outdoor_mean_c)} °C</td><td>${point.outdoor_coverage_percent==null?"Unavailable":n(point.outdoor_coverage_percent,2)+"%"}</td><td>${n(point.heating_electricity_kwh)} kWh</td><td>${esc((point.exclusion_reasons||[]).join(", "))}</td></tr>`).join("")}</tbody></table></div></details>`:"";
     const controls=`<div class="monthly-controls"><label>Y-axis <select class="heating-axis"><option value="energy" ${!this.heatingIntensity?"selected":""}>kWh/day</option><option value="intensity" ${this.heatingIntensity?"selected":""}>kWh/m²/day</option></select></label><label><input class="heating-trend" type="checkbox" ${this.heatingTrendVisible?"checked":""}> Show Trendline</label><span>Configured area: ${area>0?n(area,0)+" m²":"Unavailable"}</span></div>`;
-    if (!points.length) return `${controls}<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
+    if (!points.length&&!provisional.length) return `${controls}<div class="empty">No backend-qualified outdoor-temperature/heating points for this period.</div>${diagnostics}`;
     const xs = points.map((p) => p[0]); const ys = points.map((p) => p[1]);
-    const xmin = Math.min(...xs) - 1, xmax = Math.max(...xs) + 1;
-    const ymax = Math.max(1, ...ys) * 1.1;
+    const plottedX=xs.concat(provisional.map(p=>Number(p.outdoor_mean_c))),plottedY=ys.concat(provisional.map(p=>p.value));
+    const xmin = Math.min(...plottedX) - 1, xmax = Math.max(...plottedX) + 1;
+    const ymax = Math.max(1, ...plottedY) * 1.1;
     const px = (x) => 42 + ((x - xmin) / Math.max(1, xmax - xmin)) * 480;
     const py = (y) => 180 - (y / ymax) * 145;
     const unit=this.heatingIntensity?"kWh/m²/day":"kWh/day";
@@ -345,13 +347,13 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     const meanX=xs.reduce((a,b)=>a+b,0)/xs.length,meanY=ys.reduce((a,b)=>a+b,0)/ys.length,varianceX=xs.reduce((s,x)=>s+(x-meanX)**2,0),varianceY=ys.reduce((s,y)=>s+(y-meanY)**2,0);
     const slope=points.length>=3&&varianceX>0&&varianceY>0?xs.reduce((s,x,i)=>s+(x-meanX)*(ys[i]-meanY),0)/varianceX:null;
     const intercept=slope==null?null:meanY-slope*meanX,r2=slope==null?null:1-ys.reduce((s,y,i)=>s+(y-(intercept+slope*xs[i]))**2,0)/varianceY;
-    const observedMin=Math.min(...xs),observedMax=Math.max(...xs),validated=slope!=null&&slope<0&&points.length>=10&&observedMax-observedMin>=8&&r2>=.5;
+    const observedMin=xs.length?Math.min(...xs):null,observedMax=xs.length?Math.max(...xs):null,validated=slope!=null&&slope<0&&points.length>=10&&observedMax-observedMin>=8&&r2>=.5;
     const trend=slope==null?"Unavailable":`${validated?"Validated physical heating response":"Exploratory statistical fit, not a validated physical model"} · y = ${n(slope,4)}x ${intercept<0?"−":"+"} ${n(Math.abs(intercept),4)} ${unit} · slope ${n(slope,4)} ${unit}/°C · R² ${n(r2,3)} · ${points.length} qualified days · ${excluded.length} excluded days · observed ${n(observedMin)}–${n(observedMax)} °C`;
     return `${controls}<svg viewBox="0 0 550 215" class="chart" style="overflow:hidden" role="img" aria-label="Heating electricity versus outdoor temperature"><defs><clipPath id="heating-scatter-plot"><rect x="42" y="35" width="480" height="145"/></clipPath></defs>
       ${numericAxes}
       ${[0, .25, .5, .75, 1].map((v) => `<line x1="42" x2="522" y1="${35 + v * 145}" y2="${35 + v * 145}" />`).join("")}
-      <g clip-path="url(#heating-scatter-plot)">${this.heatingTrendVisible&&slope!=null?`<line x1="${px(observedMin)}" y1="${py(intercept+slope*observedMin)}" x2="${px(observedMax)}" y2="${py(intercept+slope*observedMax)}" style="stroke:#ef4444;stroke-width:2;${validated?"":"stroke-dasharray:5 4"}"/>`:""}${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1],3)} ${unit} · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh (confirmed ${n(item.confirmed_heating_kwh)}, assumed/selected/estimated ${n(item.uncertain_heating_kwh)}; ${esc(item.classification_quality)})`).join(" · ")}</title></circle>`).join("")}</g>
-    </svg><p class="muted">${unit} · Trendline: ${esc(trend)}</p>${diagnostics}`;
+      <g clip-path="url(#heating-scatter-plot)">${this.heatingTrendVisible&&slope!=null?`<line x1="${px(observedMin)}" y1="${py(intercept+slope*observedMin)}" x2="${px(observedMax)}" y2="${py(intercept+slope*observedMax)}" style="stroke:#ef4444;stroke-width:2;${validated?"":"stroke-dasharray:5 4"}"/>`:""}${points.map((p) => `<circle cx="${px(p[0])}" cy="${py(p[1])}" r="5"><title>${esc(p[2])}: ${n(p[0])} °C, ${n(p[1],3)} ${unit} · coverage ${n(p[3],2)}% · ${p[4].map((item)=>`${esc(item.display_name)} ${n(item.space_heating_kwh)} kWh (confirmed ${n(item.confirmed_heating_kwh)}, assumed/selected/estimated ${n(item.uncertain_heating_kwh)}; ${esc(item.classification_quality)})`).join(" · ")}</title></circle>`).join("")}${provisional.map(p=>`<circle cx="${px(Number(p.outdoor_mean_c))}" cy="${py(p.value)}" r="6" style="fill:var(--card-background-color,#fff);stroke:#d97706;stroke-dasharray:2 2"><title>${esc(p.local_date)} · provisional partial known subtotal ${n(p.value,3)} ${unit} · outdoor ${n(p.outdoor_mean_c,2)} °C (${n(p.outdoor_coverage_percent,1)}%) · ${p.components.map(c=>`${esc(c.display_name)} ${n(c.heating_kwh,3)} kWh · ${esc(c.source_entity_id)} · ${n(c.meter_coverage_seconds,0)}/${n(c.day_seconds,0)} seconds`).join("; ")} · missing ${p.missing_sources.map(c=>`${esc(c.display_name)}: ${esc(c.reason)}`).join(", ")||"none recorded"}</title></circle>`).join("")}</g>
+    </svg><p class="muted">${unit} · ${provisional.length} provisional partial source-day subtotal(s), excluded from regression · Trendline: ${esc(trend)}</p>${diagnostics}`;
   }
 
   recoveredHeatingChart() {

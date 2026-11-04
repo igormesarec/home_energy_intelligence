@@ -46,6 +46,32 @@ def test_recovered_daily_heating_requires_confirmed_dates_identity_and_temperatu
     assert run(temp={**temp, "source_provenance": {"entity_id": "sensor.flow", "role": "supply"}})["excluded"][0]["reason"] == "outdoor_source_identity_unverified"
 
 
+@pytest.mark.parametrize(("day", "seconds"), [("2026-09-25", 86400), ("2026-09-28", 86400), ("2026-09-30", 86400), ("2026-10-25", 90000)])
+def test_whole_house_recovered_subtotal_excludes_missing_unknown_and_overlap(day, seconds):
+    from custom_components.home_energy_intelligence.configuration import EquipmentMapping, TemperatureMapping
+    from custom_components.home_energy_intelligence.electricity_recovery import recovered_heating_points
+    start, end = local_day_bounds(date.fromisoformat(day), "Europe/Ljubljana")
+    outdoor = TemperatureMapping(source_id="out", display_name="Outdoor", entity_id="sensor.outdoor", role="outdoor")
+    temp = {"mean": 8, "coverage_percent": 100, "quality": "good", "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(), "source_provenance": {"entity_id": "sensor.outdoor", "attribute": None, "role": "outdoor", "mapping_effective_at": "2025-01-01T00:00:00+00:00"}}
+    devices, records = [], []
+    for index, name in enumerate(("hp", "ac1", "ac2", "ac3")):
+        kind = "heat_pump" if name == "hp" else "air_conditioner"
+        devices.append(EquipmentMapping(equipment_id=name, display_name=name, kind=kind, commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": f"sensor.{name}", "start_date": "2025-01-01", "end_date": "2027-01-01"}]))
+        category = "heating_assumed" if kind == "heat_pump" else "heating_selected"
+        records.append({**evidence(day), "source_key": f"equipment.{name}", "source_entity_id": f"sensor.{name}", "categories": {category: index + 1}, "meter_coverage_seconds": seconds})
+    def run(items=records, occupied=()):
+        return recovered_heating_points({"records": items}, occupied, [{"local_date": day, "temperatures": {"out": temp}}], devices, outdoor, "Europe/Ljubljana", 95)
+    complete = run()["whole_house"][0]
+    assert complete["known_heating_kwh"] == 10 and len(complete["components"]) == 4
+    assert complete["quality"] == "provisional partial known subtotal" and not complete["missing_sources"]
+    partial = run(items=records[:-1], occupied=[(day, "equipment.ac2")])["whole_house"][0]
+    assert partial["known_heating_kwh"] == 3 and len(partial["missing_sources"]) == 2
+    assert {item["reason"] for item in partial["missing_sources"]} == {"overlapping_authoritative_source_day", "source_evidence_unavailable"}
+    unknown = [{**records[0], "categories": {"unknown": 1}}, *records[1:]]
+    result = run(items=unknown)["whole_house"][0]
+    assert result["known_heating_kwh"] == 9 and result["missing_sources"][0]["reason"] == "heating_classification_unavailable"
+
+
 @pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-09-25", 86400), ("2026-10-25", 90000)])
 def test_site_recovered_evidence_keeps_overlap_coverage_and_missing_separate(day, seconds):
     from custom_components.home_energy_intelligence.electricity_recovery import add_recovered_presentation_metrics
