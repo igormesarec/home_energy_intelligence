@@ -48,6 +48,16 @@ process.stdout.write(JSON.stringify({sent,clicked,selected:panel.monthlyMetricId
     assert "CSV export failed: &lt;denied&gt;" in result["error"]
 
 
+def test_recovered_chart_shows_provisional_source_without_regression():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.v02Report={recovered_heating:{points:[{local_date:'2026-09-28',equipment_id:'ac',display_name:'AC',source_entity_id:'sensor.ac',heating_kwh:1.7,outdoor_mean_c:8,outdoor_coverage_percent:99,meter_coverage_seconds:86400,day_seconds:86400,categories:{heating_selected:1.7}}],excluded:[{local_date:'2026-09-25',source_key:'equipment.hp',reason:'commissioning_date_unknown'}]}};
+process.stdout.write(panel.recoveredHeatingChart());
+""", {})
+    assert '2026-09-28' in output and '1.700 kWh/day' in output
+    assert 'provisional' in output and 'commissioning_date_unknown' in output
+    assert 'never included in verified regression' in output
+
+
 def test_recovered_september_values_render_as_provisional_in_both_monthly_charts():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};
@@ -71,6 +81,18 @@ process.stdout.write(panel.monthlyHistogram()+panel.monthlyHouseProfile());
     assert 'Recovered provisional AC meter' in output and 'Recovered provisional AC unknown' in output
     assert '5.000' in output and '2.000' in output and 'sensor.ac' in output
     assert 'stroke-dasharray="3 2"' in output and 'Provisional partial' in output
+
+
+def test_partial_whole_house_months_and_missing_zero_render_truthfully():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};
+panel.monthlyReport={rows:[['2026-07',null],['2026-08',74.48593],['2026-09',197.767433],['2026-10',94.060806],['2026-11',59.918257],['2026-12',0]].map(([month,value])=>({month,known_whole_house_heating_electricity_kwh:value,period_coverage:{allocation_coverage:{complete:false},date_coverage:{complete:false}},quality:'partial'}))};
+process.stdout.write(panel.monthlyHouseProfile());
+""", {})
+    assert '74.486' in output and '197.767' in output and '94.061' in output and '59.918' in output
+    assert 'Partial known subtotal' in output and 'Unavailable' in output
+    assert '2026-12 · Whole-house: 0.000' not in output
+    assert output.count('stroke="var(--divider-color,#b9c6d5)"') >= 5
 
 
 def test_overlapping_historical_references_render_with_distinct_style_and_reasons():

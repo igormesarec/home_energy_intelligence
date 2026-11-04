@@ -529,6 +529,10 @@ def build_rolling_month_report(
                 records, equipment, "air_conditioner", ("cooling", "cooling_selected", "cooling_estimated")
             ),
             "whole_house_heating_electricity_kwh": whole_house_heating,
+            "known_whole_house_heating_electricity_kwh": _sum_present((
+                _known_allocation_subtotal(records, equipment, "heat_pump", ("confirmed_heating", "heating", "heating_assumed")),
+                _known_allocation_subtotal(records, equipment, "air_conditioner", ("heating", "heating_selected", "heating_estimated")),
+            )) if records else (whole_house_heating if whole_house_heating is not None and whole_house_heating > 0 else None),
             "whole_house_heating_kwh_m2": (
                 float(whole_house_heating) / float(floor_area_m2)
                 if whole_house_heating is not None and floor_area_m2
