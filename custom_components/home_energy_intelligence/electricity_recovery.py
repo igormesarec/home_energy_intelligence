@@ -30,7 +30,7 @@ def recovered_heating_points(evidence, occupied, daily_records, equipment, outdo
                 reason = "commissioning_date_unknown"
             elif local_date < date.fromisoformat(device.commissioning_date):
                 reason = "before_commissioning"
-            mappings = [m for m in device.historical_energy_mappings if date.fromisoformat(m["start_date"]) <= local_date <= date.fromisoformat(m["end_date"])]
+            mappings = [m for m in device.historical_energy_mappings if date.fromisoformat(m["start_date"]) <= local_date <= (date.fromisoformat(m["end_date"]) if "end_date" in m else date.max)]
             if not reason and (len(mappings) != 1 or mappings[0]["entity_id"] != item.get("source_entity_id")):
                 reason = "historical_mapping_unverified_or_mismatched"
             if not reason and ((day, key) in occupied or (day, "*") in occupied):

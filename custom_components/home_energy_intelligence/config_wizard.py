@@ -262,9 +262,10 @@ class _Wizard:
             if not isinstance(mappings, list): raise ValueError("expected list")
             intervals = []
             for item in mappings:
-                if not isinstance(item, dict) or set(item) != {"entity_id", "start_date", "end_date"} or not item["entity_id"].startswith("sensor."):
+                if not isinstance(item, dict) or not {"entity_id", "start_date"} <= set(item) or set(item) - {"entity_id", "start_date", "end_date"} or not item["entity_id"].startswith("sensor."):
                     raise ValueError("invalid mapping")
-                start, end = date.fromisoformat(item["start_date"]), date.fromisoformat(item["end_date"])
+                start = date.fromisoformat(item["start_date"])
+                end = date.fromisoformat(item["end_date"]) if "end_date" in item else date.max
                 if end < start or any(start <= old_end and old_start <= end for old_start, old_end in intervals):
                     raise ValueError("overlapping mapping")
                 intervals.append((start, end))
