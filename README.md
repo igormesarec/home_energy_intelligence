@@ -4,7 +4,7 @@
 administrator preview. It does not save recovered energy; real-data acceptance
 is pending. Do not treat partial coverage as a complete daily measurement.
 
-Draft V0.2.3 adds optional verified commissioning dates and administrator-confirmed historical electricity mappings per equipment in Options. Leave dates blank when unknown. Historical mappings use a JSON list such as `[{"entity_id":"sensor.example_energy","start_date":"2026-01-01","end_date":"2026-12-31"}]`; dates are inclusive and overlapping entries are rejected. Only enter independently confirmed facts. The provisional recovered-heating chart requires a matching mapping, commissioning date and qualified outdoor history; unsupported or overlapping source-days remain excluded and never enter verified totals or COP. This draft is not a release.
+Draft V0.2.3 adds optional verified commissioning dates and administrator-confirmed historical electricity mappings per equipment in Options. Leave dates blank when unknown. Historical mappings use a JSON list such as `[{"entity_id":"sensor.example_energy","start_date":"2026-01-01","end_date":"2026-12-31"}]`; start and end dates are inclusive; omit end_date for an indefinitely active mapping. Overlapping entries, including open-ended mappings, are rejected. Only enter independently confirmed facts. The provisional recovered-heating chart requires a matching mapping, commissioning date and qualified outdoor history; unsupported or overlapping source-days remain excluded and never enter verified totals or COP. This draft is not a release.
 
 ## V0.2.1 monthly analytics and midnight availability (draft)
 

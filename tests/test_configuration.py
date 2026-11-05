@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from custom_components.home_energy_intelligence.configuration import (
     equipment_from_config, mapping_revision, temperatures_from_config,
@@ -49,6 +50,26 @@ def test_overlapping_historical_mappings_are_rejected(monkeypatch):
         {"entity_id": "sensor.two", "start_date": "2026-09-15", "end_date": "2026-12-31"}])}
     errors = config_wizard._Wizard._accept_equipment(handler, "heat_pump", values)
     assert errors and handler.equipment == []
+
+
+@pytest.mark.parametrize(("mappings", "valid"), [
+    ([{"entity_id": "sensor.one", "start_date": "2026-01-01"}], True),
+    ([{"entity_id": "sensor.one", "start_date": "2026-01-01", "end_date": "2026-09-30"}, {"entity_id": "sensor.two", "start_date": "2026-10-01"}], True),
+    ([{"entity_id": "sensor.one", "start_date": "2026-01-01"}, {"entity_id": "sensor.two", "start_date": "2026-10-01"}], False),
+    ([{"entity_id": "sensor.one", "start_date": "2026-10-01"}, {"entity_id": "sensor.two", "start_date": "2026-01-01", "end_date": "2026-10-01"}], False),
+    ([{"entity_id": "sensor.one", "start_date": "2026-01-01", "end_date": None}], False),
+])
+def test_optional_mapping_end_date_validation(monkeypatch, mappings, valid):
+    from types import SimpleNamespace
+    from custom_components.home_energy_intelligence import config_wizard
+    monkeypatch.setattr(config_wizard, "_check_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(config_wizard, "_circuit_2k", lambda *args: False)
+    handler = SimpleNamespace(hass=SimpleNamespace(states=SimpleNamespace(get=lambda _: object())), equipment=[])
+    values = {"configure": True, "energy_entity": "sensor.hp", "state_entity": "sensor.mode", "state_map": "{}", "historical_energy_mappings": json.dumps(mappings)}
+    errors = config_wizard._Wizard._accept_equipment(handler, "heat_pump", values)
+    assert bool(errors) is not valid
+    if valid:
+        assert handler.equipment[0]["historical_energy_mappings"] == mappings
 
 
 def test_duplicate_physical_meter_is_rejected_and_temperature_quality_is_per_source():

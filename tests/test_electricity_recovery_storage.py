@@ -53,6 +53,12 @@ def test_recovered_daily_heating_requires_confirmed_dates_identity_and_temperatu
         return recovered_heating_points({"records": [record]}, occupied, [{"local_date": day, "temperatures": {"out": temp}}], [device], outdoor, "Europe/Ljubljana", 95)
     point = run()["points"][0]
     assert point["day_seconds"] == seconds and point["heating_kwh"] == .7 and "unknown" not in point["categories"]
+    open_ended = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.hp", "start_date": day}])
+    assert run(device=open_ended)["points"][0]["heating_kwh"] == .7
+    bounded = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.hp", "start_date": "2025-01-01", "end_date": day}])
+    assert run(device=bounded)["points"][0]["heating_kwh"] == .7
+    expired = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.hp", "start_date": "2025-01-01", "end_date": "2025-12-31"}])
+    assert run(device=expired)["excluded"][0]["reason"] == "historical_mapping_unverified_or_mismatched"
     unknown = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump")
     assert run(device=unknown)["excluded"][0]["reason"] == "commissioning_date_unknown"
     assert run(occupied=[(day, "equipment.hp")])["excluded"][0]["reason"] == "overlapping_authoritative_source_day"
@@ -63,6 +69,25 @@ def test_recovered_daily_heating_requires_confirmed_dates_identity_and_temperatu
     later = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2027-01-01")
     assert run(device=later)["excluded"][0]["reason"] == "before_commissioning"
     assert run(temp={**temp, "source_provenance": {"entity_id": "sensor.flow", "role": "supply"}})["excluded"][0]["reason"] == "outdoor_source_identity_unverified"
+
+
+@pytest.mark.asyncio
+async def test_v02_report_accepts_open_ended_mapping(hass, monkeypatch):
+    import inspect
+    from custom_components.home_energy_intelligence import websocket
+    day = "2026-09-28"
+    start, end = local_day_bounds(date.fromisoformat(day), "Europe/Ljubljana")
+    temp = {"mean": 8, "coverage_percent": 100, "quality": "good", "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(), "source_provenance": {"entity_id": "sensor.outdoor", "attribute": None, "role": "outdoor", "mapping_effective_at": "2025-01-01T00:00:00+00:00"}}
+    source = {**evidence(day), "categories": {"heating_assumed": .7, "unknown": .3}, "meter_coverage_seconds": 86400}
+    db = SimpleNamespace(history_period=lambda *_: [{"local_date": day, "temperatures": {"out": temp}, "allocations": {}}], electricity_recovery_evidence_range=lambda *_: {"records": [source]}, electricity_occupied_sources=lambda *_: [], thermal_readings_period=lambda *_: [])
+    config = {"equipment": json.dumps([{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.hp", "commissioning_date": "2025-01-01", "historical_energy_mappings": [{"entity_id": "sensor.hp", "start_date": "2026-09-01"}]}]), "temperature_sources": json.dumps([{"source_id": "out", "display_name": "Outdoor", "entity_id": "sensor.outdoor", "role": "outdoor"}]), "representative_outdoor_source_id": "out"}
+    coordinator = SimpleNamespace(database=db, timezone="Europe/Ljubljana", config=config)
+    monkeypatch.setattr(websocket, "_coordinator", lambda _: coordinator)
+    connection = SimpleNamespace(send_result=Mock(), send_error=Mock())
+    await inspect.unwrap(websocket.ws_v02_report)(hass, connection, {"id": 1, "start_date": day, "end_date": day})
+    report = connection.send_result.call_args.args[1]
+    assert report["recovered_heating"]["whole_house"][0]["known_heating_kwh"] == .7
+    assert report["ecodan_reports"]["heating"]["cop"] is None
 
 
 @pytest.mark.parametrize(("day", "seconds"), [("2026-09-25", 86400), ("2026-09-28", 86400), ("2026-09-30", 86400), ("2026-10-25", 90000)])
