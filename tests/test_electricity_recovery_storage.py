@@ -20,6 +20,25 @@ def evidence(day, *, value=1.0):
             "source": "recorder", "calculation_version": "historical-preview-v1"}
 
 
+def test_recovered_exclusion_diagnostics_preserve_identity_and_dst():
+    from custom_components.home_energy_intelligence.configuration import EquipmentMapping, TemperatureMapping
+    from custom_components.home_energy_intelligence.electricity_recovery import recovered_heating_points
+    day = "2026-10-25"
+    record = {**evidence(day), "categories": {"heating_assumed": 1}}
+    device = EquipmentMapping(equipment_id="hp", display_name="HP", kind="heat_pump", commissioning_date="2025-01-01", historical_energy_mappings=[{"entity_id": "sensor.other", "start_date": "2025-01-01", "end_date": "2027-01-01"}])
+    outdoor = TemperatureMapping(source_id="out", display_name="Outdoor", entity_id="sensor.outdoor", role="outdoor")
+    def run(device, occupied=()):
+        return recovered_heating_points({"records": [record]}, occupied, [{"local_date": day, "temperatures": {"out": {"coverage_percent": 99.9}}}], [device], outdoor, "Europe/Ljubljana", 95)["excluded"][0]
+    mismatch = run(device)
+    assert mismatch["diagnostic_reason"] == "mismatched_entity_id"
+    assert mismatch["source_entity_id"] == "sensor.hp" and mismatch["mapping_entity_ids"] == ["sensor.other"]
+    assert mismatch["outdoor_coverage_percent"] == 99.9
+    device.historical_energy_mappings[0]["entity_id"] = "sensor.hp"
+    overlap = run(device, [(day, "equipment.hp")])
+    assert overlap["diagnostic_reason"] == "overlapping_authoritative_source_day"
+    assert overlap["blocked_source_day_seconds"] == 25 * 3600
+
+
 @pytest.mark.parametrize(("day", "seconds"), [("2026-03-29", 82800), ("2026-10-25", 90000)])
 def test_recovered_daily_heating_requires_confirmed_dates_identity_and_temperature(day, seconds):
     from custom_components.home_energy_intelligence.configuration import EquipmentMapping, TemperatureMapping

@@ -58,6 +58,30 @@ process.stdout.write(panel.recoveredHeatingChart());
     assert 'never included in verified regression' in output
 
 
+def test_heating_diagnostics_and_thermal_profile_show_provisional_evidence():
+    output = run_panel(r"""
+panel.overviewData={floor_area_m2:170};panel.responseProfileData={points:[]};
+panel.v02Report={whole_house_heating:[],ac_cooling:[],recovered_heating:{points:[],whole_house:[{local_date:'2026-10-25',outdoor_mean_c:5,outdoor_coverage_percent:99,known_heating_kwh:2,components:[],missing_sources:[]}],excluded:[{local_date:'2026-10-25',source_key:'equipment.hp',diagnostic_reason:'overlapping_authoritative_source_day',source_entity_id:'sensor.hp',mapping_entity_ids:['sensor.hp'],meter_kwh:12,blocked_source_day_seconds:90000,outdoor_coverage_percent:99}]}};
+panel.periodControls=panel.wholeHouseEnergyCard=panel.responseCurve=panel.monthlyHouseProfile=panel.recoveredMonthlyTable=()=>'';
+process.stdout.write(panel.thermalView());
+""", {})
+    assert 'provisional partial known subtotal' in output
+    assert 'Recovery eligibility by month and equipment' in output
+    assert 'sensor.hp' in output and 'blocked source-day 25.0 h' in output
+    assert 'actual overlap unknown' in output
+
+
+def test_pv_chart_discloses_pagination_and_missing_october_fields():
+    output = run_panel(r"""
+panel.historyTotal=95;panel.history=Array.from({length:90},(_,i)=>({local_date:i===0?'2026-10-25':'2026-10-24',energy:i===0?{pv_kwh:1,import_kwh:null,export_kwh:0}:{pv_kwh:2}}));
+process.stdout.write(panel.overviewSeries('pv'));
+""", {})
+    assert 'Showing 90 loaded dates of 95' in output
+    assert 'other dates are on History pages, not necessarily missing' in output
+    assert '2026-10-25' in output and 'Import' in output
+    assert 'dates without records have no chart position' in output
+
+
 def test_whole_house_provisional_points_are_plotted_without_affecting_trend():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};panel.responseProfileData={points:[{status:'validated',outdoor_mean_c:1,heating_electricity_kwh:8,local_date:'2026-09-01'},{status:'validated',outdoor_mean_c:2,heating_electricity_kwh:7,local_date:'2026-09-02'},{status:'validated',outdoor_mean_c:3,heating_electricity_kwh:6,local_date:'2026-09-03'}]};
@@ -517,4 +541,4 @@ process.stdout.write(panel.overviewSeries('heating'));
     assert '2026-10-03 · AC heating 1.00 kWh · partial known subtotal' in output
     assert '2026-10-04 · Heat pump heating 5.00 kWh · estimated or assumed heating' in output
     assert '2026-10-04 · AC heating 2.00 kWh · estimated or assumed heating' in output
-    assert '2026-10-05 · Heat pump heating' not in output
+    assert '<title>2026-10-05 · Heat pump heating' not in output
