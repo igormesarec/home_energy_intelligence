@@ -59,10 +59,21 @@ def recovered_heating_points(evidence, occupied, daily_records, equipment, outdo
             if not reason and (not isinstance(mean, (int, float)) or not isfinite(mean) or mean in (-55, 155) or temp.get("quality") not in ("good", "filtered", "partial") or coverage is None or coverage < minimum_coverage):
                 reason = "outdoor_temperature_invalid_or_incomplete"
             if reason:
-                excluded.append({"local_date": day, "source_key": key, "reason": reason, "meter_kwh": item.get("meter_kwh")})
+                detail = reason
+                if reason == "historical_mapping_unverified_or_mismatched":
+                    detail = "missing_mapping" if not mappings else "ambiguous_mapping" if len(mappings) > 1 else "mismatched_entity_id"
+                elif reason == "heating_classification_unavailable" and item.get("residual_kwh"):
+                    detail = "source_reconciliation_unresolved"
+                excluded.append({"local_date": day, "source_key": key, "reason": reason,
+                                 "diagnostic_reason": detail, "meter_kwh": item.get("meter_kwh"),
+                                 "source_entity_id": item.get("source_entity_id"),
+                                 "mapping_entity_ids": [m.get("entity_id") for m in mappings],
+                                 "outdoor_coverage_percent": coverage,
+                                 "recovered_meter_coverage_seconds": item.get("meter_coverage_seconds"),
+                                 "blocked_source_day_seconds": (end-start).total_seconds() if reason == "overlapping_authoritative_source_day" else None})
                 continue
             points.append({"local_date": day, "equipment_id": device.equipment_id, "display_name": device.display_name,
-                           "source_entity_id": item["source_entity_id"], "outdoor_mean_c": mean,
+                           "source_entity_id": item["source_entity_id"], "mapping_entity_ids": [mappings[0]["entity_id"]], "meter_kwh": item.get("meter_kwh"), "outdoor_mean_c": mean,
                            "outdoor_coverage_percent": coverage, "heating_kwh": sum(values.values()),
                            "categories": values, "meter_coverage_seconds": item.get("meter_coverage_seconds"),
                            "classification_coverage_seconds": item.get("classification_coverage_seconds"),
