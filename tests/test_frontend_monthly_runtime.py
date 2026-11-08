@@ -58,6 +58,21 @@ process.stdout.write(panel.recoveredHeatingChart());
     assert 'never included in verified regression' in output
 
 
+def test_recovered_monthly_table_separates_sources_categories_and_scope():
+    output = run_panel(r"""
+panel.equipment=[{equipment_id:'hp',display_name:'Heat pump'}];
+panel.monthlyReport={provisional_recovered:{rows:[{month:'2026-09',source_key:'equipment.hp',source_entity_id:'sensor.hp',meter_kwh:1.23456,days:2,categories:{heating_selected:.12345,cooling_estimated:.2,standby:0,unknown:.9},residual_kwh:-.0008,residual_unknown_days:1,mapping_statuses:['historical mapping applicability verified']}],reference_rows:[{month:'2026-09',source_key:'equipment.hp',source_entity_id:'sensor.hp',meter_kwh:2,days:1,categories:{dhw:2},mapping_statuses:['historical mapping unverified']}],skipped:[{local_date:'2026-09-25',reason:'existing_electrical_record'},{local_date:'2026-09-26',reason:'current_source_identity_mismatch'}]}};
+process.stdout.write(panel.recoveredMonthlyTable());
+""", {})
+    assert 'Heat pump' in output and 'sensor.hp' in output and '<details>' in output
+    assert '1.235' in output and 'Selected: 0.123' in output and 'Estimated: 0.200' in output
+    assert 'Standby: 0.000' in output and 'Unknown: 0.900' in output and '-0.001' in output
+    assert 'Included provisional' in output and 'Overlapping reference (non-additive)' in output
+    assert 'historical mapping applicability verified' in output and 'recovery remains provisional' in output
+    assert '1 other excluded source-days; 1 overlapping source-days' in output
+    assert 'full rolling monthly report' in output and 'overflow-x:auto' in output
+
+
 def test_heating_diagnostics_and_thermal_profile_show_provisional_evidence():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};panel.responseProfileData={points:[]};

@@ -20,6 +20,16 @@ def evidence(day, *, value=1.0):
             "source": "recorder", "calculation_version": "historical-preview-v1"}
 
 
+def test_monthly_recovered_summary_exposes_mapping_status_without_changing_values():
+    first = {**evidence("2026-09-25", value=1.23456), "categories": {"heating_selected": .25, "unknown": .98456}, "residual_kwh": None, "historical_mapping_quality": "unverified historical mapping"}
+    second = {**evidence("2026-09-26", value=2), "categories": {"standby": 2}, "residual_kwh": 0, "mapping_applicability": {"status": "verified"}}
+    summary = summarize_provisional_evidence({"records": [first, second]}, set(), {"equipment.hp": "sensor.hp"})
+    row = summary["rows"][0]
+    assert row["meter_kwh"] == 3.23456 and row["categories"] == {"heating_selected": .25, "unknown": .98456, "standby": 2}
+    assert set(row["mapping_statuses"]) == {"historical mapping unverified", "historical mapping applicability verified"}
+    assert row["residual_unknown_days"] == 1 and row["residual_kwh"] == 0
+
+
 @pytest.mark.parametrize(("day", "hours"), [("2026-03-29", 23), ("2026-10-25", 25)])
 def test_interval_diagnostics_dst_full_day_and_unknown(day, hours):
     from custom_components.home_energy_intelligence.electricity_recovery import recovery_interval_diagnostics

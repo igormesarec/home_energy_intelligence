@@ -273,7 +273,7 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
             skipped.append({"local_date": day, "source_key": key, "reason": "existing_electrical_record"})
         group = (references if overlap else groups).setdefault((day[:7], key), {"month": day[:7], "source_key": key,
             "source_entity_id": record["source_entity_id"], "meter_kwh": 0.0, "categories": {}, "residual_kwh": None, "days": 0,
-            "coverage_seconds": None, "expected_seconds": 0.0, "coverage_unknown_days": 0, "sources": [],
+            "coverage_seconds": None, "expected_seconds": 0.0, "coverage_unknown_days": 0, "sources": [], "mapping_statuses": [], "residual_unknown_days": 0,
             "quality": ("overlapping historical reference; non-additive; historical mapping unverified" if overlap else "provisional partial subtotal; historical mapping unverified")})
         group["meter_kwh"] += record["meter_kwh"]
         group["days"] += 1
@@ -286,8 +286,16 @@ def summarize_provisional_evidence(evidence: dict[str, Any], excluded_dates: set
         source = record.get("counter_source")
         if source and source not in group["sources"]:
             group["sources"].append(source)
+        applicability = record.get("mapping_applicability") or {}
+        mapping_status = ("historical mapping unverified" if record.get("historical_mapping_quality") == "unverified historical mapping"
+                          else "historical mapping applicability verified" if applicability.get("status") == "verified"
+                          else "historical mapping status unavailable")
+        if mapping_status not in group["mapping_statuses"]:
+            group["mapping_statuses"].append(mapping_status)
         if record.get("residual_kwh") is not None:
             group["residual_kwh"] = (group["residual_kwh"] or 0.0) + record["residual_kwh"]
+        else:
+            group["residual_unknown_days"] += 1
         for category, value in record.get("categories", {}).items():
             group["categories"][category] = group["categories"].get(category, 0.0) + value
     return {"rows": list(groups.values()), "reference_rows": list(references.values()), "skipped": skipped}
