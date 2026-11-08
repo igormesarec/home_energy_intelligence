@@ -74,6 +74,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     this.temperatureChartSequence = 0;
     this.heatingIntensity=false;this.heatingTrendVisible=true;this.monthlyProfileNormalized=false;
     this.profileOutdoorRows=[];
+    this.copReportMode="seasonal";this.copReportSource="vendor";this.copSimpleData=null;this.copAdvancedOpen=false;
   }
 
   set hass(value) {
@@ -583,7 +584,55 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     return `<p class="muted">Provisional Shelly monthly COP versus duration-weighted outdoor temperature; controller-proportion estimates, separate from Vendor and measured Primary COP. ${points.length===1?'One eligible month; no fitted curve.':'Monthly points only; no fitted trendline.'}</p><svg class="chart" viewBox="0 0 520 205" role="img" aria-label="Provisional monthly ${esc(kind)} COP versus outdoor temperature"><line x1="45" x2="485" y1="165" y2="165" stroke="currentColor"/>${this.axisTicks(0,ymax).map(v=>`<text x="3" y="${py(v)+4}">${n(v,1)}</text>`).join('')}${points.map(p=>`<circle cx="${px(p.outdoor.mean)}" cy="${py(p.row[metric])}" r="5"><title>${esc(p.row.month)} · ${n(p.outdoor.mean,2)} °C · Provisional Shelly COP ${n(p.row[metric],2)} · outdoor coverage ${n(p.outdoor.coverage,1)}% · ${esc(p.row.provisional_cop_quality)}</title></circle><text x="${px(p.outdoor.mean)}" y="${Math.max(12,py(p.row[metric])-8)}" text-anchor="middle">${esc(p.row.month)}</text>`).join('')}<text x="45" y="192">${n(xmin,1)} °C</text><text x="450" y="192">${n(xmax,1)} °C</text></svg>`;
   }
 
+  async loadCopSimple() {
+    const today=String(this.overviewData?.cutoff_local||'').slice(0,10),source=this.representativeSource('outdoor');
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(today)){this.copSimpleError='Home Assistant local cutoff is unavailable.';this.render();return;}
+    const [year,month]=today.split('-').map(Number),index=year*12+month-1,firstIndex=index-23,first=`${Math.floor(firstIndex/12)}-${String(firstIndex%12+1).padStart(2,'0')}-01`;
+    try{
+      const monthly=await this._hass.callWS({type:'home_energy_intelligence/monthly_report',end_month:today.slice(0,7),count:24});
+      let timeline=null,temperatureError=null;
+      if(source){try{timeline=await this._hass.callWS({type:'home_energy_intelligence/temperature_timeline',start_date:first,end_date:today,resolution:'daily',source_ids:[source.source_id]});}catch(error){temperatureError=error?.message||String(error);}}
+      this.copSimpleData={today,monthly,timeline,source,temperatureError};this.copSimpleError=null;
+    }catch(error){this.copSimpleError=error?.message||String(error);this.copSimpleData=null;}
+    this.render();
+  }
+
+  copSimpleModel() {
+    const data=this.copSimpleData;if(!data)return null;
+    const today=data.today,[year,month,day]=today.split('-').map(Number),seasonMonth=Number(this.overviewData?.energy_season_start_month||7),seasonDay=Number(this.overviewData?.energy_season_start_day||1);
+    const seasonYear=month>seasonMonth||(month===seasonMonth&&day>=seasonDay)?year:year-1;
+    const startYear=this.copReportMode==='yearly'?year:seasonYear,startMonth=this.copReportMode==='yearly'?1:seasonMonth,startDay=this.copReportMode==='yearly'?1:seasonDay;
+    const start=`${startYear}-${String(startMonth).padStart(2,'0')}-${String(startDay).padStart(2,'0')}`;
+    const previousStart=`${startYear-1}-${String(startMonth).padStart(2,'0')}-${String(startDay).padStart(2,'0')}`;
+    const daysIn=(y,m)=>[31,(y%4===0&&(y%100!==0||y%400===0))?29:28,31,30,31,30,31,31,30,31,30,31][m-1];
+    const previousEnd=`${year-1}-${String(month).padStart(2,'0')}-${String(Math.min(day,daysIn(year-1,month))).padStart(2,'0')}`;
+    const temperatures=new Map();
+    for(const interval of data.timeline?.intervals||[]){const key=String(interval.local_date||'').slice(0,7),item=interval.temperatures?.[data.source?.source_id];if(!item)continue;const t=temperatures.get(key)||{valid:0,expected:0,weighted:0,dates:new Set()};t.dates.add(interval.local_date);t.expected+=Number(item.expected_seconds)||0;if(item.mean!=null&&item.valid_seconds>0){t.valid+=Number(item.valid_seconds);t.weighted+=Number(item.mean)*Number(item.valid_seconds);}temperatures.set(key,t);}
+    const byMonth=new Map((data.monthly?.rows||[]).map(r=>[r.month,r]));
+    const get=(key)=>{const row=byMonth.get(key),t=temperatures.get(key),[y,m]=key.split('-').map(Number),fullTemperature=t&&t.dates.size===daysIn(y,m)&&t.expected>0&&t.valid>=t.expected-1e-6;
+      const vendor=this.copReportSource==='vendor';const he=vendor?row?.vendor_heating_electricity_kwh:row?.provisional_shelly_heating_electricity_kwh,de=vendor?row?.vendor_dhw_electricity_kwh:row?.provisional_shelly_dhw_electricity_kwh;
+      const te=vendor?(row?.vendor_combined_electricity_kwh??(he!=null&&de!=null?Number(he)+Number(de):null)):(he!=null&&de!=null?Number(he)+Number(de):null),ht=row?.heating_thermal_kwh,dt=row?.dhw_thermal_kwh,tt=row?.vendor_combined_thermal_kwh??(ht!=null&&dt!=null?Number(ht)+Number(dt):null);
+      const eligible=row?.snapshot_status==='final'&&(vendor||row?.provisional_cop_quality==='provisional_controller_proportions'),present=v=>v!=null&&Number.isFinite(Number(v)),hvalid=eligible&&present(he)&&Number(he)>0&&present(ht),dvalid=eligible&&present(de)&&Number(de)>0&&present(dt),tvalid=eligible&&present(te)&&Number(te)>0&&present(tt);
+      const valid=hvalid&&dvalid&&tvalid;
+      const reason=!row?'monthly report unavailable':row.snapshot_status!=='final'?'snapshot not final':!vendor&&row.provisional_cop_quality!=='provisional_controller_proportions'?(row.provisional_cop_reasons||[]).join(', ')||'Shelly evidence incomplete':'required thermal or electricity evidence unavailable';
+      return {month:key,valid,eligible,hvalid,dvalid,tvalid,reason,he,de,te,ht,dt,tt,temperature:fullTemperature?t.weighted/t.valid:null,temperature_valid:fullTemperature?t.valid:0,temperature_weighted:fullTemperature?t.weighted:0};};
+    const months=[];let index=startYear*12+startMonth-1,last=year*12+month-1;for(;index<=last;index++){const y=Math.floor(index/12),m=index%12+1,key=`${y}-${String(m).padStart(2,'0')}`,prior=`${y-1}-${String(m).padStart(2,'0')}`,current=get(key),previous=get(prior),full=key<today.slice(0,7)&&!(key===start.slice(0,7)&&startDay!==1);months.push({current,previous,full,paired:full&&current.valid&&previous.valid});}
+    const aggregate=(items)=>{const valid=items.filter(x=>x.valid),sum=k=>valid.reduce((a,x)=>a+Number(x[k]),0),ratio=(a,b)=>valid.length&&sum(b)>0?sum(a)/sum(b):null,temp=valid.length&&valid.every(x=>x.temperature!=null)?valid.reduce((a,x)=>a+x.temperature_weighted,0)/valid.reduce((a,x)=>a+x.temperature_valid,0):null;return {count:valid.length,he:valid.length?sum('he'):null,de:valid.length?sum('de'):null,te:valid.length?sum('te'):null,ht:valid.length?sum('ht'):null,dt:valid.length?sum('dt'):null,tt:valid.length?sum('tt'):null,hcop:ratio('ht','he'),dcop:ratio('dt','de'),tcop:ratio('tt','te'),temperature:temp};};
+    return {start,today,previousStart,previousEnd,months,aggregate};
+  }
+
   copView() {
+    const controls=`<div class="monthly-controls"><fieldset><legend>Period</legend>${[['seasonal','Seasonal'],['yearly','Yearly']].map(([id,label])=>`<button type="button" class="cop-report-mode" data-value="${id}" aria-pressed="${this.copReportMode===id}">${label}</button>`).join('')}</fieldset><fieldset><legend>Data source</legend>${[['vendor','Vendor'],['shelly','Provisional Shelly']].map(([id,label])=>`<button type="button" class="cop-report-source" data-value="${id}" aria-pressed="${this.copReportSource===id}">${label}</button>`).join('')}</fieldset></div>`;
+    const model=this.copSimpleModel(),number=(x,d=2)=>x==null?'N/A':n(x,d),cells=x=>[number(x.dcop),number(x.hcop),number(x.tcop),number(x.de),number(x.he),number(x.te),number(x.dt),number(x.ht),number(x.tt),number(x.temperature,1)];
+    let report=`<p class="muted">${esc(this.copSimpleError||'Loading monthly evidence…')}</p>`;
+    if(model){const toRow=x=>({...x,hcop:x.hvalid?Number(x.ht)/Number(x.he):null,dcop:x.dvalid?Number(x.dt)/Number(x.de):null,tcop:x.tvalid?Number(x.tt)/Number(x.te):null,...(!x.eligible?{he:null,de:null,te:null,ht:null,dt:null,tt:null}:{})});
+      const current=model.months.filter(x=>x.full).map(x=>x.current),total=model.aggregate(current),paired=model.months.filter(x=>x.paired),cur=model.aggregate(paired.map(x=>x.current)),prev=model.aggregate(paired.map(x=>x.previous));
+      const panel=(title,x)=>`<article class="card"><h3>${esc(title)}</h3><p>${x.count} matched month(s)</p><div class="mini-stats">${[['DHW COP',x.dcop],['Heating COP',x.hcop],['Total COP',x.tcop],['Electricity kWh',x.te],['Thermal kWh',x.tt],['Outdoor °C',x.temperature]].map(([label,value])=>`<span>${esc(label)}<b>${number(value)}</b></span>`).join('')}</div></article>`;
+      report=`<article class="card page-card"><h2>Monthly ${this.copReportSource==='vendor'?'Vendor':'Provisional Shelly'} energy & COP</h2><p>Current ${esc(model.start)} to ${esc(model.today)}. Only final complete calendar months are included; the current partial month and partial season-boundary months remain N/A. COP uses summed thermal / electricity, never averaged COPs.</p><div class="table-wrap"><table><thead><tr>${['Month','DHW COP','Heating COP','Total COP','DHW electricity kWh','Heating electricity kWh','Total electricity kWh','DHW thermal kWh','Heating thermal kWh','Total thermal kWh','Outdoor °C'].map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${model.months.map(({current,full})=>{const row=toRow({...current,valid:current.valid&&full,eligible:current.eligible&&full,hvalid:current.hvalid&&full,dvalid:current.dvalid&&full,tvalid:current.tvalid&&full});return `<tr><td>${esc(row.month)}<small>${!row.valid?` · ${esc(full?row.reason:'partial period')}`:''}</small></td>${cells(row).map(v=>`<td>${v}</td>`).join('')}</tr>`;}).join('')}<tr><th>Period total (${total.count} months)</th>${cells(total).map(v=>`<td>${v}</td>`).join('')}</tr></tbody></table></div><p class="muted">Outdoor averages require complete validated daily coverage and are weighted by valid elapsed seconds. N/A means unavailable, not zero. Provisional Shelly is not verified Primary COP.</p></article><section class="grid equipment-charts">${panel(`Current ${model.start}–${model.today}`,cur)}${panel(`Previous ${model.previousStart}–${model.previousEnd}`,prev)}</section><p class="muted">Comparisons use only the same eligible completed months in each elapsed period (${paired.length} paired); excluded months and partial current month are not presented as full-period results.</p>`;}
+    return `${controls}${report}<details class="cop-advanced" ${this.copAdvancedOpen?'open':''}><summary>Advanced Analysis</summary>${this.copAdvancedView()}</details>`;
+  }
+
+  copAdvancedView() {
     const points=this.v02Report?.ecodan_space_heating||[];
     const reports=this.v02Report?.ecodan_reports||{};const report=(label,item)=>`<span>${label}<b>${item?.cop==null?"Unavailable":n(item.cop,2)}</b><small>${n(item?.thermal_kwh,2)} kWh thermal / ${n(item?.electricity_kwh,2)} kWh electricity · ${item?.matched_interval_count||0} matched category interval(s)</small></span>`;
     const month=this.fullCalendarMonth(this.selectedPeriod);
@@ -894,7 +943,10 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       const hide=()=>{chartDetail.hidden=true;};
       mark.addEventListener("pointerenter",show);mark.addEventListener("pointerleave",hide);mark.addEventListener("focus",show);mark.addEventListener("blur",hide);mark.addEventListener("click",show);
     });
-    this.shadowRoot.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => { this.active = button.dataset.tab; this.render(); if(this.active==="settings"&&this.settings?.configured)this.refreshElectricityRecoveryStatus(); }));
+    this.shadowRoot.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => { this.active = button.dataset.tab; this.render(); if(this.active==="settings"&&this.settings?.configured)this.refreshElectricityRecoveryStatus(); if(this.active==="cop"&&!this.copSimpleData)this.loadCopSimple(); }));
+    this.shadowRoot.querySelectorAll('.cop-report-mode').forEach(button=>button.addEventListener('click',()=>{this.copReportMode=button.dataset.value;this.render();}));
+    this.shadowRoot.querySelectorAll('.cop-report-source').forEach(button=>button.addEventListener('click',()=>{this.copReportSource=button.dataset.value;this.render();}));
+    this.shadowRoot.querySelector('.cop-advanced')?.addEventListener('toggle',event=>{this.copAdvancedOpen=event.target.open;});
     this.shadowRoot.querySelector(".refresh")?.addEventListener("click", () => this.refreshNow());
     this.shadowRoot.querySelector(".csv")?.addEventListener("click", () => this.exportCsv());
     this.shadowRoot.querySelector(".apply-period")?.addEventListener("click", () => { this.historyOffset=0; this.loadPeriod(); });
@@ -1019,13 +1071,13 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   async saveMonthlySnapshot(event) {
     event.preventDefault();const form=new FormData(event.currentTarget);const payload={type:"home_energy_intelligence/save_monthly_ecodan_snapshot"};
     for(const [key,value] of form.entries()){if(value!=="")payload[key]=["snapshot_id","fold"].includes(key)?Number(value):value;}
-    try{await this._hass.callWS(payload);this.monthlyEdit=null;await this.loadMonthly(false);this.refreshError=null;this.render();}
+    try{await this._hass.callWS(payload);this.monthlyEdit=null;await this.loadMonthly(false);this.refreshError=null;if(this.active==='cop')await this.loadCopSimple();this.render();}
     catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
   async deleteMonthlySnapshot(snapshotId) {
     if(!window.confirm("Delete this monthly snapshot? The deletion remains in the audit ledger."))return;
-    try{await this._hass.callWS({type:"home_energy_intelligence/delete_monthly_ecodan_snapshot",snapshot_id:snapshotId});this.monthlyEdit=null;await this.loadMonthly(false);this.refreshError=null;this.render();}
+    try{await this._hass.callWS({type:"home_energy_intelligence/delete_monthly_ecodan_snapshot",snapshot_id:snapshotId});this.monthlyEdit=null;await this.loadMonthly(false);this.refreshError=null;if(this.active==='cop')await this.loadCopSimple();this.render();}
     catch(error){this.refreshError=error?.message||String(error);this.render();}
   }
 
@@ -1133,6 +1185,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
   }
 
   static styles = `
+    .cop-report-mode,.cop-report-source{border:1px solid var(--divider-color,#dbe4ee);background:var(--card-background-color,#fff);color:var(--primary-text-color,#17233b);padding:10px 14px;min-height:44px;cursor:pointer}.cop-report-mode[aria-pressed=true],.cop-report-source[aria-pressed=true]{background:var(--primary-color,#0785db);color:white}.cop-advanced>summary{cursor:pointer;padding:14px;font-weight:600}.cop-advanced{margin-top:16px}
     .chart-detail{position:fixed;z-index:1000;max-width:min(320px,85vw);padding:8px;background:var(--card-background-color,#fff);color:var(--primary-text-color,#17233b);border:1px solid var(--divider-color,#66758d);border-radius:6px;box-shadow:0 2px 8px #0004;pointer-events:none;font-size:12px}.chart-detail[hidden]{display:none}svg rect:focus,svg circle:focus,svg rect:hover,svg circle:hover{filter:brightness(1.15);outline:none;stroke:var(--primary-color,#0785db);stroke-width:2}
     :host{display:block;background:var(--primary-background-color,#f4f7fb);color:var(--primary-text-color,#17233b);min-height:100%;font-family:var(--paper-font-body1_-_font-family,Inter,system-ui,sans-serif)}
     *{box-sizing:border-box} main{max-width:1600px;margin:auto;padding:24px 26px 40px} header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:14px}.brand{display:flex;align-items:center;gap:18px}.brand>ha-icon{--mdc-icon-size:62px;color:#0984d8}.brand h1{font-size:34px;line-height:1;margin:0;color:var(--primary-text-color,#111827)}.brand p{margin:6px 0 0;font-size:18px;color:var(--secondary-text-color,#65728a)}.connection{display:flex;align-items:center;gap:10px}.connection i{width:12px;height:12px;border-radius:50%;background:#20a35a}.connection div{display:flex;flex-direction:column}.connection span{font-size:12px;color:var(--secondary-text-color,#65728a);margin-top:4px}
