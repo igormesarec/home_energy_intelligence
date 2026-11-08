@@ -58,6 +58,32 @@ process.stdout.write(panel.recoveredHeatingChart());
     assert 'never included in verified regression' in output
 
 
+def test_current_month_partial_evidence_is_exported_with_coverage_and_missing_snapshot():
+    output = run_panel(r"""
+(async()=>{panel.overviewData={floor_area_m2:170};panel.profileOutdoorRows=[];panel.selectedPeriod={start_date:'2026-11-01',end_date:'2026-11-30'};panel.historySummary={period_end_utc:'2026-11-08T12:00:00+00:00',energy:{known_household_kwh:357.3,known_confirmed_heat_pump_heating_kwh:100,known_assumed_heat_pump_heating_kwh:41,known_dhw_kwh:26.2,equipment:[{kind:'air_conditioner',known_selected_heating_kwh:22}]}};panel.monthlyReport={rows:[{month:'2026-11',household_electricity_kwh:357.3,known_ecodan_heating_electricity_kwh:141,known_ecodan_dhw_electricity_kwh:26.2,known_ac_heating_electricity_kwh:22,known_whole_house_heating_electricity_kwh:163,known_ac_cooling_electricity_kwh:null,period_coverage:{allocation_coverage:{complete:false},date_coverage:{complete:false,complete_through_available_cutoff:false}},available_daily_dates:['2026-11-01','2026-11-07','2026-11-08'],energy_period_end_utc:'2026-11-08T12:00:00+00:00',source:{electricity:'shelly_classified_daily_records'},snapshot_status:'missing',quality:'partial',recovered_reference_ecodan_assumed_heating_kwh:999}]};let blob;global.URL={createObjectURL:b=>(blob=b,''),revokeObjectURL:()=>{}};global.document={createElement:()=>({click:()=>{}})};panel.exportHouseProfile();process.stdout.write(await blob.text());})();
+""", {})
+    import csv
+    import io
+    row = next(csv.DictReader(io.StringIO(output)))
+    assert row['ecodan_heating_kwh'] == '141' and row['dhw_shelly_kwh'] == '26.2'
+    assert row['ac_heating_kwh'] == '22' and row['household_electricity_kwh'] == '357.3'
+    assert row['allocation_evidence_status'] == 'partial known subtotal'
+    assert row['snapshot_status'] == 'missing' and row['electricity_source'] == 'shelly_classified_daily_records'
+    assert row['energy_period_end_utc'] == '2026-11-08T12:00:00+00:00'
+    assert row['recovered_reference_ecodan_assumed_heating_kwh'] == '999'
+    assert row['ac_cooling_kwh'] == ''
+    assert row['selected_period_ecodan_heating_kwh'] == '141' and row['selected_period_dhw_kwh'] == '26.2'
+    assert row['selected_period_ac_heating_kwh'] == '22' and row['selected_period_household_kwh'] == '357.3'
+
+
+def test_heat_pump_raw_unknown_is_visible_without_adding_it_again():
+    output = run_panel(r"""
+panel.historySummary={energy:{equipment:[{equipment_id:'hp',display_name:'Heat pump',kind:'heat_pump',known_confirmed_heating_kwh:2,known_assumed_heating_kwh:4,known_dhw_kwh:1,known_idle_kwh:.5,residual_kwh:.4,coverage_percent:80}]},allocations:{hp:{known_categories:{unknown:3}}}};panel.v02Report={};panel.selectedPeriod={};process.stdout.write(panel.wholeHouseEnergyCard());
+""", {})
+    assert 'raw unknown 3.00 kWh' in output and 'residual 0.40 kWh' in output
+    assert 'classification coverage 80.0%' in output and 'Do not add them again' in output
+
+
 def test_ecodan_evidence_download_and_error():
     output = run_panel(r"""
 (async()=>{panel.equipment=[{equipment_id:'hp',display_name:'HP',kind:'heat_pump'}];
