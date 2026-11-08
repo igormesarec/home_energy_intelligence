@@ -669,6 +669,16 @@ class EnergyDatabase:
             if connection is not None:
                 connection.close()
 
+    @contextmanager
+    def connect_readonly(self) -> Iterator[sqlite3.Connection]:
+        """Open an existing database in SQLite read-only mode without changing pragmas."""
+        connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=self.CONNECT_TIMEOUT_SECONDS)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def initialize(self, *, recover_corrupt: bool = True) -> Path | None:
         recovered = None
         if self.path.exists():
@@ -799,12 +809,12 @@ class EnergyDatabase:
             row = connection.execute("SELECT * FROM electricity_recovery_jobs ORDER BY id DESC LIMIT 1").fetchone()
             return dict(row) if row else None
 
-    def electricity_recovery_evidence_range(self, start_date: str, end_date: str) -> dict[str, Any]:
+    def electricity_recovery_evidence_range(self, start_date: str, end_date: str, *, read_only: bool = False) -> dict[str, Any]:
         """Return only unambiguous source-day evidence; never select a version by recency."""
         start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
         if end < start:
             raise ValueError("invalid evidence date range")
-        with self.connect() as connection:
+        with (self.connect_readonly() if read_only else self.connect()) as connection:
             rows = connection.execute("""SELECT local_date,source_key,payload_json,checksum
                 FROM electricity_recovery_evidence WHERE local_date>=? AND local_date<=?
                 ORDER BY local_date,source_key,checksum""", (start_date, end_date)).fetchall()

@@ -77,6 +77,43 @@ class InfluxBackfillClient:
         return [(timestamp, float(value)) for timestamp, value in self._query_values(query)
                 if value is not None]
 
+    def diagnostic_states_ns(self, start: datetime, end: datetime, *, entity_id: str, limit: int) -> list[tuple[int, str]]:
+        """Read raw state rows for diagnostics, preserving nanoseconds and duplicates."""
+        if start.tzinfo is None or end.tzinfo is None or end <= start or end-start > timedelta(days=2) or not 1 <= limit <= 10000:
+            raise InfluxBackfillError("invalid diagnostic query bounds")
+        domain, separator, tag = entity_id.partition(".")
+        if not separator or not domain or not tag:
+            raise InfluxBackfillError("invalid diagnostic entity")
+        ref = f'{self.quote_identifier(self.retention_policy)}.{self.quote_identifier("state")}'
+        query = (f'SELECT "state" FROM {ref} WHERE time >= {self.quote_string(start.isoformat())} '
+                 f'AND time < {self.quote_string(end.isoformat())} AND "entity_id" = {self.quote_string(tag)} '
+                 f'AND "domain" = {self.quote_string(domain)} ORDER BY time ASC LIMIT {limit+1}')
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if self.username:
+            token = base64.b64encode(f"{self.username}:{self.password or ''}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        request = Request(self.base_url, data=urlencode({"db": self.database, "q": query, "epoch": "ns"}).encode(), headers=headers, method="POST")
+        context = None if self.verify_ssl else ssl._create_unverified_context()  # noqa: SLF001
+        with urlopen(request, timeout=30, context=context) as response:  # noqa: S310
+            payload = json.load(response)
+        if not isinstance(payload, dict) or payload.get("error") or any(item.get("error") for item in payload.get("results", [])):
+            raise InfluxBackfillError("diagnostic InfluxDB query failed")
+        try:
+            rows = [row for result in payload["results"] for series in result.get("series", []) for row in series["values"]]
+            if len(rows) > limit:
+                raise InfluxBackfillError("diagnostic observation limit exceeded")
+            if any(not isinstance(row[0], int) or not isinstance(row[1], str) for row in rows):
+                raise ValueError("invalid diagnostic row")
+            epoch = datetime(1970, 1, 1, tzinfo=UTC)
+            def nanoseconds(value):
+                delta = value.astimezone(UTC) - epoch
+                return (delta.days*86400 + delta.seconds)*1_000_000_000 + delta.microseconds*1000
+            if any(not nanoseconds(start) <= row[0] < nanoseconds(end) or len(row[1]) > 512 for row in rows):
+                raise ValueError("diagnostic row outside bounds")
+            return [(row[0], row[1]) for row in rows]
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise InfluxBackfillError("malformed diagnostic InfluxDB response") from error
+
     def _query_values(self, query: str) -> list[tuple[datetime, object]]:
         params = {"db": self.database, "q": query, "epoch": "ns"}
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
