@@ -31,6 +31,7 @@ from .configuration import (
 )
 from .const import DOMAIN
 from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics, recovered_heating_points, recovery_interval_diagnostics
+from .evidence_export import build_evidence_export
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -65,6 +66,7 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_status)
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
     websocket_api.async_register_command(hass, ws_historical_energy_preview)
+    websocket_api.async_register_command(hass, ws_ecodan_evidence_export)
     websocket_api.async_register_command(hass, ws_electricity_recovery_start)
     websocket_api.async_register_command(hass, ws_electricity_recovery_status)
     websocket_api.async_register_command(hass, ws_electricity_recovery_cancel)
@@ -1227,6 +1229,31 @@ async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
         connection.send_error(msg["id"], "invalid_range", str(error))
         return
     connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/ecodan_evidence_export",
+    vol.Optional("start_date", default="2026-10-01"): str,
+    vol.Optional("end_date", default="2026-10-31"): str,
+    vol.Required("equipment_id"): str, vol.Required("state_entity"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_ecodan_evidence_export(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        start, end = _diagnostic_dates(coordinator, msg)
+        content = await build_evidence_export(hass, coordinator, start, end, msg["equipment_id"], msg["state_entity"])
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_export", str(error))
+        return
+    except Exception:
+        connection.send_error(msg["id"], "export_failed", "Evidence export failed; check the selected sources and try a shorter range")
+        return
+    connection.send_result(msg["id"], {"filename": f"hei-ecodan-evidence-{start}-{end}.json", "json": content})
 
 
 @websocket_api.websocket_command({

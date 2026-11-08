@@ -58,6 +58,16 @@ process.stdout.write(panel.recoveredHeatingChart());
     assert 'never included in verified regression' in output
 
 
+def test_ecodan_evidence_download_and_error():
+    output = run_panel(r"""
+(async()=>{panel.equipment=[{equipment_id:'hp',display_name:'HP',kind:'heat_pump'}];
+panel.shadowRoot={querySelector:s=>({' .unused':null,'.evidence-export-equipment':{value:'hp'},'.evidence-export-entity':{value:'sensor.operation'},'.evidence-export-start':{value:'2026-10-01'},'.evidence-export-end':{value:'2026-10-31'}}[s])};panel.render=()=>{};let clicked=false;global.document={createElement:()=>({click:()=>{clicked=true}})};global.URL={createObjectURL:()=>'',revokeObjectURL:()=>{}};panel._hass={callWS:async()=>({json:'{}',filename:'evidence.json'})};await panel.downloadEcodanEvidence();const success=panel.evidenceExportStatus.state;panel._hass.callWS=async()=>{throw {code:'invalid_export',message:'bad range'}};await panel.downloadEcodanEvidence();process.stdout.write(JSON.stringify({success,clicked,error:panel.evidenceExportControls()}));})();
+""", {})
+    result = json.loads(output)
+    assert result['success'] == 'success' and result['clicked']
+    assert 'invalid_export' in result['error'] and 'bad range' in result['error']
+
+
 def test_recovered_monthly_table_separates_sources_categories_and_scope():
     output = run_panel(r"""
 panel.equipment=[{equipment_id:'hp',display_name:'Heat pump'}];
