@@ -71,6 +71,15 @@ process.stdout.write(panel.thermalView());
     assert 'actual overlap unknown' in output
 
 
+def test_recovery_interval_diagnostics_shows_unknown_and_nonadditive_totals():
+    output = run_panel(r"""
+panel.v02Report={recovered_heating:{interval_diagnostics:[{local_date:'2026-10-25',equipment_id:'hp',source_entity_id:'sensor.hp',day_seconds:90000,authoritative_intervals:[],authoritative_intervals_complete:false,recovered_intervals:null,authoritative_kwh:2,recovered_kwh:12,overlap_seconds:null,nonoverlap_seconds:null,unknown_seconds:90000}]}};
+process.stdout.write(panel.recoveryIntervalDiagnostics());
+""", {})
+    assert 'sensor.hp' in output and '25.00' in output
+    assert 'Unknown' in output and 'non-additive' in output
+
+
 def test_pv_chart_discloses_pagination_and_missing_october_fields():
     output = run_panel(r"""
 panel.historyTotal=95;panel.history=Array.from({length:90},(_,i)=>({local_date:i===0?'2026-10-25':'2026-10-24',energy:i===0?{pv_kwh:1,import_kwh:null,export_kwh:0}:{pv_kwh:2}}));

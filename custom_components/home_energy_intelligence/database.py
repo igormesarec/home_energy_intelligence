@@ -904,6 +904,25 @@ class EnergyDatabase:
                 occupied.add((row["local_date"], "*"))
         return sorted(occupied)
 
+    def electricity_authoritative_interval_rows(self, start_date: str, end_date: str, blocked_dates: list[str]) -> list[dict[str, Any]]:
+        """Read bounded electrical rows without hydrating or changing stored records."""
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if end < start or (end - start).days > 3660:
+            raise ValueError("invalid date range")
+        days = sorted({value for value in blocked_dates if start_date <= value <= end_date})
+        result = []
+        with self.connect() as connection:
+            for index in range(0, len(days), 400):
+                chunk = days[index:index+400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(f"""SELECT local_date,period_start_utc AS start_utc,
+                    period_end_utc AS end_utc,payload_json,'daily' AS kind FROM daily_records
+                    WHERE local_date IN ({placeholders}) UNION ALL
+                    SELECT local_date,interval_start_utc,interval_end_utc,payload_json,'hourly'
+                    FROM hourly_records WHERE local_date IN ({placeholders})""", (*chunk, *chunk)).fetchall()
+                result.extend(dict(row) for row in rows)
+        return result
+
     def cancel_electricity_recovery_job(self, job_id: int) -> bool:
         with self.connect() as connection:
             return connection.execute("""UPDATE electricity_recovery_jobs SET cancel_requested=1,updated_at=?
