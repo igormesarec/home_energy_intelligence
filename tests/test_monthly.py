@@ -64,6 +64,25 @@ def test_partial_month_known_heating_is_nullable_and_keeps_assumptions_separate(
     assert october["ecodan_assumed_heating_kwh"] is not None
 
 
+def test_november_completed_days_and_partial_day_without_thermal_snapshot():
+    from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+    records = []
+    for day_number in range(1, 9):
+        day = date(2026, 11, day_number)
+        start, end = local_day_bounds(day, "Europe/Ljubljana")
+        item = daily_record(local_date=day.isoformat(), period_start=start.isoformat(), period_end=end.isoformat())
+        if day_number == 8:
+            item.update(partial=True, finalized=False, quality="partial")
+        records.append(item)
+    equipment = [{"equipment_id": "hp_main", "kind": "heat_pump", "enabled": True}]
+    row = build_rolling_month_report(daily_records=records, snapshots=[], equipment=equipment,
+                                    timezone="Europe/Ljubljana", end_month="2026-11", count=1)["rows"][0]
+    assert row["snapshot_status"] == "missing" and row["heating_thermal_kwh"] is None
+    assert row["known_ecodan_heating_electricity_kwh"] == 72
+    assert row["available_daily_dates"] == [f"2026-11-{day:02}" for day in range(1, 9)]
+    assert row["period_coverage"]["date_coverage"]["complete"] is False
+
+
 def test_september_provisional_shelly_cop_without_classification():
     from custom_components.home_energy_intelligence.timeutils import local_day_bounds
 
