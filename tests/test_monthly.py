@@ -62,6 +62,8 @@ def test_partial_month_known_heating_is_nullable_and_keeps_assumptions_separate(
     assert september["known_whole_house_heating_electricity_kwh"] is None
     assert october["known_whole_house_heating_electricity_kwh"] == 9
     assert october["ecodan_assumed_heating_kwh"] is not None
+    assert "missing monthly controller snapshot" in october["provisional_cop_reasons"]
+    assert "daily Shelly meter evidence incomplete or unreliable" in october["provisional_cop_reasons"]
 
 
 def test_november_completed_days_and_partial_day_without_thermal_snapshot():

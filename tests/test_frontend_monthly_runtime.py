@@ -84,6 +84,35 @@ panel.historySummary={energy:{equipment:[{equipment_id:'hp',display_name:'Heat p
     assert 'classification coverage 80.0%' in output and 'Do not add them again' in output
 
 
+def test_season_cop_uses_ratio_of_sums_and_omits_partial_month():
+    output = run_panel(r"""
+panel.historyPreset='current_season';panel.selectedPeriod={start_date:'2026-07-01',end_date:'2027-06-30'};panel.equipment=[];panel.v02Report={};panel.monthlyReport={rows:[]};
+const row=(month,h,d,vh,vd,sh,sd)=>({month,snapshot_status:'final',provisional_cop_quality:'provisional_controller_proportions',heating_thermal_kwh:h,dhw_thermal_kwh:d,vendor_heating_electricity_kwh:vh,vendor_dhw_electricity_kwh:vd,vendor_combined_electricity_kwh:vh+vd,provisional_shelly_heating_electricity_kwh:sh,provisional_shelly_dhw_electricity_kwh:sd,provisional_shelly_heating_cop:h/sh,provisional_shelly_dhw_cop:d/sd,provisional_shelly_combined_cop:(h+d)/(sh+sd)});
+panel.selectedYearReport={rows:[row('2026-09',309,424,72,121,69.44,116.81),row('2027-01',10,10,10,10,10,10),{month:'2026-11',snapshot_status:'partial',provisional_cop_reasons:['monthly snapshot is not final']}]};panel.copOutdoorRows=[];process.stdout.write(panel.copView());
+""", {})
+    assert 'Energy season Provisional Shelly COP' in output
+    assert 'September 2026 to January 2027' in output
+    assert '2026-11: monthly snapshot is not final' in output
+    assert '3.94' not in output  # Ratio of summed energies, not September's COP.
+
+
+def test_monthly_provisional_temperature_plot_requires_qualified_evidence():
+    output = run_panel(r"""
+panel.copOutdoorRows=[{key:'2026-09',mean:11,coverage:99,complete_dates:true}];const row={month:'2026-09',snapshot_status:'final',provisional_cop_quality:'provisional_controller_proportions',provisional_shelly_heating_cop:4.45};process.stdout.write(panel.monthlyCopTemperatureChart('heating',[row])+'\n---\n'+panel.monthlyCopTemperatureChart('dhw',[row]));
+""", {})
+    assert '4.45' in output and 'One eligible month; no fitted curve' in output
+    assert 'Unavailable: no final provisional monthly COP' in output
+
+
+def test_previous_season_and_monthly_plot_do_not_promote_provisional_to_primary():
+    output = run_panel(r"""
+panel.historyPreset='previous_season';panel.selectedPeriod={start_date:'2025-07-01',end_date:'2026-06-30'};panel.equipment=[];panel.v02Report={};panel.monthlyReport={rows:[]};panel.selectedYearReport={rows:[{month:'2026-04',snapshot_status:'final',provisional_cop_quality:'provisional_controller_proportions',heating_thermal_kwh:12,dhw_thermal_kwh:8,vendor_heating_electricity_kwh:4,vendor_dhw_electricity_kwh:4,vendor_combined_electricity_kwh:8,provisional_shelly_heating_electricity_kwh:3,provisional_shelly_dhw_electricity_kwh:4,provisional_shelly_heating_cop:4,provisional_shelly_dhw_cop:2,provisional_shelly_combined_cop:20/7}]};panel.copOutdoorRows=[{key:'2026-04',mean:10,coverage:99,complete_dates:true}];process.stdout.write(panel.copView());
+""", {})
+    assert '2026-04' in output and 'Energy season Provisional Shelly COP' in output
+    assert 'monthly estimates do not create curve points' in output
+    assert 'One eligible month; no fitted curve' in output
+
+
 def test_ecodan_evidence_download_and_error():
     output = run_panel(r"""
 (async()=>{panel.equipment=[{equipment_id:'hp',display_name:'HP',kind:'heat_pump'}];
