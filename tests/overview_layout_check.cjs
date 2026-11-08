@@ -28,6 +28,16 @@ const path = require('path');
     });
     console.log(width,JSON.stringify(result));
     if(result.pageOverflow||result.overlaps||result.clipped||result.internal||result.plots!==2||result.temperatures!==2)process.exitCode=1;
+    const cop=await page.evaluate(()=>{
+      const Panel=customElements.get('home-energy-intelligence-panel'),panel=new Panel();
+      panel.overviewData={cutoff_local:'2026-11-08T12:00:00+01:00',energy_season_start_month:7,energy_season_start_day:1};panel.equipment=[];panel.v02Report={};panel.monthlyReport={rows:[]};panel.selectedPeriod={};
+      panel.copSimpleData={today:'2026-11-08',monthly:{rows:[{month:'2026-09',snapshot_status:'final',heating_thermal_kwh:309,dhw_thermal_kwh:424,vendor_heating_electricity_kwh:72,vendor_dhw_electricity_kwh:121,vendor_combined_electricity_kwh:193}]},timeline:null};
+      document.body.innerHTML='';document.body.append(panel);panel.shadowRoot.innerHTML=`<style>${Panel.styles}</style><main>${panel.copView()}</main>`;
+      const root=panel.shadowRoot,table=root.querySelector('.table-wrap');
+      return {pageOverflow:document.documentElement.scrollWidth>innerWidth,tableContained:!!table&&table.getBoundingClientRect().right<=innerWidth+1,advancedClosed:!root.querySelector('.cop-advanced')?.open,panelCount:root.querySelector('section.grid.equipment-charts')?.children.length};
+    });
+    console.log('cop',width,JSON.stringify(cop));
+    if(cop.pageOverflow||!cop.tableContained||!cop.advancedClosed||cop.panelCount!==2)process.exitCode=1;
   }
   await browser.close();
 })().catch(e=>{console.error(e);process.exitCode=1});

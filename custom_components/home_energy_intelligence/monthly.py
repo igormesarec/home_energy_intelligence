@@ -445,6 +445,21 @@ def build_rolling_month_report(
             and all(item.get("vendor_heating_electricity_kwh") is not None
                     and item.get("vendor_dhw_electricity_kwh") is not None for item in selected_values)
         )
+        provisional_reasons = []
+        if not selected_values:
+            provisional_reasons.append("missing monthly controller snapshot")
+        elif not all(item.get("status") == "final" for item in selected_values):
+            provisional_reasons.append("monthly snapshot is not final")
+        if not heat_pump_ids or set(selected) != heat_pump_ids:
+            provisional_reasons.append("missing snapshot for configured heat pump")
+        if not exact_cutoff or len(cutoff_values) != 1 or cutoff_values[0] != month_end_utc.isoformat():
+            provisional_reasons.append("exact full-month cutoff unavailable or mismatched")
+        if not meter_complete:
+            provisional_reasons.append("daily Shelly meter evidence incomplete or unreliable")
+        if vendor_category_sum is None or vendor_category_sum <= 0:
+            provisional_reasons.append("controller heating/DHW electricity inputs missing or zero")
+        if thermal_heating is None or thermal_dhw is None:
+            provisional_reasons.append("controller thermal production inputs incomplete")
         measured_month = sum(daily_meter_values) if provisional_valid else None
         estimated_heating = (measured_month * vendor_heating_electricity / vendor_category_sum
                              if provisional_valid else None)
@@ -570,6 +585,7 @@ def build_rolling_month_report(
             "provisional_shelly_dhw_cop": _ratio(thermal_dhw, estimated_dhw) if all(item.get("dhw_thermal_kwh") is not None for item in selected_values) else None,
             "provisional_shelly_combined_cop": _ratio(provisional_thermal, measured_month),
             "provisional_cop_quality": "provisional_controller_proportions" if provisional_valid else "unavailable",
+            "provisional_cop_reasons": provisional_reasons,
             "shelly_minus_vendor_kwh": difference,
             "shelly_heating_minus_vendor_kwh": heating_difference,
             "shelly_heating_minus_vendor_percent": heating_percent,
