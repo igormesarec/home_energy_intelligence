@@ -105,7 +105,7 @@ panel.copSimpleData={today:'2026-11-08',monthly:{rows:[row('2026-09',309,424,70,
     result = json.loads(output)
     assert '2026-07-01 to 2026-11-08' in result['vendor']
     assert 'Previous 2025-07-01–2025-11-08' in result['vendor']
-    assert '1 matched month(s)' in result['vendor'] and '4.41' in result['vendor']
+    assert '1 eligible month(s)' in result['vendor'] and 'Comparable 1 matched month position(s)' in result['vendor'] and '4.41' in result['vendor']
     assert 'daily Shelly meter evidence incomplete or unreliable' in result['shelly']
     assert 'partial period' in result['vendor'] and '<details class="cop-advanced"' in result['vendor']
 
@@ -135,6 +135,35 @@ panel.overviewData={cutoff_local:'2026-03-10T12:00:00+01:00'};panel.copReportMod
     result = json.loads(output)
     assert result['mean'] == pytest.approx(27 * 86400 * 10 / (27 * 86400 + 82800))
     assert result['missing'] is None
+
+
+def test_cop_panels_keep_independent_totals_and_limit_comparison_to_matched_months():
+    output = run_panel(r"""
+panel.overviewData={cutoff_local:'2026-11-08T12:00:00+01:00',energy_season_start_month:7,energy_season_start_day:1};panel.equipment=[];panel.v02Report={};panel.monthlyReport={rows:[]};panel.selectedPeriod={};
+const row=(month,h,d,he,de)=>({month,snapshot_status:'final',heating_thermal_kwh:h,dhw_thermal_kwh:d,vendor_heating_electricity_kwh:he,vendor_dhw_electricity_kwh:de,vendor_combined_electricity_kwh:he+de});
+const current=[row('2026-08',100,90,25,30),row('2026-09',40,30,10,10)];const previous=[row('2025-08',50,60,25,30),row('2025-10',20,20,10,10)];
+const view=rows=>{panel.copSimpleData={today:'2026-11-08',monthly:{rows},timeline:null};return panel.copView().split('<details class="cop-advanced"')[0];};
+const out={current:view(current),previous:view(previous),both:view([...current,...previous])};panel.copReportMode='yearly';out.yearly=view(current);process.stdout.write(JSON.stringify(out));
+""", {})
+    result = json.loads(output)
+    assert '2 eligible month(s)' in result['current'] and '165.00' not in result['current']
+    assert '75.00' in result['current'] and '260.00' in result['current']
+    assert 'Comparison unavailable' in result['current']
+    assert '2 eligible month(s)' in result['previous'] and 'Comparison unavailable' in result['previous']
+    assert 'Comparable 1 matched month position(s)' in result['both']
+    assert 'Heating COP 100.0%' in result['both'] and 'DHW COP 50.0%' in result['both']
+    assert all(label in result['both'] for label in ['DHW COP', 'Heating COP', 'Total COP', 'Electricity kWh', 'Thermal kWh'])
+    assert '2026-01-01 to 2026-11-08' in result['yearly']
+
+
+def test_cop_outdoor_partial_coverage_uses_only_valid_elapsed_seconds():
+    output = run_panel(r"""
+panel.overviewData={cutoff_local:'2026-03-10T12:00:00+01:00'};panel.copReportMode='yearly';panel.copReportSource='vendor';panel.equipment=[];panel.v02Report={};panel.monthlyReport={rows:[]};panel.selectedPeriod={};const row={month:'2026-02',snapshot_status:'final',heating_thermal_kwh:20,dhw_thermal_kwh:10,vendor_heating_electricity_kwh:5,vendor_dhw_electricity_kwh:5};const intervals=Array.from({length:28},(_,i)=>({local_date:`2026-02-${String(i+1).padStart(2,'0')}`,temperatures:{out:{expected_seconds:86400,valid_seconds:i===0?43200:86400,mean:i===0?0:10}}}));panel.copSimpleData={today:'2026-03-10',monthly:{rows:[row]},source:{source_id:'out'},timeline:{intervals}};const model=panel.copSimpleModel(),total=model.aggregate(model.months.filter(x=>x.full).map(x=>x.current));process.stdout.write(JSON.stringify({total,view:panel.copView()}));
+""", {})
+    result = json.loads(output)
+    assert result['total']['temperature'] == pytest.approx(27 * 86400 * 10 / (27 * 86400 + 43200))
+    assert result['total']['temperature_coverage'] == pytest.approx(27.5 / 28 * 100)
+    assert '98.2% coverage · partial' in result['view']
 
 
 def test_monthly_provisional_temperature_plot_requires_qualified_evidence():
