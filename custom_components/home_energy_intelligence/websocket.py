@@ -30,7 +30,7 @@ from .configuration import (
     temperatures_from_config,
 )
 from .const import DOMAIN
-from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics, recovered_heating_points
+from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics, recovered_heating_points, recovery_interval_diagnostics
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -379,6 +379,15 @@ async def ws_v02_report(hass, connection, msg):
         outdoor_source = next((item for item in _temperatures(coordinator) if item.source_id == outdoor_source_id and item.enabled and item.role == "outdoor"), None)
         recovered = recovered_heating_points(evidence, occupied, records, equipment_from_config(coordinator.config), outdoor_source,
                                              coordinator.timezone, _response_temperature_coverage_minimum(coordinator))
+        interval_reader = getattr(coordinator.database, "electricity_authoritative_interval_rows", None)
+        if interval_reader:
+            occupied_set = set(occupied)
+            blocked_dates = sorted({item["local_date"] for item in [*evidence.get("records", []), *evidence.get("ambiguous", [])]
+                                    if item.get("source_key", "").startswith("equipment.")
+                                    and ((item.get("local_date"), item.get("source_key")) in occupied_set
+                                         or (item.get("local_date"), "*") in occupied_set)})
+            interval_rows = await hass.async_add_executor_job(interval_reader, start.isoformat(), end.isoformat(), blocked_dates) if blocked_dates else []
+            recovered["interval_diagnostics"] = recovery_interval_diagnostics(evidence, occupied, interval_rows, coordinator.timezone)
     period_start, _ = local_day_bounds(start, coordinator.timezone)
     _, period_end = local_day_bounds(end, coordinator.timezone)
     readings = await hass.async_add_executor_job(

@@ -2,11 +2,126 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+import json
 from math import isfinite
 from typing import Any
 
 from .timeutils import local_day_bounds
+
+
+def _interval_union(intervals):
+    result = []
+    for start, end in sorted(intervals):
+        if result and start <= result[-1][1]:
+            result[-1] = (result[-1][0], max(end, result[-1][1]))
+        else:
+            result.append((start, end))
+    return result
+
+
+def recovery_interval_diagnostics(evidence, occupied, rows, timezone):
+    """Compare independently recorded intervals; never infer coverage from totals."""
+    occupied = set(occupied)
+    by_key = {}
+    for item in [*evidence.get("records", []), *evidence.get("ambiguous", [])]:
+        key = (item.get("local_date"), item.get("source_key"))
+        if key[1] and key[1].startswith("equipment.") and (key in occupied or (key[0], "*") in occupied):
+            by_key.setdefault(key, []).append(item)
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row.get("local_date"), []).append(row)
+    result = []
+    for (day, key), versions in sorted(by_key.items()):
+        if len(versions) != 1 or "source_entity_id" not in versions[0]:
+            start, end = local_day_bounds(date.fromisoformat(day), timezone)
+            result.append({"local_date": day, "equipment_id": key.removeprefix("equipment."),
+                           "source_entity_id": None, "day_seconds": (end-start).total_seconds(),
+                           "authoritative_intervals": [], "authoritative_intervals_complete": False,
+                           "recovered_intervals": None, "authoritative_kwh": None, "recovered_kwh": None,
+                           "overlap_seconds": None, "nonoverlap_seconds": None,
+                           "unknown_seconds": (end-start).total_seconds(), "reason": "ambiguous_evidence"})
+            continue
+        item = versions[0]
+        start, end = local_day_bounds(date.fromisoformat(day), timezone)
+        duration = (end-start).total_seconds()
+        device = key.removeprefix("equipment.")
+        windows, daily_values, hourly_values = [], [], []
+        uncertain, matched = False, False
+        for row in by_day.get(day, []):
+            try:
+                payload = json.loads(row["payload_json"])
+                allocation = payload.get("allocations", {}).get(device)
+                if not isinstance(allocation, dict):
+                    continue
+                meter = allocation.get("meter_kwh")
+                if meter is None and not allocation.get("categories"):
+                    continue
+                matched = True
+                value = float(meter) if meter is not None else None
+                if value is not None and (not isfinite(value) or value < 0):
+                    value = None
+                if row["kind"] == "daily":
+                    daily_values.append(value)
+                    uncertain = True  # A daily meter does not locate its coverage.
+                    continue
+                left = datetime.fromisoformat(row["start_utc"].replace("Z", "+00:00"))
+                right = datetime.fromisoformat(row["end_utc"].replace("Z", "+00:00"))
+                if left.tzinfo is None or right.tzinfo is None or left < start or right > end or right <= left:
+                    raise ValueError("invalid hourly bounds")
+                provenance = allocation.get("source_provenance") or {}
+                seconds = (right-left).total_seconds()
+                covered = provenance.get("meter_coverage_seconds")
+                identity = provenance.get("energy_entity_id")
+                if (value is not None and isinstance(covered, (int, float)) and abs(covered-seconds) < 1e-6
+                        and allocation.get("quality") == "good" and identity == item.get("source_entity_id")):
+                    windows.append((left, right))
+                else:
+                    uncertain = True
+                hourly_values.append((left, right, value))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                uncertain = True
+        merged = _interval_union(windows)
+        covered_seconds = sum((b-a).total_seconds() for a, b in merged)
+        # Even a daily record is fully located when independent hourly intervals cover the day.
+        authoritative_exact = matched and (not uncertain or covered_seconds >= duration)
+        recovered = []
+        provenance = item.get("source_provenance") or {}
+        recorded = provenance.get("meter_supported_intervals_utc")
+        try:
+            if not isinstance(recorded, list) or provenance.get("energy_entity_id") != item.get("source_entity_id"):
+                raise ValueError("no exact recovered intervals")
+            for interval in recorded:
+                a = datetime.fromisoformat(interval["start"].replace("Z", "+00:00"))
+                b = datetime.fromisoformat(interval["end"].replace("Z", "+00:00"))
+                if a.tzinfo is None or b.tzinfo is None or a < start or b > end or b <= a:
+                    raise ValueError("invalid recovered interval")
+                recovered.append((a, b))
+            recovered = _interval_union(recovered)
+            reported_seconds = float(item["meter_coverage_seconds"])
+            if not isfinite(reported_seconds) or abs(sum((b-a).total_seconds() for a, b in recovered) - reported_seconds) > 1e-6:
+                raise ValueError("inconsistent coverage")
+        except (KeyError, TypeError, ValueError, AttributeError):
+            recovered = None
+        intersection = None
+        nonoverlap = None
+        unknown = duration
+        if authoritative_exact and recovered is not None:
+            intersection = sum(max(0, (min(b, d)-max(a, c)).total_seconds()) for a, b in merged for c, d in recovered)
+            supported = sum((b-a).total_seconds() for a, b in recovered)
+            nonoverlap = supported - intersection
+            unknown = duration - supported
+        valid_hours = [v for _, _, v in hourly_values if v is not None]
+        hour_windows = [(a, b) for a, b, _ in hourly_values]
+        duplicate_hours = sum((b-a).total_seconds() for a, b in hour_windows) != sum((b-a).total_seconds() for a, b in _interval_union(hour_windows))
+        authoritative_kwh = daily_values[0] if len(daily_values) == 1 else (sum(valid_hours) if not daily_values and valid_hours and not duplicate_hours else None)
+        result.append({"local_date": day, "equipment_id": device, "source_entity_id": item.get("source_entity_id"),
+                       "day_seconds": duration, "authoritative_intervals": [{"start": a.astimezone(UTC).isoformat(), "end": b.astimezone(UTC).isoformat()} for a, b in merged],
+                       "authoritative_intervals_complete": authoritative_exact,
+                       "recovered_intervals": None if recovered is None else [{"start": a.astimezone(UTC).isoformat(), "end": b.astimezone(UTC).isoformat()} for a, b in recovered],
+                       "authoritative_kwh": authoritative_kwh, "recovered_kwh": item.get("meter_kwh"),
+                       "overlap_seconds": intersection, "nonoverlap_seconds": nonoverlap, "unknown_seconds": unknown})
+    return result
 
 
 def recovered_heating_points(evidence, occupied, daily_records, equipment, outdoor_source, timezone, minimum_coverage):

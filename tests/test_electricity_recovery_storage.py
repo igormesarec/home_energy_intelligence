@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import date
+from datetime import date, timedelta
 import json
 
 import pytest
@@ -18,6 +18,64 @@ def evidence(day, *, value=1.0):
             "interval_end_utc": end.isoformat(), "verification_status": "provisional",
             "meter_kwh": value, "categories": {"unknown": value}, "residual_kwh": 0,
             "source": "recorder", "calculation_version": "historical-preview-v1"}
+
+
+@pytest.mark.parametrize(("day", "hours"), [("2026-03-29", 23), ("2026-10-25", 25)])
+def test_interval_diagnostics_dst_full_day_and_unknown(day, hours):
+    from custom_components.home_energy_intelligence.electricity_recovery import recovery_interval_diagnostics
+    start, end = local_day_bounds(date.fromisoformat(day), "Europe/Ljubljana")
+    record = {**evidence(day), "meter_coverage_seconds": hours * 3600,
+              "source_provenance": {"energy_entity_id": "sensor.hp", "meter_supported_intervals_utc": [{"start": start.isoformat(), "end": end.isoformat()}]}}
+    rows = []
+    for i in range(hours):
+        a, b = start + timedelta(hours=i), start + timedelta(hours=i+1)
+        allocation = {"meter_kwh": 1, "quality": "good", "source_provenance": {"energy_entity_id": "sensor.hp", "meter_coverage_seconds": 3600}}
+        rows.append({"local_date": day, "kind": "hourly", "start_utc": a.isoformat(), "end_utc": b.isoformat(), "payload_json": json.dumps({"allocations": {"hp": allocation}})})
+    run = lambda rec, records=rows: recovery_interval_diagnostics({"records": [rec]}, [(day, "equipment.hp")], records, "Europe/Ljubljana")[0]
+    result = run(record)
+    assert result["overlap_seconds"] == hours * 3600 and result["nonoverlap_seconds"] == 0
+    assert result["authoritative_kwh"] == hours and result["unknown_seconds"] == 0
+    unknown = run({**record, "source_provenance": {"energy_entity_id": "sensor.hp"}})
+    assert unknown["overlap_seconds"] is None and unknown["unknown_seconds"] == hours * 3600
+
+
+def test_interval_diagnostics_partial_disjoint_duplicates_and_daily_unknown():
+    from custom_components.home_energy_intelligence.electricity_recovery import recovery_interval_diagnostics
+    day = "2026-10-25"
+    start, end = local_day_bounds(date.fromisoformat(day), "Europe/Ljubljana")
+    half = start + timedelta(minutes=30)
+    hour = start + timedelta(hours=1)
+    record = {**evidence(day), "meter_coverage_seconds": 1800, "source_provenance": {"energy_entity_id": "sensor.hp", "meter_supported_intervals_utc": [{"start": half.isoformat(), "end": hour.isoformat()}]}}
+    allocation = {"meter_kwh": 2, "quality": "good", "source_provenance": {"energy_entity_id": "sensor.hp", "meter_coverage_seconds": 3600}}
+    row = {"local_date": day, "kind": "hourly", "start_utc": start.isoformat(), "end_utc": hour.isoformat(), "payload_json": json.dumps({"allocations": {"hp": allocation}})}
+    def run(rec, rows):
+        return recovery_interval_diagnostics({"records": [rec]}, [(day, "equipment.hp")], rows, "Europe/Ljubljana")[0]
+    overlap = run(record, [row])
+    assert overlap["overlap_seconds"] == 1800 and overlap["nonoverlap_seconds"] == 0
+    disjoint = {**record, "source_provenance": {**record["source_provenance"], "meter_supported_intervals_utc": [{"start": hour.isoformat(), "end": (hour + timedelta(minutes=30)).isoformat()}]}}
+    assert run(disjoint, [row])["nonoverlap_seconds"] == 1800
+    assert run(record, [row, row])["authoritative_kwh"] is None
+    duplicate = recovery_interval_diagnostics({"records": [record, record]}, [(day, "equipment.hp")], [row], "Europe/Ljubljana")
+    assert len(duplicate) == 1 and duplicate[0]["reason"] == "ambiguous_evidence"
+    assert duplicate[0]["recovered_kwh"] is None and duplicate[0]["overlap_seconds"] is None
+    daily = {**row, "kind": "daily", "end_utc": end.isoformat()}
+    assert run(record, [daily])["overlap_seconds"] is None
+
+
+def test_interval_rows_are_read_only_and_restricted_to_blocked_dates(tmp_path):
+    db = EnergyDatabase(tmp_path / "energy.sqlite3")
+    db.initialize()
+    start, _ = local_day_bounds(date(2026, 10, 25), "Europe/Ljubljana")
+    payload = {"period_start_utc": start.isoformat(), "period_end_utc": (start + timedelta(hours=1)).isoformat(),
+               "local_date": "2026-10-25", "timezone": "Europe/Ljubljana", "quality": "good",
+               "allocations": {"hp": {"meter_kwh": 1}}}
+    db.upsert_hourly(payload)
+    with db.connect() as connection:
+        before = [tuple(row) for row in connection.execute("SELECT * FROM hourly_records")]
+    assert db.electricity_authoritative_interval_rows("2026-10-01", "2026-10-31", ["2026-10-24"]) == []
+    assert len(db.electricity_authoritative_interval_rows("2026-10-01", "2026-10-31", ["2026-10-25"])) == 1
+    with db.connect() as connection:
+        assert [tuple(row) for row in connection.execute("SELECT * FROM hourly_records")] == before
 
 
 def test_recovered_exclusion_diagnostics_preserve_identity_and_dst():
