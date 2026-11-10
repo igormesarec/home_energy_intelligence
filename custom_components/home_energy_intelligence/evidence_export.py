@@ -13,6 +13,7 @@ from .timeutils import local_day_bounds
 
 MAX_OBSERVATIONS = 10000
 MAX_BYTES = 2_000_000
+MAX_TRACE_BYTES = 8_000_000
 PROVENANCE_FIELDS = ("energy_entity_id", "state_entity_id", "fallback_entity", "historical_mode_source", "meter_coverage_seconds", "meter_expected_seconds", "meter_evidence_status", "first_observation_utc", "last_observation_utc", "missing_intervals", "conflicting_timestamps_utc", "boundary_policy", "strict_influx_identity", "historical_mapping_quality", "mapping_attested")
 RECORD_FIELDS = ("local_date", "source_key", "source_entity_id", "interval_start_utc", "interval_end_utc", "meter_kwh", "categories", "residual_kwh", "meter_coverage_seconds", "classification_coverage_seconds", "quality", "reset_count", "rejected_count", "counter_source", "verification_status", "historical_mapping_quality", "calculation_version")
 
@@ -137,3 +138,62 @@ async def build_evidence_export(hass, coordinator, start, end, equipment_id, sta
     if len(serialized.encode("utf-8")) > MAX_BYTES:
         raise ValueError("Output size limit exceeded; select a shorter range")
     return serialized
+
+
+async def build_increment_trace_export(hass, coordinator, dates, equipment_id, state_entity):
+    """Run the existing strict preview for up to four dates without persisting it."""
+    if not dates or len(dates) > 4 or len(set(dates)) != len(dates):
+        raise ValueError("Select one to four distinct local dates")
+    devices = [item for item in equipment_from_config(coordinator.config)
+               if item.enabled and item.kind == "heat_pump" and item.equipment_id == equipment_id]
+    if len(devices) != 1 or not devices[0].energy_entity or devices[0].state_entity != state_entity:
+        raise ValueError("Select a heat pump with matching configured energy and operating-state entities")
+    days = []
+    for day in sorted(dates):
+        preview = await coordinator.async_preview_historical_energy(day, evidence_only=True, diagnostic_device=equipment_id)
+        raw = json.loads(await build_evidence_export(hass, coordinator, day, day, equipment_id, state_entity))
+        allocation = preview.get("allocations", {}).get(equipment_id)
+        diagnostic = preview.get("increment_diagnostic", {})
+        begin, _ = local_day_bounds(day, coordinator.timezone)
+        lookback = begin - timedelta(seconds=float(diagnostic.get("freshness_seconds", 3600)))
+        boundary = {"recorder": None, "influx": None, "lookback_start_utc": lookback.isoformat()}
+        try:
+            preceding = await coordinator.reader.async_history([state_entity], lookback, begin)
+            candidates = [item for item in preceding.get(state_entity, []) if item.last_updated.tzinfo is not None and lookback <= item.last_updated < begin]
+            if len(candidates) > MAX_OBSERVATIONS:
+                raise EvidenceExportLimit("Boundary observation limit exceeded")
+            if candidates:
+                item = max(candidates, key=lambda state: state.last_updated)
+                boundary["recorder"] = {"timestamp": item.last_updated.isoformat(), "state": str(item.state)}
+        except EvidenceExportLimit:
+            raise
+        except Exception as error:
+            boundary["recorder_error"] = type(error).__name__
+        cfg = coordinator.config
+        if cfg.get(CONF_INFLUX_ENABLED) and cfg.get(CONF_INFLUX_HOST) and cfg.get(CONF_INFLUX_DATABASE):
+            try:
+                client = InfluxBackfillClient(host=cfg[CONF_INFLUX_HOST], port=int(cfg.get(CONF_INFLUX_PORT, 8086)), database=cfg[CONF_INFLUX_DATABASE], username=cfg.get(CONF_INFLUX_USERNAME), password=cfg.get(CONF_INFLUX_PASSWORD), use_ssl=bool(cfg.get("influx_use_ssl", False)), verify_ssl=bool(cfg.get("influx_verify_ssl", True)), retention_policy=str(cfg.get("influx_retention_policy", "autogen")))
+                observations = await hass.async_add_executor_job(partial(client.diagnostic_states_ns, lookback, begin, entity_id=state_entity, limit=MAX_OBSERVATIONS))
+                if observations:
+                    stamp = max(item[0] for item in observations)
+                    boundary["influx"] = [{"timestamp_ns": str(t), "state": value} for t, value in observations if t == stamp]
+            except Exception as error:
+                if "limit" in str(error).lower():
+                    raise EvidenceExportLimit("Boundary observation limit exceeded") from error
+                boundary["influx_error"] = type(error).__name__
+        else:
+            boundary["influx_error"] = "not_configured"
+        if len(diagnostic.get("trace", [])) + len(diagnostic.get("counter_observations", [])) > MAX_OBSERVATIONS:
+            raise EvidenceExportLimit("Diagnostic observation limit exceeded; select fewer dates")
+        days.append({"local_date": day.isoformat(), "diagnostic": diagnostic,
+                     "allocation": {key: allocation.get(key) for key in ("meter_kwh", "categories", "residual_kwh", "classification_coverage_seconds", "classification_expected_seconds", "reset_count", "rejected_count", "quality", "authoritative_counter_source")} if allocation else None,
+                     "state_evidence": {key: raw.get(key) for key in ("recorder_observations", "influx_observations", "influx_status", "errors", "limitations")},
+                     "preceding_state_evidence": boundary,
+                     "preview_errors": [{"source": error.get("source"), "error": error.get("error")} for error in preview.get("errors", []) if str(error.get("source", "")).startswith(f"equipment.{equipment_id}.")]})
+    output = json.dumps({"timezone": coordinator.timezone, "equipment_id": equipment_id,
+                         "energy_entity": devices[0].energy_entity, "state_entity": state_entity,
+                         "evidence_only": True, "mapping_quality": "unverified historical mapping",
+                         "days": days}, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(output.encode("utf-8")) > MAX_TRACE_BYTES:
+        raise EvidenceExportLimit("Diagnostic output size limit exceeded; select fewer dates")
+    return output

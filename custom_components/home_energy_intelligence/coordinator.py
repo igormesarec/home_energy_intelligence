@@ -176,7 +176,8 @@ class HomeEnergyCoordinator:
         }
 
     async def async_preview_historical_energy(self, day: date, *, attest_current_mapping: bool = False,
-                                              evidence_only: bool = False) -> dict[str, object]:
+                                              evidence_only: bool = False,
+                                              diagnostic_device: str | None = None) -> dict[str, object]:
         """Read-only single-day preview; no database mutations or automatic execution.
 
         The WebSocket entry point requires administrator access. Evidence-only
@@ -389,9 +390,11 @@ class HomeEnergyCoordinator:
                                       "boundary_policy": "observed_whole_increments_only"})
             if coverage_seconds < (end-start).total_seconds():
                 errors.append({"source": base + ".energy", "error": "counter_coverage_incomplete"})
+        diagnostic_traces = {diagnostic_device: []} if diagnostic_device is not None else None
         report = DailyAggregator(self.timezone, strict_historical=True,
                                  maximum_counter_delta_kwh=float(self.config.get("counter_jump_limit_kwh", 500)),
-                                 assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate"))).aggregate_range(day, start, end, source)
+                                 assumed_heating_reporting=str(self.config.get("assumed_heating_reporting", "separate")),
+                                 historical_trace=diagnostic_traces).aggregate_range(day, start, end, source)
         site = {}
         for key in ("pv", "import", "export"):
             site_entity = self._site_sources().get(key) if hasattr(self, "_site_sources") else None
@@ -416,10 +419,19 @@ class HomeEnergyCoordinator:
                                     "complete" if observed.covered_seconds >= observed.period_seconds and not observed.rejected_count and not observed.reset_count
                                     else "partial_known_subtotal"),
                          "source": source.provenance.get("counter_collection", {}).get(f"site.{key}", "unavailable")}
-        return {"local_date": day.isoformat(), "preview": True, "evidence_only": evidence_only,
+        result = {"local_date": day.isoformat(), "preview": True, "evidence_only": evidence_only,
                 "historical_mapping_quality": "unverified historical mapping" if evidence_only else "normal",
                 "allocations": report.allocations, "site": site,
                 "errors": errors, "provenance": source.provenance}
+        if diagnostic_traces is not None:
+            history = source.devices.get(diagnostic_device)
+            result["increment_diagnostic"] = {"trace": diagnostic_traces[diagnostic_device],
+                "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
+                "counter_observations": [{"timestamp": s.timestamp.isoformat(), "value_kwh": s.value if s.value is not None and isfinite(s.value) else None, "source": s.source, "reason": s.reason} for s in history.counter] if history else [],
+                "mode_transitions": [{"timestamp": s.timestamp.isoformat(), "state": s.state, "source": s.attributes.get("source")} for s in history.mode] if history else [],
+                "freshness_seconds": freshness.total_seconds(),
+                "note": "Mode timestamps are normalized decision boundaries, not necessarily original observation timestamps; state observation age is unavailable."}
+        return result
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):
         explicit = list(temperatures_from_config(self.config))

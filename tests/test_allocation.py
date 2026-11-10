@@ -4,10 +4,54 @@ import pytest
 
 from custom_components.home_energy_intelligence.allocation import ac_category, allocate_interval, configurable_classifier, counter_delta, ecodan_category
 from custom_components.home_energy_intelligence.models import NumericSample, StateSample
+from custom_components.home_energy_intelligence.allocation import allocate_historical_counter_increments
+from custom_components.home_energy_intelligence.timeutils import local_day_bounds
+from datetime import date
 
 
 START = datetime(2026, 10, 25, tzinfo=UTC)
 END = START + timedelta(hours=6)
+
+
+@pytest.mark.parametrize('day,hours', [(date(2026, 3, 29), 23), (date(2026, 10, 25), 25)])
+def test_historical_trace_preserves_whole_range_allocation_and_dst(day, hours):
+    start, end = local_day_bounds(day, 'Europe/Ljubljana')
+    counters = [NumericSample(start + timedelta(hours=i), float(i)) for i in range(hours+1)]
+    modes = [StateSample(start, 'heating'), StateSample(start + timedelta(hours=2, minutes=30), 'dhw')]
+    kwargs = dict(start=start, end=end, counter_samples=counters, mode_samples=modes,
+                  classifier=lambda sample: sample.state)
+    original = allocate_historical_counter_increments(**kwargs)
+    trace = []
+    traced = allocate_historical_counter_increments(**kwargs, trace=trace)
+    assert traced == original and traced.period_seconds == hours * 3600
+    assert sum(item['delta_kwh'] for item in trace if item['status'] == 'accepted') == pytest.approx(traced.meter_kwh)
+    assert sum(traced.allocations_kwh.values()) == pytest.approx(traced.meter_kwh)
+    assert any(item.get('reason') == 'unsupported_transition' and item.get('category') == 'unknown' for item in trace)
+
+
+def test_historical_trace_preserves_reset_and_gap_rejections():
+    start = START
+    counters = [NumericSample(start, 100), NumericSample(start+timedelta(minutes=10), 0),
+                NumericSample(start+timedelta(minutes=20), 100.1), NumericSample(start+timedelta(hours=3), 101)]
+    kwargs = dict(start=start, end=start+timedelta(hours=4), counter_samples=counters,
+                  mode_samples=[], classifier=lambda s:s.state)
+    trace = []
+    assert allocate_historical_counter_increments(**kwargs, trace=trace) == allocate_historical_counter_increments(**kwargs)
+    assert [item['reason'] for item in trace] == ['transient_reset_sequence', 'transient_reset_sequence', 'counter_gap_or_nonpositive_duration']
+
+
+def test_historical_trace_power_supported_mixed_mode_reconciles():
+    start = START
+    kwargs = dict(start=start, end=start+timedelta(hours=1),
+                  counter_samples=[NumericSample(start, 10), NumericSample(start+timedelta(hours=1), 11)],
+                  mode_samples=[StateSample(start, 'heating'), StateSample(start+timedelta(minutes=30), 'dhw')],
+                  power_samples=[NumericSample(start, 1000), NumericSample(start+timedelta(minutes=30), 1000), NumericSample(start+timedelta(hours=1), 1000)],
+                  classifier=lambda sample: sample.state)
+    trace = []
+    result = allocate_historical_counter_increments(**kwargs, trace=trace)
+    assert result == allocate_historical_counter_increments(**kwargs)
+    assert trace[0]['reason'] == 'power_supported_transition' and trace[0]['power_supported']
+    assert trace[0]['split_allocations_kwh'] == pytest.approx(result.allocations_kwh)
 
 
 def power_samples(watts=1000):
