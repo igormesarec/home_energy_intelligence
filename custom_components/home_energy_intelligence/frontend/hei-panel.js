@@ -262,11 +262,13 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
       ["mdi:leaf", "Self-Sufficiency", null, "green", "%"],
     ];
     const energy = r.energy || {};
+    const heatingDhwKnown = Number.isFinite(energy.known_space_heating_kwh) && Number.isFinite(energy.known_dhw_kwh)
+      ? energy.known_space_heating_kwh + energy.known_dhw_kwh : null;
     return [
       ["mdi:flash", "Whole-House Electricity", energy.household_kwh, "blue", "kWh", r.known_household_kwh],
       ["mdi:radiator", "Heating Electricity", energy.space_heating_kwh, "red", "kWh", energy.known_space_heating_kwh],
       ["mdi:water", "DHW Electricity", energy.dhw_kwh, "orange", "kWh", energy.known_dhw_kwh],
-      ["mdi:heat-wave", "Heating + DHW", energy.heating_and_dhw_kwh, "orange", "kWh"],
+      ["mdi:heat-wave", "Heating + DHW", energy.heating_and_dhw_kwh, "orange", "kWh", Number.isFinite(heatingDhwKnown) ? heatingDhwKnown : null],
       ["mdi:snowflake", "Cooling Electricity", energy.cooling_kwh, "blue", "kWh", energy.known_cooling_kwh],
       ["mdi:white-balance-sunny", "PV Generation", energy.pv_kwh, "amber", "kWh", r.known_pv_kwh],
       ["mdi:leaf", "Self-Sufficiency", energy.self_sufficiency_percent, "green", "%"],
@@ -683,7 +685,7 @@ class HomeEnergyIntelligencePanel extends HTMLElement {
     <section class="kpis">${this.kpis().map(([icon, label, value, color, unit = "kWh", known]) => {const shown=value??known;return `
       <article class="card kpi"><div class="kpi-icon ${color}"><ha-icon icon="${icon}"></ha-icon></div>
       <div><span>${label}</span><strong>${shown==null?"Unavailable":`${n(shown)} ${unit}`}</strong>
-      ${value==null&&known!=null?`<small><b>Partial known subtotal</b> · complete total unavailable</small>`:shown==null?`<small>Missing or incomplete source evidence</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
+      ${value==null&&known!=null?`<small>${label==="Heating + DHW"?"<b>Partial known subtotal. Complete total unavailable.</b>":"<b>Partial known subtotal</b> · complete total unavailable"}</small>`:shown==null?`<small>Missing or incomplete source evidence</small>`:""}${isToday&&shown!=null&&(selected?.energy?.provisional||value==null)?`<small><b>Known/provisional through cutoff</b> · ${esc(this.overviewData?.cutoff_local || "latest completed hour")} ${esc(this.overviewData?.timezone || "")}</small>`:""}<small>${isToday?this.comparisonText(value, metric(label, comparison), metric(label, full), unit):`Selected period · ${esc(this.selectedPeriod?.start_date || "—")}–${esc(this.selectedPeriod?.end_date || "—")}`}</small></div></article>`;}).join("")}</section>
     <section class="grid top-grid">
       <article class="card wide"><h2><ha-icon icon="mdi:home-thermometer-outline"></ha-icon>Heating Energy vs Outdoor Temperature</h2>${this.scatterChart()}${this.recoveredHeatingChart()}</article>
       <article class="card"><h2><ha-icon icon="mdi:chart-box-outline"></ha-icon>Daily Energy Split</h2>${this.splitChart()}</article>

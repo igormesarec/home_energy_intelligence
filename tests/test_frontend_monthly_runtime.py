@@ -48,6 +48,23 @@ process.stdout.write(JSON.stringify({sent,clicked,selected:panel.monthlyMetricId
     assert "CSV export failed: &lt;denied&gt;" in result["error"]
 
 
+def test_overview_heating_dhw_partial_subtotal_requires_finite_supported_values():
+    output = run_panel(r"""
+const cases=[{known_space_heating_kwh:1.24,known_dhw_kwh:2.24},{known_space_heating_kwh:1,known_dhw_kwh:null},{known_space_heating_kwh:null,known_dhw_kwh:null},{known_space_heating_kwh:0,known_dhw_kwh:0},{known_space_heating_kwh:1,known_dhw_kwh:2,heating_and_dhw_kwh:9},{known_space_heating_kwh:Infinity,known_dhw_kwh:2}];
+panel.historyPreset='today';panel.overviewData={};panel.equipment=[];panel.temperatureSources=[];panel.history=[];panel.historyCoverage={};panel.v02Report={};
+const results=cases.map(energy=>{panel.historySummary={energy};const item=panel.kpis().find(k=>k[1]==='Heating + DHW');const card=panel.overview().split('<article class="card kpi">').find(x=>x.includes('<span>Heating + DHW</span>'));return {value:item[2],known:item[5],card};});process.stdout.write(JSON.stringify(results));
+""", {})
+    result = json.loads(output)
+    assert result[0]['known'] == pytest.approx(3.48) and '3.5 kWh' in result[0]['card']
+    assert 'Partial known subtotal. Complete total unavailable.' in result[0]['card']
+    assert result[1]['known'] is None and 'Unavailable' in result[1]['card']
+    assert result[2]['known'] is None and 'Unavailable' in result[2]['card']
+    assert result[3]['known'] == 0 and '0.0 kWh' in result[3]['card']
+    assert result[4]['value'] == 9 and '9.0 kWh' in result[4]['card']
+    assert 'Partial known subtotal. Complete total unavailable.' not in result[4]['card']
+    assert result[5]['known'] is None and 'Unavailable' in result[5]['card']
+
+
 def test_recovered_chart_shows_provisional_source_without_regression():
     output = run_panel(r"""
 panel.overviewData={floor_area_m2:170};panel.v02Report={recovered_heating:{points:[{local_date:'2026-09-28',equipment_id:'ac',display_name:'AC',source_entity_id:'sensor.ac',heating_kwh:1.7,outdoor_mean_c:8,outdoor_coverage_percent:99,meter_coverage_seconds:86400,day_seconds:86400,categories:{heating_selected:1.7}}],excluded:[{local_date:'2026-09-25',source_key:'equipment.hp',reason:'commissioning_date_unknown'}]}};
