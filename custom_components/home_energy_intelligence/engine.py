@@ -49,7 +49,8 @@ class DailyAggregator:
                  maximum_power_gap: timedelta = timedelta(minutes=30),
                  maximum_counter_delta_kwh: float = 500.0,
                  assumed_heating_reporting: str = "separate",
-                 strict_historical: bool = False) -> None:
+                 strict_historical: bool = False,
+                 historical_trace: dict[str, list[dict]] | None = None) -> None:
         self.timezone = timezone
         self.cycle_hours = cycle_hours
         self.temperature_freshness = temperature_freshness
@@ -58,6 +59,7 @@ class DailyAggregator:
         self.maximum_counter_delta_kwh = maximum_counter_delta_kwh
         self.assumed_heating_reporting = assumed_heating_reporting
         self.strict_historical = strict_historical
+        self.historical_trace = historical_trace
 
     def aggregate(self, day: date, source: DailyInput) -> DailyRecord:
         start, end = local_day_bounds(day, self.timezone)
@@ -120,6 +122,7 @@ class DailyAggregator:
                         counter_samples=history.counter, classifier=classifier,
                         power_samples=history.power,
                         maximum_delta_kwh=self.maximum_counter_delta_kwh,
+                        trace=self.historical_trace.get(device) if self.historical_trace is not None else None,
                     ) if self.strict_historical else allocate_interval(
                         start=interval_start,
                         end=interval_end,

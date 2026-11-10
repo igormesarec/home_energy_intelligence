@@ -210,6 +210,15 @@ panel.shadowRoot={querySelector:s=>({' .unused':null,'.evidence-export-equipment
     assert 'invalid_export' in result['error'] and 'bad range' in result['error']
 
 
+def test_october_increment_trace_download_uses_four_selected_dates():
+    output = run_panel(r"""
+(async()=>{panel.shadowRoot={querySelector:s=>({'.evidence-export-equipment':{value:'hp'},'.evidence-export-entity':{value:'sensor.operation'},'.evidence-export-start':{value:'2026-10-01'},'.evidence-export-end':{value:'2026-10-31'}}[s])};panel.render=()=>{};let request;global.document={createElement:()=>({click:()=>{}})};global.URL={createObjectURL:()=>'',revokeObjectURL:()=>{}};panel._hass={callWS:async msg=>(request=msg,{json:'{}',filename:'trace.json'})};await panel.downloadEcodanEvidence(true);process.stdout.write(JSON.stringify(request));})();
+""", {})
+    request = json.loads(output)
+    assert request['type'] == 'home_energy_intelligence/ecodan_increment_trace_export'
+    assert request['dates'] == ['2026-10-22', '2026-10-26', '2026-10-27', '2026-10-29']
+
+
 def test_recovered_monthly_table_separates_sources_categories_and_scope():
     output = run_panel(r"""
 panel.equipment=[{equipment_id:'hp',display_name:'Heat pump'}];

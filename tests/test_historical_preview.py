@@ -10,6 +10,19 @@ from custom_components.home_energy_intelligence.engine import DailyInput, Device
 from custom_components.home_energy_intelligence.models import NumericSample, StateSample
 
 
+@pytest.mark.asyncio
+async def test_historical_preview_diagnostic_trace_does_not_change_allocations():
+    day = date(2026, 10, 25)
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    def source():
+        return DailyInput(devices={"hp": DeviceHistory(kind="heat_pump", counter=[NumericSample(start, 1), NumericSample(start + timedelta(hours=1), 2)], mode=[StateSample(start, "heat")])}, site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={"effective_at": "2026-01-01T00:00:00+00:00"}, config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "state_entity": "sensor.operation", "state_map": {"heat": "confirmed_heating"}}]}, _async_collect_range=AsyncMock(side_effect=lambda *args, **kwargs: source()))
+    plain = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True)
+    traced = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True, diagnostic_device="hp")
+    assert plain["allocations"] == traced["allocations"]
+    assert sum(item["delta_kwh"] for item in traced["increment_diagnostic"]["trace"] if item["status"] == "accepted") == traced["allocations"]["hp"]["meter_kwh"]
+
+
 def test_historical_preview_requires_administrator():
     from homeassistant.exceptions import Unauthorized
     from custom_components.home_energy_intelligence.websocket import ws_historical_energy_preview

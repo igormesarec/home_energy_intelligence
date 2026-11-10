@@ -256,7 +256,8 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                                            classifier: Callable[[StateSample], str],
                                            power_samples: list[NumericSample] | None = None,
                                            maximum_gap: timedelta = timedelta(hours=1),
-                                           maximum_delta_kwh: float = 500.0) -> AllocationResult:
+                                           maximum_delta_kwh: float = 500.0,
+                                           trace: list[dict] | None = None) -> AllocationResult:
     """Allocate whole observed increments only; never interpolate across a boundary."""
     samples, conflicts = historical_counter_observations(
         [item for item in counter_samples if start <= item.timestamp <= end])
@@ -268,6 +269,9 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
     measured = covered = 0.0
     accepted = resets = 0
     rejected = len(conflicts)
+    if trace is not None:
+        for stamp in conflicts:
+            trace.append({"status": "rejected", "timestamp": stamp.isoformat(), "reason": "conflicting_counter_timestamp"})
     suppressed: set[int] = set()
     for index, (left, right) in enumerate(zip(samples, samples[1:])):
         if valid_value(left) and valid_value(right) and right.value < left.value:
@@ -281,28 +285,40 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                     break
     for pair_index, (left, right) in enumerate(zip(samples, samples[1:])):
         duration = right.timestamp-left.timestamp
+        entry = {"start": left.timestamp.isoformat(), "end": right.timestamp.isoformat(),
+                 "delta_kwh": right.value-left.value if valid_value(left) and valid_value(right) else None} if trace is not None else None
+        def rejected_trace(reason):
+            if trace is not None:
+                trace.append({**entry, "status": "rejected", "reason": reason})
         if not valid_value(left) or not valid_value(right):
             rejected += 1
+            rejected_trace("invalid_or_conflicting_counter")
             continue
         delta = right.value-left.value
         if pair_index in suppressed:
             resets += int(delta < 0)
             rejected += 1
+            rejected_trace("transient_reset_sequence")
             continue
         if duration <= timedelta(0) or duration > maximum_gap:
             rejected += 1
+            rejected_trace("counter_gap_or_nonpositive_duration")
             continue
         if delta < 0:
             resets += 1
+            rejected_trace("counter_reset")
             continue
         if delta > maximum_delta_kwh:
             rejected += 1
+            rejected_trace("counter_jump_limit")
             continue
         index = bisect_right(mode_times, left.timestamp)
         state = modes[index-1] if index else None
         category = classifier(state) if state else "unknown"
         changes = [classifier(item) for item in modes[index:bisect_left(mode_times, right.timestamp)]]
-        if any(item != category for item in changes):
+        transition = any(item != category for item in changes)
+        split_allocations = None
+        if transition:
             refined = allocate_interval(start=left.timestamp, end=right.timestamp,
                 mode_samples=modes, power_samples=power_samples or [], counter_samples=[left, right],
                 classifier=classifier, maximum_counter_delta_kwh=maximum_delta_kwh)
@@ -316,6 +332,7 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
                 for name, amount in refined.allocations_kwh.items():
                     key = name + "_power_estimate"
                     allocations[key] = allocations.get(key, 0.0) + amount
+                split_allocations = {name + "_power_estimate": amount for name, amount in refined.allocations_kwh.items()}
                 category = "power_estimate"
             else:
                 category = "unknown"
@@ -324,6 +341,16 @@ def allocate_historical_counter_increments(*, start: datetime, end: datetime,
         measured += delta
         if category != "unknown":
             covered += duration.total_seconds()
+        if trace is not None:
+            trace.append({**entry, "status": "accepted", "category": category,
+                          "reason": ("power_supported_transition" if split_allocations is not None else
+                                     "unsupported_transition" if transition else
+                                     "no_mode_evidence" if state is None else
+                                     "unknown_mode" if category == "unknown" else "mode_classification"),
+                          "mode_transition": transition, "power_supported": split_allocations is not None,
+                          "split_allocations_kwh": split_allocations,
+                          "state": None if state is None else {"timestamp": state.timestamp.isoformat(), "value": state.state,
+                              "source": state.attributes.get("source"), "timestamp_basis": "normalized_mode_transition_not_observation"}})
         accepted += 1
     period = elapsed_seconds(start, end)
     quality = "missing_counter" if not accepted else "partial" if covered < period or resets or rejected else "uncertain" if any(key in allocations or any(k.endswith("_power_estimate") for k in allocations) for key in ("unknown", "heating_assumed", "heating_selected", "cooling_selected")) else "good"

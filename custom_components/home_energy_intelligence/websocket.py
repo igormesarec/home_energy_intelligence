@@ -31,7 +31,7 @@ from .configuration import (
 )
 from .const import DOMAIN
 from .electricity_recovery import prepare_recovery_day, summarize_provisional_evidence, add_recovered_presentation_metrics, recovered_heating_points, recovery_interval_diagnostics
-from .evidence_export import build_evidence_export
+from .evidence_export import build_evidence_export, build_increment_trace_export
 from .monthly import (
     build_rolling_month_report,
     monthly_metric_catalog,
@@ -67,6 +67,7 @@ def async_register_websocket(hass) -> None:
     websocket_api.async_register_command(hass, ws_temperature_backfill_cancel)
     websocket_api.async_register_command(hass, ws_historical_energy_preview)
     websocket_api.async_register_command(hass, ws_ecodan_evidence_export)
+    websocket_api.async_register_command(hass, ws_ecodan_increment_trace_export)
     websocket_api.async_register_command(hass, ws_electricity_recovery_start)
     websocket_api.async_register_command(hass, ws_electricity_recovery_status)
     websocket_api.async_register_command(hass, ws_electricity_recovery_cancel)
@@ -1229,6 +1230,32 @@ async def _start_temperature_backfill(hass, connection, msg, *, dry_run: bool):
         connection.send_error(msg["id"], "invalid_range", str(error))
         return
     connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{DOMAIN}/ecodan_increment_trace_export",
+    vol.Required("dates"): vol.All([str], vol.Length(min=1, max=4)),
+    vol.Required("equipment_id"): str, vol.Required("state_entity"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_ecodan_increment_trace_export(hass, connection, msg):
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", "Integration is not configured")
+        return
+    try:
+        dates = [date.fromisoformat(value) for value in msg["dates"]]
+        if any(value.isoformat() != raw for value, raw in zip(dates, msg["dates"], strict=True)):
+            raise ValueError("Dates must use YYYY-MM-DD")
+        content = await build_increment_trace_export(hass, coordinator, dates, msg["equipment_id"], msg["state_entity"])
+    except ValueError as error:
+        connection.send_error(msg["id"], "invalid_export", str(error))
+        return
+    except Exception:
+        connection.send_error(msg["id"], "export_failed", "Trace export failed; check the selected sources")
+        return
+    connection.send_result(msg["id"], {"filename": "hei-ecodan-increment-trace.json", "json": content})
 
 
 @websocket_api.websocket_command({

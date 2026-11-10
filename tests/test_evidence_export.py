@@ -64,6 +64,29 @@ def test_export_command_requires_admin():
         ws_ecodan_evidence_export(None, SimpleNamespace(user=SimpleNamespace(is_admin=False)), {"id": 1})
 
 
+def test_increment_trace_export_requires_admin():
+    from homeassistant.exceptions import Unauthorized
+    from custom_components.home_energy_intelligence.websocket import ws_ecodan_increment_trace_export
+    with pytest.raises(Unauthorized):
+        ws_ecodan_increment_trace_export(None, SimpleNamespace(user=SimpleNamespace(is_admin=False)), {"id": 1})
+
+
+@pytest.mark.asyncio
+async def test_increment_trace_export_is_bounded_and_read_only(monkeypatch):
+    from custom_components.home_energy_intelligence import evidence_export as module
+    dates = [date(2026, 10, day) for day in (22, 26, 27, 29)]
+    preview = {"allocations": {"hp": {"meter_kwh": 1, "categories": {"unknown": 1}}}, "increment_diagnostic": {"trace": [{"status": "accepted", "delta_kwh": 1, "category": "unknown"}], "counter_observations": []}, "errors": []}
+    coordinator = SimpleNamespace(timezone="Europe/Ljubljana", config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.meter", "state_entity": "sensor.operation"}]}, async_preview_historical_energy=AsyncMock(return_value=preview))
+    monkeypatch.setattr(module, 'build_evidence_export', AsyncMock(return_value=json.dumps({"recorder_observations": [], "influx_status": "not configured"})))
+    result = json.loads(await module.build_increment_trace_export(None, coordinator, dates, "hp", "sensor.operation"))
+    assert [item['local_date'] for item in result['days']] == [item.isoformat() for item in dates]
+    assert result['mapping_quality'] == 'unverified historical mapping'
+    assert coordinator.async_preview_historical_energy.await_count == 4
+    assert all(call.kwargs == {'evidence_only': True, 'diagnostic_device': 'hp'} for call in coordinator.async_preview_historical_energy.await_args_list)
+    with pytest.raises(ValueError, match='one to four'):
+        await module.build_increment_trace_export(None, coordinator, dates + dates[:1], 'hp', 'sensor.operation')
+
+
 @pytest.mark.asyncio
 async def test_export_command_admin_receives_json(monkeypatch):
     import inspect
