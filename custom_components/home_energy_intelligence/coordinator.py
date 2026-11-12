@@ -34,6 +34,7 @@ from .engine import DailyAggregator, DailyInput, DeviceHistory
 from .influx import InfluxBackfillClient
 from .models import NumericSample, StateSample
 from .historical_modes import explain_historical_mode, historical_heat_pump_modes, historical_selected_modes
+from .historical_simulation import simulate_modes
 from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
@@ -293,6 +294,29 @@ class HomeEnergyCoordinator:
                         "fallback": {"entity_id": fallback_entity or (item.state_entity if not primary and fallback else None), "samples": fallback},
                     }
                     diagnostic_state_map = item.state_map
+                    diagnostic_fallback = fallback
+                    diagnostic_fallback_status = "existing_selected_stream"
+                    if fallback_entity:
+                        try:
+                            longer = await self.reader.async_history([fallback_entity], start-timedelta(hours=3), end)
+                            recorder_fallback = states_to_modes(longer.get(fallback_entity, []))
+                            if recorder_fallback:
+                                diagnostic_fallback = [sample for sample in recorder_fallback if start-timedelta(hours=3) <= sample.timestamp < end]
+                                diagnostic_fallback_status = "recorder_3h_lookback"
+                            elif influx and isinstance(fallback_config, dict) and fallback_config.get("entity_id") == fallback_entity:
+                                rows = await self.hass.async_add_executor_job(partial(influx.query_states,
+                                    start-timedelta(hours=3), end, entity_id=fallback_entity,
+                                    domain=fallback_entity.split(".", 1)[0], maximum_age=timedelta(hours=3)))
+                                if rows:
+                                    diagnostic_fallback = [StateSample(timestamp, value, {"source": "influx"}) for timestamp, value in rows
+                                                           if start-timedelta(hours=3) <= timestamp < end]
+                                    diagnostic_fallback_status = "influx_3h_lookback"
+                                else:
+                                    diagnostic_fallback_status = "extended_sources_unavailable_existing_stream_used"
+                            else:
+                                diagnostic_fallback_status = "extended_recorder_unavailable_existing_stream_used"
+                        except Exception as error:
+                            diagnostic_fallback_status = "extended_recorder_error_" + type(error).__name__
                 device.mode = historical_heat_pump_modes(start, end, primary=primary, actual_dhw=actual_dhw, fallback=fallback,
                                                          state_map=item.state_map, maximum_age=freshness)
                 device.state_map = {name: name for name in ("confirmed_heating", "dhw", "cooling", "idle", "heating_assumed", "unknown")}
@@ -445,6 +469,15 @@ class HomeEnergyCoordinator:
                     detail = ", ".join(f"{role}:{evidence[role]['reason']}" for role in ("primary", "actual_dhw", "fallback"))
                     key = f"{reason} ({detail})"
                     unknown_summary[key] = unknown_summary.get(key, 0.0) + entry["delta_kwh"]
+            simulations = None
+            if diagnostic_mode_sources is not None and history:
+                simulation_sources = dict(diagnostic_mode_sources)
+                simulation_sources["fallback"] = {**diagnostic_mode_sources["fallback"], "samples": diagnostic_fallback}
+                simulations = simulate_modes(start, end, history, simulation_sources, diagnostic_state_map,
+                    float(self.config.get("counter_jump_limit_kwh", 500)), freshness)
+                # The baseline must use the exact originally selected stream, not the longer diagnostic query.
+                simulations["baseline"] = simulate_modes(start, end, history, diagnostic_mode_sources,
+                    diagnostic_state_map, float(self.config.get("counter_jump_limit_kwh", 500)), freshness)["baseline"]
             result["increment_diagnostic"] = {"trace": diagnostic_traces[diagnostic_device],
                 "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
                 "counter_observations": [{"timestamp": s.timestamp.isoformat(), "value_kwh": s.value if s.value is not None and isfinite(s.value) else None, "source": s.source, "reason": s.reason} for s in history.counter] if history else [],
@@ -455,6 +488,8 @@ class HomeEnergyCoordinator:
                     "source": sample.attributes.get("source", "recorder")} for sample in info["samples"]]
                     for role, info in diagnostic_mode_sources.items()} if diagnostic_mode_sources else {},
                 "unknown_kwh_by_reason": unknown_summary,
+                "scenario_comparison": simulations,
+                "scenario_fallback_evidence_status": diagnostic_fallback_status if diagnostic_mode_sources else "unavailable",
                 "note": "Decision transitions are normalized boundaries; source observations and their ages retain original timestamps. Selected heat is assumed, not confirmed."}
         return result
 
