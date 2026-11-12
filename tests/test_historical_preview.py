@@ -318,3 +318,27 @@ async def test_influx_failure_keeps_recorder_data_and_never_writes(monkeypatch):
     assert report["allocations"]["hp"]["meter_kwh"] == pytest.approx(1)
     assert any(e["error"] == "TimeoutError" for e in report["errors"])
     assert database.mock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_trace_preserves_original_time_and_does_not_write():
+    day = date(2026, 10, 25)
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    def source():
+        return DailyInput(devices={"hp": DeviceHistory(kind="heat_pump",
+            counter=[NumericSample(start, 10), NumericSample(start+timedelta(hours=1), 11)],
+            mode=[StateSample(start-timedelta(minutes=30), "heat")])},
+            site_counters={}, temperatures={}, provenance={"counter_collection": {}})
+    coordinator = SimpleNamespace(timezone="UTC", mapping_revision={},
+        config={"equipment": [{"equipment_id": "hp", "display_name": "HP", "kind": "heat_pump",
+                 "state_entity": "sensor.operation", "state_map": {"heat": "confirmed_heating"}}]},
+        _async_collect_range=AsyncMock(side_effect=lambda *a, **kw: source()))
+    plain = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True)
+    traced = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True, diagnostic_device="hp")
+    assert plain["allocations"] == traced["allocations"]
+    diagnostic = traced["increment_diagnostic"]
+    unknown = next(x for x in diagnostic["trace"] if x.get("category") == "unknown")
+    assert unknown["reason"] == "unsupported_transition"
+    assert unknown["mode_evidence_at_start"]["primary"]["latest_observation"]["age_seconds"] == 1800
+    assert sum(diagnostic["unknown_kwh_by_reason"].values()) == pytest.approx(unknown["delta_kwh"])
+    assert all(call.kwargs["store_mapping_revision"] is False for call in coordinator._async_collect_range.await_args_list)

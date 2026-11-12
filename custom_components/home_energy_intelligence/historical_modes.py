@@ -91,3 +91,43 @@ def historical_selected_modes(start: datetime, end: datetime, samples: list[Stat
         if not result or result[-1].state != category:
             result.append(StateSample(moment, category, {"source": "selected_mode"}))
     return result
+
+
+def explain_historical_mode(moment, streams, state_map, maximum_age):
+    """Explain the existing priority decision using original observation times."""
+    allowed = {"confirmed_heating", "dhw", "cooling", "idle"}
+    mapping = {str(k).lower(): str(v) for k, v in state_map.items() if v in allowed}
+    def supported(role, sample):
+        value = sample.state.lower()
+        return (value in mapping if role == "primary" else
+                value == "heating_water" if role == "actual_dhw" else value == "heat")
+    result = {}
+    selected = None
+    for role in ("primary", "actual_dhw", "fallback"):
+        info = streams[role]
+        observations = sorted((s for s in info["samples"] if s.timestamp.tzinfo and s.timestamp <= moment),
+                              key=lambda s: s.timestamp)
+        latest = observations[-1] if observations else None
+        valid = next((s for s in reversed(observations) if supported(role, s)), None)
+        def describe(sample):
+            return ({"timestamp": sample.timestamp.isoformat(), "state": sample.state,
+                     "source": sample.attributes.get("source", "recorder"),
+                     "age_seconds": (moment - sample.timestamp).total_seconds()} if sample else None)
+        if not info["entity_id"]:
+            reason = "not_configured"
+        elif not latest:
+            reason = "no_observation"
+        elif moment - latest.timestamp >= maximum_age:
+            reason = "expired"
+        elif not supported(role, latest):
+            reason = "unavailable_state" if latest.state.lower() in {"unknown", "unavailable"} else "unsupported_state"
+        elif selected:
+            reason = "lower_priority_than_" + selected
+        else:
+            reason = "selected"
+            selected = role
+        result[role] = {"entity_id": info["entity_id"], "latest_observation": describe(latest),
+                        "most_recent_supported_observation": describe(valid), "reason": reason}
+    result["selected_source"] = selected
+    result["freshness_seconds"] = maximum_age.total_seconds()
+    return result
