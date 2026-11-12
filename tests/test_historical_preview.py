@@ -20,6 +20,7 @@ async def test_historical_preview_diagnostic_trace_does_not_change_allocations()
     plain = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True)
     traced = await HomeEnergyCoordinator.async_preview_historical_energy(coordinator, day, evidence_only=True, diagnostic_device="hp")
     assert plain["allocations"] == traced["allocations"]
+    assert traced["increment_diagnostic"]["scenario_comparison"]["baseline"]["categories_kwh"] == plain["allocations"]["hp"]["categories"]
     assert sum(item["delta_kwh"] for item in traced["increment_diagnostic"]["trace"] if item["status"] == "accepted") == traced["allocations"]["hp"]["meter_kwh"]
 
 
