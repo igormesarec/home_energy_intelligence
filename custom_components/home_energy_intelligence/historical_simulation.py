@@ -16,9 +16,9 @@ def simulate_modes(start, end, history, streams, state_map, maximum_delta, basel
     scenarios = {}
     for name, age, samples, primary_age in (
         ("baseline", baseline_freshness, fallback, baseline_freshness),
-        ("fallback_120m", timedelta(minutes=120), fallback, timedelta(minutes=60)),
-        ("fallback_180m", timedelta(minutes=180), fallback, timedelta(minutes=60)),
-        ("recorder_hvac_action", timedelta(minutes=60), actions, timedelta(minutes=60)),
+        ("fallback_120m", timedelta(minutes=120), fallback, baseline_freshness),
+        ("fallback_180m", timedelta(minutes=180), fallback, baseline_freshness),
+        ("recorder_hvac_action", baseline_freshness, actions, baseline_freshness),
     ):
         modes = historical_heat_pump_modes(start, end, primary=primary, actual_dhw=dhw, fallback=samples,
                                            state_map=state_map, maximum_age=primary_age, fallback_maximum_age=age)

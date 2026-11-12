@@ -42,3 +42,20 @@ def test_mixed_mode_without_power_remains_unknown():
         "actual_dhw": {"samples": []}, "fallback": {"samples": []}}
     result = simulate_modes(start, start+timedelta(hours=1), history, streams, {"dhw": "dhw", "heat": "confirmed_heating"}, 500, timedelta(hours=1))
     assert all(r["unknown_kwh"] == 1 and r["unsupported_transition_kwh"] == 1 for r in result.values())
+
+
+def test_nonstandard_freshness_preserves_primary_priority_in_every_scenario():
+    start = datetime(2026, 10, 9, tzinfo=UTC)
+    history = DeviceHistory(kind="heat_pump", counter=[
+        NumericSample(start + timedelta(minutes=60), 10),
+        NumericSample(start + timedelta(minutes=80), 11)])
+    streams = {"primary": {"samples": [StateSample(start, "dhw")]},
+               "actual_dhw": {"samples": []},
+               "fallback": {"samples": [StateSample(start, "heat", {"hvac_action": "heating"})]}}
+    reports = simulate_modes(start, start + timedelta(minutes=90), history, streams,
+                             {"dhw": "dhw"}, 500, timedelta(minutes=90))
+    assert all(report["dhw_kwh"] == 1 and report["heating_assumed_kwh"] == 0
+               and report["primary_freshness_seconds"] == 5400 for report in reports.values())
+    assert reports["recorder_hvac_action"]["fallback_freshness_seconds"] == 5400
+    assert reports["fallback_120m"]["fallback_freshness_seconds"] == 7200
+    assert reports["fallback_180m"]["fallback_freshness_seconds"] == 10800
