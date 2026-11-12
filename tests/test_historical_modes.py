@@ -58,3 +58,26 @@ def test_ac_modes_preserve_selected_transitions_and_explicit_gaps():
         (timedelta(), "heating_selected"), (timedelta(minutes=30), "cooling_selected"),
         (timedelta(hours=1), "standby"), (timedelta(hours=2), "unknown"),
     ]
+
+
+def test_diagnostic_explains_priority_expiry_and_unavailable_state():
+    from custom_components.home_energy_intelligence.historical_modes import explain_historical_mode
+    start = datetime(2026, 10, 9, tzinfo=UTC)
+    streams = {"primary": {"entity_id": "sensor.primary", "samples": [StateSample(start, "heating_water")]},
+               "actual_dhw": {"entity_id": "sensor.dhw", "samples": [StateSample(start, "heating_water")]},
+               "fallback": {"entity_id": "climate.zone", "samples": [StateSample(start, "heat")]}}
+    mapping = {"heating_water": "dhw"}
+    fresh = explain_historical_mode(start, streams, mapping, timedelta(hours=1))
+    assert fresh["selected_source"] == "primary"
+    assert fresh["actual_dhw"]["reason"] == "lower_priority_than_primary"
+    stale = explain_historical_mode(start + timedelta(hours=1), streams, mapping, timedelta(hours=1))
+    assert stale["selected_source"] is None
+    assert all(stale[role]["reason"] == "expired" for role in streams)
+    assert stale["primary"]["latest_observation"]["age_seconds"] == 3600
+    streams["primary"]["samples"].append(StateSample(start + timedelta(minutes=30), "unavailable"))
+    unavailable = explain_historical_mode(start + timedelta(minutes=45), streams, mapping, timedelta(hours=1))
+    assert unavailable["primary"]["reason"] == "unavailable_state"
+    assert unavailable["primary"]["most_recent_supported_observation"]["timestamp"] == start.isoformat()
+    assert unavailable["selected_source"] == "actual_dhw"
+    streams["fallback"] = {"entity_id": None, "samples": []}
+    assert explain_historical_mode(start, streams, mapping, timedelta(hours=1))["fallback"]["reason"] == "not_configured"

@@ -183,11 +183,26 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
                 boundary["influx_error"] = type(error).__name__
         else:
             boundary["influx_error"] = "not_configured"
-        if len(diagnostic.get("trace", [])) + len(diagnostic.get("counter_observations", [])) > MAX_OBSERVATIONS:
+        # Collect each configured source independently; never merge raw Recorder and Influx evidence.
+        state_sources = {"primary": {"entity_id": state_entity,
+                         "evidence": {key: raw.get(key) for key in ("recorder_observations", "influx_observations", "influx_status", "errors", "limitations")}}}
+        for role in ("fallback", "actual_dhw"):
+            entity = diagnostic.get("mode_source_entities", {}).get(role)
+            if not entity:
+                state_sources[role] = {"entity_id": None, "status": "not_configured_or_not_validated"}
+                continue
+            extra = json.loads(await build_evidence_export(hass, coordinator, day, day, equipment_id, entity))
+            state_sources[role] = {"entity_id": entity, "evidence": {key: extra.get(key) for key in
+                ("recorder_observations", "influx_observations", "influx_status", "errors", "limitations")}}
+        observation_count = sum(len((info.get("evidence") or {}).get(key) or []) for info in state_sources.values()
+                                for key in ("recorder_observations", "influx_observations"))
+        observation_count += sum(len(items) for items in diagnostic.get("selected_source_observations", {}).values())
+        if observation_count + len(diagnostic.get("trace", [])) + len(diagnostic.get("counter_observations", [])) > MAX_OBSERVATIONS:
             raise EvidenceExportLimit("Diagnostic observation limit exceeded; select fewer dates")
         days.append({"local_date": day.isoformat(), "diagnostic": diagnostic,
                      "allocation": {key: allocation.get(key) for key in ("meter_kwh", "categories", "residual_kwh", "classification_coverage_seconds", "classification_expected_seconds", "reset_count", "rejected_count", "quality", "authoritative_counter_source")} if allocation else None,
                      "state_evidence": {key: raw.get(key) for key in ("recorder_observations", "influx_observations", "influx_status", "errors", "limitations")},
+                     "state_sources": state_sources,
                      "preceding_state_evidence": boundary,
                      "preview_errors": [{"source": error.get("source"), "error": error.get("error")} for error in preview.get("errors", []) if str(error.get("source", "")).startswith(f"equipment.{equipment_id}.")]})
     output = json.dumps({"timezone": coordinator.timezone, "equipment_id": equipment_id,

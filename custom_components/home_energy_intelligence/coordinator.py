@@ -33,7 +33,7 @@ from .electricity_recovery import prepare_recovery_day
 from .engine import DailyAggregator, DailyInput, DeviceHistory
 from .influx import InfluxBackfillClient
 from .models import NumericSample, StateSample
-from .historical_modes import historical_heat_pump_modes, historical_selected_modes
+from .historical_modes import explain_historical_mode, historical_heat_pump_modes, historical_selected_modes
 from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
@@ -219,6 +219,7 @@ class HomeEnergyCoordinator:
         if not 1 <= freshness_minutes <= 1440:
             raise ValueError("historical mode freshness must be between 1 and 1440 minutes")
         freshness = timedelta(minutes=freshness_minutes)
+        diagnostic_mode_sources = None
         for item in equipment_from_config(self.config):
             if not item.enabled or item.equipment_id not in source.devices:
                 continue
@@ -285,6 +286,13 @@ class HomeEnergyCoordinator:
                     if not fallback:
                         fallback = primary
                     primary = []
+                if item.equipment_id == diagnostic_device:
+                    diagnostic_mode_sources = {
+                        "primary": {"entity_id": item.state_entity, "samples": primary},
+                        "actual_dhw": {"entity_id": dhw_entity, "samples": actual_dhw},
+                        "fallback": {"entity_id": fallback_entity or (item.state_entity if not primary and fallback else None), "samples": fallback},
+                    }
+                    diagnostic_state_map = item.state_map
                 device.mode = historical_heat_pump_modes(start, end, primary=primary, actual_dhw=actual_dhw, fallback=fallback,
                                                          state_map=item.state_map, maximum_age=freshness)
                 device.state_map = {name: name for name in ("confirmed_heating", "dhw", "cooling", "idle", "heating_assumed", "unknown")}
@@ -425,12 +433,29 @@ class HomeEnergyCoordinator:
                 "errors": errors, "provenance": source.provenance}
         if diagnostic_traces is not None:
             history = source.devices.get(diagnostic_device)
+            unknown_summary = {}
+            if diagnostic_mode_sources is not None:
+                for entry in diagnostic_traces[diagnostic_device]:
+                    if entry.get("status") != "accepted" or entry.get("category") != "unknown":
+                        continue
+                    moment = datetime.fromisoformat(entry["start"])
+                    evidence = explain_historical_mode(moment, diagnostic_mode_sources, diagnostic_state_map, freshness)
+                    entry["mode_evidence_at_start"] = evidence
+                    reason = entry.get("reason", "unknown")
+                    detail = ", ".join(f"{role}:{evidence[role]['reason']}" for role in ("primary", "actual_dhw", "fallback"))
+                    key = f"{reason} ({detail})"
+                    unknown_summary[key] = unknown_summary.get(key, 0.0) + entry["delta_kwh"]
             result["increment_diagnostic"] = {"trace": diagnostic_traces[diagnostic_device],
                 "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
                 "counter_observations": [{"timestamp": s.timestamp.isoformat(), "value_kwh": s.value if s.value is not None and isfinite(s.value) else None, "source": s.source, "reason": s.reason} for s in history.counter] if history else [],
                 "mode_transitions": [{"timestamp": s.timestamp.isoformat(), "state": s.state, "source": s.attributes.get("source")} for s in history.mode] if history else [],
                 "freshness_seconds": freshness.total_seconds(),
-                "note": "Mode timestamps are normalized decision boundaries, not necessarily original observation timestamps; state observation age is unavailable."}
+                "mode_source_entities": {role: info["entity_id"] for role, info in diagnostic_mode_sources.items()} if diagnostic_mode_sources else {},
+                "selected_source_observations": {role: [{"timestamp": sample.timestamp.isoformat(), "state": sample.state,
+                    "source": sample.attributes.get("source", "recorder")} for sample in info["samples"]]
+                    for role, info in diagnostic_mode_sources.items()} if diagnostic_mode_sources else {},
+                "unknown_kwh_by_reason": unknown_summary,
+                "note": "Decision transitions are normalized boundaries; source observations and their ages retain original timestamps. Selected heat is assumed, not confirmed."}
         return result
 
     def _temperature_sources(self, *, include_disabled: bool = False, equipment=None):

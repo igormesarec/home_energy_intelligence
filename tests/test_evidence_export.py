@@ -136,3 +136,21 @@ async def test_export_leaves_actual_sqlite_evidence_unchanged(tmp_path):
     await build_evidence_export(SimpleNamespace(async_add_executor_job=executor), coordinator, date(2026, 10, 25), date(2026, 10, 25), "hp", "sensor.operation")
     with db.connect() as connection:
         assert list(connection.iterdump()) == before
+
+
+@pytest.mark.asyncio
+async def test_increment_export_keeps_configured_sources_separate(monkeypatch):
+    from custom_components.home_energy_intelligence import evidence_export as module
+    diagnostic = {"trace": [], "counter_observations": [], "mode_source_entities": {
+        "primary": "sensor.operation", "fallback": "climate.zone", "actual_dhw": "sensor.dhw"}}
+    coordinator = SimpleNamespace(timezone="Europe/Ljubljana", config={"equipment": [{"equipment_id": "hp",
+        "display_name": "HP", "kind": "heat_pump", "energy_entity": "sensor.meter", "state_entity": "sensor.operation"}]},
+        async_preview_historical_energy=AsyncMock(return_value={"increment_diagnostic": diagnostic, "allocations": {}, "errors": []}))
+    async def raw(hass, coord, start, end, equipment, entity):
+        return json.dumps({"recorder_observations": [{"entity_id": entity}],
+                           "influx_observations": [{"entity_id": entity, "timestamp_ns": "123"}]})
+    monkeypatch.setattr(module, "build_evidence_export", raw)
+    result = json.loads(await module.build_increment_trace_export(None, coordinator, [date(2026, 10, 25)], "hp", "sensor.operation"))
+    sources = result["days"][0]["state_sources"]
+    assert sources["fallback"]["evidence"]["recorder_observations"][0]["entity_id"] == "climate.zone"
+    assert sources["actual_dhw"]["evidence"]["influx_observations"][0]["timestamp_ns"] == "123"
