@@ -207,16 +207,20 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
                      "preview_errors": [{"source": error.get("source"), "error": error.get("error")} for error in preview.get("errors", []) if str(error.get("source", "")).startswith(f"equipment.{equipment_id}.")]})
     # Totals are available only when every selected day produced the corresponding evidence.
     scenario_totals = {}
-    for name in ("baseline", "fallback_120m", "fallback_180m", "recorder_hvac_action"):
+    for name in ("baseline", "supported_continuity", "fallback_120m", "fallback_180m", "recorder_hvac_action"):
         reports = [(day.get("diagnostic", {}).get("scenario_comparison") or {}).get(name) for day in days]
-        fields = ("meter_kwh", "unknown_kwh", "heating_assumed_kwh", "confirmed_heating_kwh", "dhw_kwh", "unsupported_transition_kwh", "covered_seconds", "period_seconds")
+        fields = ("meter_kwh", "unknown_kwh", "heating_assumed_kwh", "confirmed_heating_kwh", "dhw_kwh", "idle_kwh", "unsupported_transition_kwh", "covered_seconds", "period_seconds")
         totals = {field: sum(report[field] for report in reports) if all(report and report.get(field) is not None for report in reports) else None for field in fields}
         totals["classification_coverage_percent"] = (100 * totals["covered_seconds"] / totals["period_seconds"]) if totals["period_seconds"] else None
         totals["reconciles"] = all(report and report.get("reconciles") is True for report in reports) if all(report and report.get("reconciles") is not None for report in reports) else None
         scenario_totals[name] = totals
     for name, report in scenario_totals.items():
         report["difference_from_baseline_kwh"] = {key: report[key] - scenario_totals["baseline"][key] if report[key] is not None and scenario_totals["baseline"][key] is not None else None for key in ("unknown_kwh", "heating_assumed_kwh", "confirmed_heating_kwh", "dhw_kwh", "unsupported_transition_kwh")}
-    output = json.dumps({"scenario_totals": scenario_totals, "timezone": coordinator.timezone, "equipment_id": equipment_id,
+    continuity_totals = {}
+    for key in ("supported_kwh", "plausible_unverified_kwh", "conflicting_or_insufficient_kwh"):
+        reports = [((day.get("diagnostic", {}).get("continuity_analysis") or {}).get("totals") or {}).get(key) for day in days]
+        continuity_totals[key] = sum(reports) if all(value is not None for value in reports) else None
+    output = json.dumps({"continuity_totals": continuity_totals, "scenario_totals": scenario_totals, "timezone": coordinator.timezone, "equipment_id": equipment_id,
                          "energy_entity": devices[0].energy_entity, "state_entity": state_entity,
                          "evidence_only": True, "mapping_quality": "unverified historical mapping",
                          "days": days}, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
