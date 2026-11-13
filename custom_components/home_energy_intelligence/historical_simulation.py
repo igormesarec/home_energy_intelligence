@@ -34,6 +34,7 @@ def simulate_modes(start, end, history, streams, state_map, maximum_delta, basel
             "heating_assumed_kwh": category_total("heating_assumed"),
             "confirmed_heating_kwh": category_total("confirmed_heating"),
             "dhw_kwh": category_total("dhw"),
+            "idle_kwh": category_total("idle"),
             "unsupported_transition_kwh": sum(x["delta_kwh"] for x in trace if x.get("reason") == "unsupported_transition") if result.meter_kwh is not None else None,
             "residual_kwh": result.residual_kwh, "classification_coverage_percent": result.coverage_percent,
             "covered_seconds": result.covered_seconds, "period_seconds": result.period_seconds,
@@ -47,3 +48,88 @@ def simulate_modes(start, end, history, streams, state_map, maximum_delta, basel
             if report[key] is not None and scenarios["baseline"][key] is not None else None
             for key in ("unknown_kwh", "heating_assumed_kwh", "confirmed_heating_kwh", "dhw_kwh", "unsupported_transition_kwh")}
     return scenarios
+
+
+def continuity_candidates(trace, history, streams, state_map, freshness):
+    """Describe unknown increments without asserting an unverified historical mapping."""
+    from bisect import bisect_left, bisect_right
+    from datetime import datetime
+    from math import isfinite
+
+    ordered = {role: sorted((s for s in info["samples"] if s.timestamp.tzinfo), key=lambda s: s.timestamp)
+               for role, info in streams.items()}
+    times = {role: [s.timestamp for s in values] for role, values in ordered.items()}
+    def adjacent(role, start, end):
+        samples, stamps = ordered[role], times[role]
+        previous, following = bisect_right(stamps, start)-1, bisect_left(stamps, end)
+        def show(index):
+            if index < 0 or index >= len(samples):
+                return None
+            sample = samples[index]
+            return {"timestamp_utc": sample.timestamp.isoformat(), "state": sample.state,
+                    "source": sample.attributes.get("source", "recorder"),
+                    "hvac_action": str(sample.attributes["hvac_action"]) if "hvac_action" in sample.attributes else None}
+        return show(previous), show(following)
+    mapping = {str(k).lower(): v for k, v in state_map.items()}
+    results = []
+    totals = {"supported_kwh": 0.0, "plausible_unverified_kwh": 0.0, "conflicting_or_insufficient_kwh": 0.0}
+    for entry in trace:
+        if entry.get("status") != "accepted" or entry.get("category") != "unknown":
+            continue
+        start, end = datetime.fromisoformat(entry["start"]), datetime.fromisoformat(entry["end"])
+        primary_before, primary_after = adjacent("primary", start, end)
+        fallback_before, fallback_after = adjacent("fallback", start, end)
+        dhw_before, dhw_after = adjacent("actual_dhw", start, end)
+        state = primary_before["state"].lower() if primary_before else None
+        category = mapping.get(state) if state else None
+        bracketed = bool(primary_before and primary_after and primary_after["state"].lower() == state
+                         and category in {"confirmed_heating", "dhw", "idle", "cooling"})
+        # A state is evidence only while fresh, and later observations can
+        # introduce an unresolved disagreement within the increment.
+        fallback_times = times["fallback"]
+        first_after_start = bisect_right(fallback_times, start)
+        first_at_end = bisect_left(fallback_times, end)
+        fallback_signals = ordered["fallback"][max(0, first_after_start-1):first_at_end]
+        fallback_signals = [sample for sample in fallback_signals
+                            if sample.timestamp + freshness > start
+                            and sample.attributes.get("hvac_action") is not None]
+        disagreements = []
+        for sample in fallback_signals:
+            action = str(sample.attributes["hvac_action"]).lower()
+            if ((category == "confirmed_heating" and action == "idle") or
+                (category in {"idle", "dhw"} and action == "heating")):
+                disagreements.append({"timestamp_utc": sample.timestamp.isoformat(),
+                    "hvac_action": action, "primary_category": category,
+                    "source": sample.attributes.get("source", "recorder"),
+                    "interpretation": "potential disagreement; climate action may differ during DHW"})
+        fallback_conflict = bool(disagreements)
+        dhw_conflict = bool(dhw_before and dhw_before["state"].lower() == "heating_water"
+                            and datetime.fromisoformat(dhw_before["timestamp_utc"]) + freshness > start
+                            and category in {"confirmed_heating", "idle", "cooling"})
+        primary_interruption = any(sample.state.lower() != state for sample in ordered["primary"]
+                                   if start < sample.timestamp < end)
+        conflict = entry.get("reason") == "unsupported_transition" or primary_interruption or fallback_conflict or dhw_conflict
+        classification = "plausible_unverified" if bracketed and not conflict else "conflicting_or_insufficient"
+        rationale = (["Matching surrounding primary observations; silence is not proof of operation",
+                      "Historical operation-state mapping validity is unverified"] if classification == "plausible_unverified" else
+                     ["Unsupported transition, conflicting signal, unsupported state, or missing bounding observation"])
+        power = [{"timestamp_utc": s.timestamp.isoformat(), "value_w": s.value, "source": s.source}
+                 for s in history.power if start <= s.timestamp <= end and s.value is not None and isfinite(s.value)]
+        amount = entry["delta_kwh"]
+        totals[classification + "_kwh"] += amount
+        results.append({"start_utc": start.isoformat(), "end_utc": end.isoformat(), "meter_kwh": amount,
+            "primary_previous": primary_before, "primary_next": primary_after,
+            "fallback_previous": fallback_before, "fallback_next": fallback_after,
+            "actual_dhw_previous": dhw_before, "actual_dhw_next": dhw_after,
+            "primary_observation_gap_seconds": (datetime.fromisoformat(primary_after["timestamp_utc"])-datetime.fromisoformat(primary_before["timestamp_utc"])).total_seconds() if primary_before and primary_after else None,
+            "power_observations": power, "power_coverage": "unverified" if power else "unavailable",
+            "primary_interruption": primary_interruption,
+            "possible_idle_conflict": any(item["primary_category"] == "confirmed_heating" for item in disagreements),
+            "possible_fallback_conflict": fallback_conflict, "fallback_disagreements": disagreements,
+            "possible_dhw_conflict": dhw_conflict,
+            "confidence": classification, "rationale": rationale, "evidence_type": "inferred",
+            "mapping_status": "unverified; continuity cannot be promoted"})
+    if not any(entry.get("status") == "accepted" for entry in trace):
+        totals = {key: None for key in totals}
+    return {"candidates": results, "totals": totals,
+            "limitation": "Actual-state mapping applicability and independent continuity are not verified by this export; supported scenario retains baseline."}

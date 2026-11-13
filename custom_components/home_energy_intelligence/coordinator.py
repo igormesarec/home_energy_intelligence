@@ -34,7 +34,7 @@ from .engine import DailyAggregator, DailyInput, DeviceHistory
 from .influx import InfluxBackfillClient
 from .models import NumericSample, StateSample
 from .historical_modes import explain_historical_mode, historical_heat_pump_modes, historical_selected_modes
-from .historical_simulation import simulate_modes
+from .historical_simulation import continuity_candidates, simulate_modes
 from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
@@ -470,6 +470,7 @@ class HomeEnergyCoordinator:
                     key = f"{reason} ({detail})"
                     unknown_summary[key] = unknown_summary.get(key, 0.0) + entry["delta_kwh"]
             simulations = None
+            continuity = None
             if diagnostic_mode_sources is not None and history:
                 simulation_sources = dict(diagnostic_mode_sources)
                 simulation_sources["fallback"] = {**diagnostic_mode_sources["fallback"], "samples": diagnostic_fallback}
@@ -478,6 +479,10 @@ class HomeEnergyCoordinator:
                 # The baseline must use the exact originally selected stream, not the longer diagnostic query.
                 simulations["baseline"] = simulate_modes(start, end, history, diagnostic_mode_sources,
                     diagnostic_state_map, float(self.config.get("counter_jump_limit_kwh", 500)), freshness)["baseline"]
+                continuity = continuity_candidates(diagnostic_traces[diagnostic_device], history,
+                    simulation_sources, diagnostic_state_map, freshness)
+                simulations["supported_continuity"] = {**simulations["baseline"],
+                    "evidence": "No validated historical operating-state mapping and independent continuity evidence; baseline retained."}
             result["increment_diagnostic"] = {"trace": diagnostic_traces[diagnostic_device],
                 "period_start_utc": start.isoformat(), "period_end_utc": end.isoformat(),
                 "counter_observations": [{"timestamp": s.timestamp.isoformat(), "value_kwh": s.value if s.value is not None and isfinite(s.value) else None, "source": s.source, "reason": s.reason} for s in history.counter] if history else [],
@@ -489,6 +494,7 @@ class HomeEnergyCoordinator:
                     for role, info in diagnostic_mode_sources.items()} if diagnostic_mode_sources else {},
                 "unknown_kwh_by_reason": unknown_summary,
                 "scenario_comparison": simulations,
+                "continuity_analysis": continuity,
                 "scenario_fallback_evidence_status": diagnostic_fallback_status if diagnostic_mode_sources else "unavailable",
                 "note": "Decision transitions are normalized boundaries; source observations and their ages retain original timestamps. Selected heat is assumed, not confirmed."}
         return result

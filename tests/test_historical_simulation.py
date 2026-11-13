@@ -59,3 +59,79 @@ def test_nonstandard_freshness_preserves_primary_priority_in_every_scenario():
     assert reports["recorder_hvac_action"]["fallback_freshness_seconds"] == 5400
     assert reports["fallback_120m"]["fallback_freshness_seconds"] == 7200
     assert reports["fallback_180m"]["fallback_freshness_seconds"] == 10800
+
+
+@pytest.mark.parametrize("next_state,action,expected", [
+    ("heat", "heating", "plausible_unverified"),
+    ("dhw", "heating", "conflicting_or_insufficient"),
+    ("idle", "heating", "conflicting_or_insufficient"),
+    ("unavailable", "heating", "conflicting_or_insufficient"),
+    ("heat", "idle", "conflicting_or_insufficient"),
+])
+def test_unknown_continuity_stays_unverified(next_state, action, expected):
+    from custom_components.home_energy_intelligence.historical_simulation import continuity_candidates
+    start = datetime(2026, 10, 25, tzinfo=UTC)
+    trace = [{"start": start.isoformat(), "end": (start+timedelta(minutes=30)).isoformat(),
+              "status": "accepted", "category": "unknown", "reason": "unknown_mode", "delta_kwh": 1.25}]
+    streams = {"primary": {"samples": [StateSample(start-timedelta(hours=2), "heat"),
+               StateSample(start+timedelta(hours=1), next_state)]},
+               "actual_dhw": {"samples": []},
+               "fallback": {"samples": [StateSample(start, "heat", {"hvac_action": action})]}}
+    result = continuity_candidates(trace, DeviceHistory(kind="heat_pump"), streams,
+                                   {"heat": "confirmed_heating", "dhw": "dhw"}, timedelta(hours=1))
+    candidate = result["candidates"][0]
+    assert candidate["confidence"] == expected
+    assert candidate["power_coverage"] == "unavailable"
+    assert candidate["evidence_type"] == "inferred"
+    assert result["totals"]["supported_kwh"] == 0
+    assert result["totals"][expected+"_kwh"] == pytest.approx(1.25)
+
+
+def test_continuity_reports_missing_observations_and_unknown_meter():
+    from custom_components.home_energy_intelligence.historical_simulation import continuity_candidates
+    streams = {role: {"samples": []} for role in ("primary", "fallback", "actual_dhw")}
+    result = continuity_candidates([], DeviceHistory(kind="heat_pump"), streams, {}, timedelta(hours=1))
+    assert result["totals"]["supported_kwh"] is None
+    assert result["candidates"] == []
+
+
+def test_primary_interruption_cannot_be_bridged_even_if_endpoints_match():
+    from custom_components.home_energy_intelligence.historical_simulation import continuity_candidates
+    start = datetime(2026, 10, 22, tzinfo=UTC)
+    trace = [{"start": start.isoformat(), "end": (start+timedelta(hours=1)).isoformat(),
+              "status": "accepted", "category": "unknown", "reason": "unknown_mode", "delta_kwh": 1}]
+    streams = {"primary": {"samples": [StateSample(start-timedelta(hours=2), "heat"),
+                StateSample(start+timedelta(minutes=20), "dhw"), StateSample(start+timedelta(hours=1), "heat")]},
+               "fallback": {"samples": []}, "actual_dhw": {"samples": []}}
+    result = continuity_candidates(trace, DeviceHistory(kind="heat_pump"), streams,
+                                   {"heat": "confirmed_heating"}, timedelta(hours=1))
+    assert result["candidates"][0]["primary_interruption"]
+    assert result["totals"]["conflicting_or_insufficient_kwh"] == 1
+
+
+@pytest.mark.parametrize("primary,action,age,conflict", [
+    ("heat", "idle", 0, True),
+    ("idle", "heating", 0, True),
+    ("dhw", "heating", 0, True),
+    ("heat", "idle", 60, False),
+    ("idle", "heating", 61, False),
+    ("heat", "heating", 0, False),
+    ("idle", "idle", 0, False),
+])
+def test_continuity_fresh_fallback_action_disagreements(primary, action, age, conflict):
+    from custom_components.home_energy_intelligence.historical_simulation import continuity_candidates
+    start = datetime(2026, 10, 22, tzinfo=UTC)
+    trace = [{"start": start.isoformat(), "end": (start + timedelta(minutes=30)).isoformat(),
+              "status": "accepted", "category": "unknown", "reason": "unknown_mode", "delta_kwh": 1}]
+    streams = {"primary": {"samples": [StateSample(start-timedelta(hours=2), primary),
+                StateSample(start+timedelta(hours=1), primary)]},
+               "fallback": {"samples": [StateSample(start-timedelta(minutes=age), "heat", {"hvac_action": action})]},
+               "actual_dhw": {"samples": []}}
+    result = continuity_candidates(trace, DeviceHistory(kind="heat_pump"), streams,
+        {"heat": "confirmed_heating", "idle": "idle", "dhw": "dhw"}, timedelta(hours=1))
+    candidate = result["candidates"][0]
+    assert candidate["possible_fallback_conflict"] is conflict
+    assert candidate["confidence"] == ("conflicting_or_insufficient" if conflict else "plausible_unverified")
+    assert result["totals"]["supported_kwh"] == 0
+    if conflict and primary == "dhw":
+        assert "may differ during DHW" in candidate["fallback_disagreements"][0]["interpretation"]
