@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 from .configuration import equipment_from_config
-from .power_pattern_diagnostic import power_statistics
+from .power_pattern_diagnostic import classify_power, power_statistics, validate_power_model
 from .const import CONF_INFLUX_DATABASE, CONF_INFLUX_ENABLED, CONF_INFLUX_HOST, CONF_INFLUX_PASSWORD, CONF_INFLUX_PORT, CONF_INFLUX_USERNAME
 from .influx import InfluxBackfillClient
 from .timeutils import local_day_bounds
@@ -222,11 +222,16 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
         reports = [((day.get("diagnostic", {}).get("continuity_analysis") or {}).get("totals") or {}).get(key) for day in days]
         continuity_totals[key] = sum(reports) if all(value is not None for value in reports) else None
     power_days = []
+    reference_intervals = []
+    exclusion_counts = {}
     pooled = {role: {"interval_count": 0, "segments": [], "expected_seconds": 0, "gaps": [], "observations": set()}
               for role in ("confirmed_heating", "dhw", "idle", "cooling")}
     for day in days:
         analysis = day.get("diagnostic", {}).pop("power_pattern_analysis", None)
         if analysis:
+            reference_intervals.extend(analysis.pop("_episodes", []))
+            for reason, count in analysis.get("reference_exclusions", {}).items():
+                exclusion_counts[reason] = exclusion_counts.get(reason, 0) + count
             for role, ref in analysis["references"].items():
                 pooled[role]["segments"].extend(ref.pop("_segments"))
                 pooled[role]["gaps"].extend(ref.pop("_gaps"))
@@ -241,6 +246,25 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
     power_refs = {role: {"interval_count": ref["interval_count"], "sample_count": len(ref["observations"]), "segment_count": len(ref["segments"]),
         "statistics": power_statistics(ref["segments"], ref["expected_seconds"], ref["gaps"]),
         "mapping_quality": "unverified; exploratory only"} for role, ref in pooled.items()}
+    # Existing preview mappings are unverified, so only independently verified
+    # reference rows may ever reach the held-out validation framework.
+    model = validate_power_model(reference_intervals)
+    labels = {"confirmed_heating": "heating_compatible", "dhw": "dhw_compatible", "idle": "idle_compatible"}
+    for day in power_days:
+        analysis = day["analysis"]
+        if not analysis or model["verdict"] != "VALIDATED":
+            continue
+        for candidate in analysis["candidates"]:
+            if candidate["power"]["coverage_percent"] != 100 or candidate["potential_conflict"]:
+                continue
+            category = classify_power(candidate["power"]["mean_w"], model["ranges_w"])
+            label = labels.get(category)
+            if label:
+                amount = candidate["meter_kwh"]
+                analysis["candidate_totals"][candidate["candidate"] + "_kwh"] -= amount
+                analysis["candidate_totals"][label + "_kwh"] += amount
+                candidate.update({"candidate": label, "validation_status": "VALIDATED",
+                                  "reason": "unique match to independently validated reference range; diagnostic only"})
     power_totals = {}
     for key in ("heating_compatible_kwh", "dhw_compatible_kwh", "idle_compatible_kwh", "ambiguous_kwh", "insufficient_evidence_kwh"):
         values = [((day["analysis"] or {}).get("candidate_totals") or {}).get(key) for day in power_days]
@@ -251,10 +275,11 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
             return None
         return {"ranges_overlap": max(a["p10_w"], b["p10_w"]) <= min(a["p90_w"], b["p90_w"]),
                 "quality": "descriptive only; unverified references"}
-    power_validation = {"verdict": "NOT VALIDATED", "references": power_refs, "days": power_days,
+    power_validation = {"verdict": model["verdict"], "references": power_refs, "days": power_days,
+        "reference_eligibility": {"mapping_verified_intervals": sum(bool(row.get("mapping_verified")) for row in reference_intervals),
+            "mapping_unverified_intervals": sum(not row.get("mapping_verified") for row in reference_intervals), "exclusions": exclusion_counts},
         "candidate_totals": power_totals, "unknown_partition_reconciles": all(day["unknown_partition_reconciles"] is True for day in power_days) if all(day["unknown_partition_reconciles"] is not None for day in power_days) else None, "validated_recovery_kwh": 0 if all(day["analysis"] and day["analysis"]["validated_recovery_kwh"] is not None for day in power_days) else None,
-        "validation": {"chronological_split": "not run: historically verified state mappings and independent operating episodes unavailable",
-            "confusion_matrix": None, "precision": None, "recall": None, "abstention_rate": None,
+        "validation": {**model, "split_method": "chronological, complete consecutive episodes",
             "overlap": {"heating_vs_dhw": overlap("confirmed_heating", "dhw"),
                         "heating_vs_idle": overlap("confirmed_heating", "idle"),
                         "heating_vs_cooling": overlap("confirmed_heating", "cooling")}},

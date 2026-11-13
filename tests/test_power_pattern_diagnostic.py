@@ -67,3 +67,52 @@ def test_conflicting_duplicate_power_observations_break_coverage():
     segments, gaps = power_segments(samples, t, t+timedelta(minutes=10))
     assert segments == []
     assert power_statistics(segments, 600, gaps)["coverage_percent"] == 0
+
+
+def _episodes(heat=2000, idle=100, *, verified=True):
+    start = datetime(2026, 10, 1, tzinfo=UTC)
+    return [{"start": (start+timedelta(hours=i)).isoformat(),
+             "end": (start+timedelta(hours=i, minutes=30)).isoformat(),
+             "category": "confirmed_heating" if i % 2 == 0 else "idle",
+             "mean_w": heat if i % 2 == 0 else idle, "coverage_percent": 100,
+             "mapping_verified": verified, "episode_id": str(i)} for i in range(12)]
+
+
+def test_chronological_independent_episode_validation():
+    from custom_components.home_energy_intelligence.power_pattern_diagnostic import validate_power_model, classify_power
+    result = validate_power_model(_episodes())
+    assert result["verdict"] == "VALIDATED"
+    assert result["training_episodes"] == 8 and result["validation_episodes"] == 4
+    assert result["training_end_utc"] < result["validation_start_utc"]
+    assert result["precision"]["idle"] == result["recall"]["confirmed_heating"] == 1
+    assert classify_power(100, result["ranges_w"]) == "idle"
+    assert result["abstention_rate"] == 0
+
+
+def test_unverified_or_insufficient_episodes_never_validate():
+    from custom_components.home_energy_intelligence.power_pattern_diagnostic import validate_power_model
+    assert validate_power_model(_episodes(verified=False))["verdict"] == "NOT VALIDATED"
+    assert validate_power_model(_episodes()[:3])["verdict"] == "NOT VALIDATED"
+
+
+def test_overlapping_heating_dhw_distributions_abstain():
+    from custom_components.home_energy_intelligence.power_pattern_diagnostic import validate_power_model
+    rows = _episodes(heat=500, idle=500)
+    for row in rows:
+        if row["category"] == "idle":
+            row["category"] = "dhw"
+    result = validate_power_model(rows)
+    assert result["verdict"] == "NOT VALIDATED"
+    assert result["abstention_rate"] == 1
+    assert result["confusion_matrix"]["dhw"]["abstain"] == 2
+
+
+def test_adjacent_intervals_from_same_episode_do_not_split():
+    from custom_components.home_energy_intelligence.power_pattern_diagnostic import validate_power_model
+    start = datetime(2026, 10, 1, tzinfo=UTC)
+    rows = [{"start": (start+timedelta(minutes=i*10)).isoformat(),
+             "end": (start+timedelta(minutes=(i+1)*10)).isoformat(), "category": "idle",
+             "mean_w": 100, "coverage_percent": 100, "mapping_verified": True, "episode_id": "one"} for i in range(12)]
+    result = validate_power_model(rows)
+    assert result["eligible_episodes"] == 1
+    assert result["verdict"] == "NOT VALIDATED"

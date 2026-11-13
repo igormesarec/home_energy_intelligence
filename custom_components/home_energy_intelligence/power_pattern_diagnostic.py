@@ -69,6 +69,8 @@ def analyze_power(trace, history, streams, state_map, freshness, continuity):
     ordered_power = sorted((s for s in history.power if s.timestamp.tzinfo), key=lambda s: s.timestamp)
     power_times = [s.timestamp for s in ordered_power]
     candidates = []
+    episodes = []
+    exclusion_reasons = {}
     totals = {"heating_compatible_kwh": 0.0, "dhw_compatible_kwh": 0.0, "idle_compatible_kwh": 0.0,
               "ambiguous_kwh": 0.0, "insufficient_evidence_kwh": 0.0}
     for entry in trace:
@@ -76,19 +78,45 @@ def analyze_power(trace, history, streams, state_map, freshness, continuity):
             continue
         start, end = datetime.fromisoformat(entry["start"]), datetime.fromisoformat(entry["end"])
         duration = (end-start).total_seconds()
-        first = max(0, bisect_right(power_times, start)-1)
-        last = min(len(ordered_power), bisect_left(power_times, end)+1)
+        first = max(0, bisect_left(power_times, start)-1)
+        last = min(len(ordered_power), bisect_right(power_times, end)+1)
         segments, gaps = power_segments(ordered_power[first:last], start, end)
         stats = power_statistics(segments, duration, gaps)
         category = entry.get("category")
         index = bisect_right(times, start)-1
         obs = primary[index] if index >= 0 else None
-        if (category in roles and not entry.get("mode_transition") and obs and
-            mapping.get(obs.state.lower()) == category and start-obs.timestamp < freshness and
-            end <= obs.timestamp+freshness and (entry.get("state") or {}).get("source") == "primary" and
-            stats["coverage_percent"] == 100):
+        relevant_fallback = sorted((sample for sample in streams.get("fallback", {}).get("samples", [])
+                                    if sample.timestamp.tzinfo and sample.timestamp < end), key=lambda sample: sample.timestamp)
+        previous_fallback = [sample for sample in relevant_fallback if sample.timestamp <= start]
+        fallback_checks = (previous_fallback[-1:] + [sample for sample in relevant_fallback if start < sample.timestamp < end])
+        conflicting_fallback = any(sample.timestamp + freshness > start and
+            ((category == "confirmed_heating" and str(sample.attributes.get("hvac_action", "")).lower() == "idle") or
+             (category in {"idle", "dhw"} and str(sample.attributes.get("hvac_action", "")).lower() == "heating"))
+            for sample in fallback_checks)
+        primary_interruption = any(start < sample.timestamp < end and mapping.get(sample.state.lower()) != category for sample in primary)
+        dhw_samples = sorted((sample for sample in streams.get("actual_dhw", {}).get("samples", [])
+                              if sample.timestamp.tzinfo and sample.timestamp < end), key=lambda sample: sample.timestamp)
+        previous_dhw = [sample for sample in dhw_samples if sample.timestamp <= start]
+        dhw_checks = previous_dhw[-1:] + [sample for sample in dhw_samples if start < sample.timestamp < end]
+        conflicting_dhw = category in {"confirmed_heating", "idle", "cooling"} and any(
+            sample.timestamp + freshness > start and sample.state.lower() == "heating_water" for sample in dhw_checks)
+        if category in roles:
+            reason = ("transition" if entry.get("mode_transition") or primary_interruption else
+                "primary_missing_or_stale" if not obs or mapping.get(obs.state.lower()) != category or
+                    start-obs.timestamp >= freshness or end > obs.timestamp+freshness or
+                    (entry.get("state") or {}).get("source") != "primary" else
+                "fallback_or_dhw_conflict" if conflicting_fallback or conflicting_dhw else
+                "power_coverage_incomplete" if stats["coverage_percent"] != 100 else None)
+            if reason:
+                exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+        else:
+            reason = "not_primary_reference"
+        if category in roles and reason is None:
             ref = references[category]
             ref["interval_count"] += 1
+            episodes.append({"start": start.isoformat(), "end": end.isoformat(), "category": category,
+                "mean_w": stats["mean_w"], "coverage_percent": stats["coverage_percent"],
+                "mapping_verified": False})
             ref["expected_seconds"] += duration
             ref["segments"].extend(segments)
             ref["gaps"].extend(gaps)
@@ -120,5 +148,89 @@ def analyze_power(trace, history, streams, state_map, freshness, continuity):
     return {"power_source": {"entity_id": history.provenance.get("power_entity"),
                 "sources": sorted({sample.source for sample in history.power if sample.source}),
                 "unit": "W", "mapping_quality": "unverified"},
-            "references": refs, "candidates": candidates, "candidate_totals": totals,
+            "references": refs, "reference_exclusions": exclusion_reasons, "_episodes": episodes,
+            "candidates": candidates, "candidate_totals": totals,
             "validated_recovery_kwh": 0 if any(e.get("status") == "accepted" for e in trace) else None}
+
+
+def validate_power_model(intervals, *, minimum_training_episodes=2, minimum_coverage_percent=100):
+    """Evaluate only mapping-verified complete episodes in chronological order.
+
+    Episode means define category ranges. Ambiguous overlapping ranges abstain.
+    The conservative validation gate requires perfect held-out precision/recall
+    and no abstentions; this is a diagnostic gate, not production classification.
+    """
+    eligible = []
+    for row in intervals:
+        try:
+            start, end = datetime.fromisoformat(row["start"]), datetime.fromisoformat(row["end"])
+            value = float(row["mean_w"])
+            if (not row.get("mapping_verified") or not row.get("episode_id") or not start.tzinfo or not end.tzinfo or end <= start
+                    or not isfinite(value) or value < 0 or row.get("coverage_percent", 0) < minimum_coverage_percent
+                    or row.get("category") not in {"confirmed_heating", "dhw", "idle", "cooling"}):
+                continue
+            eligible.append({"start": start, "end": end, "category": row["category"], "mean_w": value,
+                             "episode_id": row["episode_id"]})
+        except (KeyError, TypeError, ValueError):
+            continue
+    eligible.sort(key=lambda row: (row["start"], row["end"]))
+    episodes = []
+    closed_episode_ids = set()
+    for row in eligible:
+        if episodes and row["start"] < episodes[-1]["end"]:
+            return {"verdict": "NOT VALIDATED", "reason": "overlapping reference intervals", "training_episodes": 0, "validation_episodes": 0}
+        duration = (row["end"]-row["start"]).total_seconds()
+        if episodes and row["episode_id"] == episodes[-1]["episode_id"]:
+            episode = episodes[-1]
+            if row["category"] != episode["category"]:
+                return {"verdict": "NOT VALIDATED", "reason": "inconsistent episode category", "training_episodes": 0, "validation_episodes": 0}
+            episode["weighted_sum"] += row["mean_w"]*duration
+            episode["duration"] += duration
+            episode["end"] = row["end"]
+        else:
+            if row["episode_id"] in closed_episode_ids:
+                return {"verdict": "NOT VALIDATED", "reason": "noncontiguous episode identity", "training_episodes": 0, "validation_episodes": 0}
+            if episodes:
+                closed_episode_ids.add(episodes[-1]["episode_id"])
+            episodes.append({**row, "weighted_sum": row["mean_w"]*duration, "duration": duration})
+    split = int(len(episodes)*0.7)
+    train, validation = episodes[:split], episodes[split:]
+    categories = sorted({row["category"] for row in episodes})
+    result = {"verdict": "NOT VALIDATED", "reason": "insufficient independent verified episodes",
+        "eligible_episodes": len(episodes), "training_episodes": len(train), "validation_episodes": len(validation),
+        "training_end_utc": train[-1]["end"].isoformat() if train else None,
+        "validation_start_utc": validation[0]["start"].isoformat() if validation else None,
+        "confusion_matrix": None, "precision": None, "recall": None, "abstention_rate": None, "ranges_w": {}}
+    if (minimum_training_episodes < 1 or len(categories) < 2 or not validation or
+        (train and train[-1]["end"] >= validation[0]["start"]) or
+        any(sum(x["category"] == c for x in train) < minimum_training_episodes or
+            not any(x["category"] == c for x in validation) for c in categories)):
+        return result
+    ranges = {c: [min(x["weighted_sum"]/x["duration"] for x in train if x["category"] == c),
+                  max(x["weighted_sum"]/x["duration"] for x in train if x["category"] == c)] for c in categories}
+    matrix = {c: {pred: 0 for pred in categories + ["abstain"]} for c in categories}
+    for episode in validation:
+        pred = classify_power(episode["weighted_sum"]/episode["duration"], ranges)
+        matrix[episode["category"]][pred or "abstain"] += 1
+    precision, recall = {}, {}
+    for category in categories:
+        true_positive = matrix[category][category]
+        predicted = sum(matrix[actual][category] for actual in categories)
+        actual = sum(matrix[category].values())
+        precision[category] = true_positive/predicted if predicted else None
+        recall[category] = true_positive/actual if actual else None
+    abstained = sum(matrix[c]["abstain"] for c in categories)
+    success = not abstained and all(precision[c] == 1 and recall[c] == 1 for c in categories)
+    result.update({"verdict": "VALIDATED" if success else "NOT VALIDATED",
+        "reason": "held-out diagnostic criteria passed" if success else "held-out errors or abstentions",
+        "confusion_matrix": matrix, "precision": precision, "recall": recall,
+        "abstention_rate": abstained/len(validation), "ranges_w": ranges})
+    return result
+
+
+def classify_power(mean_w, ranges):
+    """Return a unique distribution match; overlapping or unmatched ranges abstain."""
+    if mean_w is None or not isfinite(mean_w):
+        return None
+    matched = [category for category, bounds in ranges.items() if bounds[0] <= mean_w <= bounds[1]]
+    return matched[0] if len(matched) == 1 else None
