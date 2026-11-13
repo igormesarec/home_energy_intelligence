@@ -84,8 +84,25 @@ def continuity_candidates(trace, history, streams, state_map, freshness):
         category = mapping.get(state) if state else None
         bracketed = bool(primary_before and primary_after and primary_after["state"].lower() == state
                          and category in {"confirmed_heating", "dhw", "idle", "cooling"})
-        action = (fallback_before or {}).get("hvac_action")
-        fallback_conflict = bool(action and str(action).lower() == "idle" and category == "confirmed_heating")
+        # A state is evidence only while fresh, and later observations can
+        # introduce an unresolved disagreement within the increment.
+        fallback_times = times["fallback"]
+        first_after_start = bisect_right(fallback_times, start)
+        first_at_end = bisect_left(fallback_times, end)
+        fallback_signals = ordered["fallback"][max(0, first_after_start-1):first_at_end]
+        fallback_signals = [sample for sample in fallback_signals
+                            if sample.timestamp + freshness > start
+                            and sample.attributes.get("hvac_action") is not None]
+        disagreements = []
+        for sample in fallback_signals:
+            action = str(sample.attributes["hvac_action"]).lower()
+            if ((category == "confirmed_heating" and action == "idle") or
+                (category in {"idle", "dhw"} and action == "heating")):
+                disagreements.append({"timestamp_utc": sample.timestamp.isoformat(),
+                    "hvac_action": action, "primary_category": category,
+                    "source": sample.attributes.get("source", "recorder"),
+                    "interpretation": "potential disagreement; climate action may differ during DHW"})
+        fallback_conflict = bool(disagreements)
         dhw_conflict = bool(dhw_before and dhw_before["state"].lower() == "heating_water"
                             and datetime.fromisoformat(dhw_before["timestamp_utc"]) + freshness > start
                             and category in {"confirmed_heating", "idle", "cooling"})
@@ -106,7 +123,10 @@ def continuity_candidates(trace, history, streams, state_map, freshness):
             "actual_dhw_previous": dhw_before, "actual_dhw_next": dhw_after,
             "primary_observation_gap_seconds": (datetime.fromisoformat(primary_after["timestamp_utc"])-datetime.fromisoformat(primary_before["timestamp_utc"])).total_seconds() if primary_before and primary_after else None,
             "power_observations": power, "power_coverage": "unverified" if power else "unavailable",
-            "primary_interruption": primary_interruption, "possible_idle_conflict": fallback_conflict, "possible_dhw_conflict": dhw_conflict,
+            "primary_interruption": primary_interruption,
+            "possible_idle_conflict": any(item["primary_category"] == "confirmed_heating" for item in disagreements),
+            "possible_fallback_conflict": fallback_conflict, "fallback_disagreements": disagreements,
+            "possible_dhw_conflict": dhw_conflict,
             "confidence": classification, "rationale": rationale, "evidence_type": "inferred",
             "mapping_status": "unverified; continuity cannot be promoted"})
     if not any(entry.get("status") == "accepted" for entry in trace):
