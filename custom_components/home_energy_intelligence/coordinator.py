@@ -35,6 +35,7 @@ from .influx import InfluxBackfillClient
 from .models import NumericSample, StateSample
 from .historical_modes import explain_historical_mode, historical_heat_pump_modes, historical_selected_modes
 from .historical_simulation import continuity_candidates, simulate_modes
+from .power_pattern_diagnostic import analyze_power
 from .recorder import (
     RecorderReader, states_to_modes, states_to_numeric,
     statistics_to_counter_samples, statistics_to_numeric_samples,
@@ -471,6 +472,7 @@ class HomeEnergyCoordinator:
                     unknown_summary[key] = unknown_summary.get(key, 0.0) + entry["delta_kwh"]
             simulations = None
             continuity = None
+            power_analysis = None
             if diagnostic_mode_sources is not None and history:
                 simulation_sources = dict(diagnostic_mode_sources)
                 simulation_sources["fallback"] = {**diagnostic_mode_sources["fallback"], "samples": diagnostic_fallback}
@@ -481,6 +483,8 @@ class HomeEnergyCoordinator:
                     diagnostic_state_map, float(self.config.get("counter_jump_limit_kwh", 500)), freshness)["baseline"]
                 continuity = continuity_candidates(diagnostic_traces[diagnostic_device], history,
                     simulation_sources, diagnostic_state_map, freshness)
+                power_analysis = analyze_power(diagnostic_traces[diagnostic_device], history,
+                    diagnostic_mode_sources, diagnostic_state_map, freshness, continuity)
                 simulations["supported_continuity"] = {**simulations["baseline"],
                     "evidence": "No validated historical operating-state mapping and independent continuity evidence; baseline retained."}
             result["increment_diagnostic"] = {"trace": diagnostic_traces[diagnostic_device],
@@ -495,6 +499,7 @@ class HomeEnergyCoordinator:
                 "unknown_kwh_by_reason": unknown_summary,
                 "scenario_comparison": simulations,
                 "continuity_analysis": continuity,
+                "power_pattern_analysis": power_analysis,
                 "scenario_fallback_evidence_status": diagnostic_fallback_status if diagnostic_mode_sources else "unavailable",
                 "note": "Decision transitions are normalized boundaries; source observations and their ages retain original timestamps. Selected heat is assumed, not confirmed."}
         return result
