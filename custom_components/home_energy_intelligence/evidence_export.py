@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 from .configuration import equipment_from_config
+from .power_pattern_diagnostic import power_statistics
 from .const import CONF_INFLUX_DATABASE, CONF_INFLUX_ENABLED, CONF_INFLUX_HOST, CONF_INFLUX_PASSWORD, CONF_INFLUX_PORT, CONF_INFLUX_USERNAME
 from .influx import InfluxBackfillClient
 from .timeutils import local_day_bounds
@@ -220,7 +221,48 @@ async def build_increment_trace_export(hass, coordinator, dates, equipment_id, s
     for key in ("supported_kwh", "plausible_unverified_kwh", "conflicting_or_insufficient_kwh"):
         reports = [((day.get("diagnostic", {}).get("continuity_analysis") or {}).get("totals") or {}).get(key) for day in days]
         continuity_totals[key] = sum(reports) if all(value is not None for value in reports) else None
-    output = json.dumps({"continuity_totals": continuity_totals, "scenario_totals": scenario_totals, "timezone": coordinator.timezone, "equipment_id": equipment_id,
+    power_days = []
+    pooled = {role: {"interval_count": 0, "segments": [], "expected_seconds": 0, "gaps": [], "observations": set()}
+              for role in ("confirmed_heating", "dhw", "idle", "cooling")}
+    for day in days:
+        analysis = day.get("diagnostic", {}).pop("power_pattern_analysis", None)
+        if analysis:
+            for role, ref in analysis["references"].items():
+                pooled[role]["segments"].extend(ref.pop("_segments"))
+                pooled[role]["gaps"].extend(ref.pop("_gaps"))
+                pooled[role]["observations"].update(tuple(item) for item in ref.pop("_observations"))
+                pooled[role]["expected_seconds"] += ref.pop("_expected_seconds")
+                pooled[role]["interval_count"] += ref["interval_count"]
+        baseline_unknown = ((day.get("diagnostic", {}).get("scenario_comparison") or {}).get("baseline") or {}).get("unknown_kwh")
+        partition = (sum(analysis["candidate_totals"].values()) if analysis and
+                     all(value is not None for value in analysis["candidate_totals"].values()) else None)
+        power_days.append({"local_date": day["local_date"], "analysis": analysis,
+                           "unknown_partition_reconciles": abs(partition-baseline_unknown) < 1e-7 if partition is not None and baseline_unknown is not None else None})
+    power_refs = {role: {"interval_count": ref["interval_count"], "sample_count": len(ref["observations"]), "segment_count": len(ref["segments"]),
+        "statistics": power_statistics(ref["segments"], ref["expected_seconds"], ref["gaps"]),
+        "mapping_quality": "unverified; exploratory only"} for role, ref in pooled.items()}
+    power_totals = {}
+    for key in ("heating_compatible_kwh", "dhw_compatible_kwh", "idle_compatible_kwh", "ambiguous_kwh", "insufficient_evidence_kwh"):
+        values = [((day["analysis"] or {}).get("candidate_totals") or {}).get(key) for day in power_days]
+        power_totals[key] = sum(values) if all(value is not None for value in values) else None
+    def overlap(first, second):
+        a, b = power_refs[first]["statistics"], power_refs[second]["statistics"]
+        if any(value is None for value in (a["p10_w"], a["p90_w"], b["p10_w"], b["p90_w"])):
+            return None
+        return {"ranges_overlap": max(a["p10_w"], b["p10_w"]) <= min(a["p90_w"], b["p90_w"]),
+                "quality": "descriptive only; unverified references"}
+    power_validation = {"verdict": "NOT VALIDATED", "references": power_refs, "days": power_days,
+        "candidate_totals": power_totals, "unknown_partition_reconciles": all(day["unknown_partition_reconciles"] is True for day in power_days) if all(day["unknown_partition_reconciles"] is not None for day in power_days) else None, "validated_recovery_kwh": 0 if all(day["analysis"] and day["analysis"]["validated_recovery_kwh"] is not None for day in power_days) else None,
+        "validation": {"chronological_split": "not run: historically verified state mappings and independent operating episodes unavailable",
+            "confusion_matrix": None, "precision": None, "recall": None, "abstention_rate": None,
+            "overlap": {"heating_vs_dhw": overlap("confirmed_heating", "dhw"),
+                        "heating_vs_idle": overlap("confirmed_heating", "idle"),
+                        "heating_vs_cooling": overlap("confirmed_heating", "cooling")}},
+        "limitations": ["All reference intervals are exploratory and mapping validity is unverified.",
+            "No candidate can be assigned heating, DHW or idle from power alone.",
+            "Power observations require two valid samples within a 15-minute diagnostic gap; missing intervals are never filled.",
+            "Commissioning and historical source validity were not independently established."]}
+    output = json.dumps({"power_pattern_validation": power_validation, "continuity_totals": continuity_totals, "scenario_totals": scenario_totals, "timezone": coordinator.timezone, "equipment_id": equipment_id,
                          "energy_entity": devices[0].energy_entity, "state_entity": state_entity,
                          "evidence_only": True, "mapping_quality": "unverified historical mapping",
                          "days": days}, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
